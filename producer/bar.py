@@ -15,6 +15,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import asyncio
 
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
 @dataclass
 class OHLCPoint:
     symbol: str
