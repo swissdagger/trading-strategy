@@ -34,7 +34,7 @@ import logging
 from collections import defaultdict
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from models import OHLCPoint
+from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 from producer.ladders import sets_for_timeframe
 from strategy.chain_view import ChainSet, TaggedChainEvent
