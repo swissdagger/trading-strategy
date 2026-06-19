@@ -18,7 +18,6 @@ pydantic
 
 httpx
 
-pandas
 sumtyme==2.0.6
 
 # --- Position-manager process (later; not needed for the signal process) ---
