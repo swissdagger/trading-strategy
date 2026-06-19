@@ -1,0 +1,72 @@
+# docker-compose.yml — the trading system's signal side.
+#
+# Three services: Kafka (the message bus), the feed process (bars -> Kafka), and
+# the signal process (Kafka -> chains -> trade_signals). Postgres is NOT here —
+# it's managed Supabase, reached over the network via TRADING_DB_URL in .env.
+#
+# Both Python services use the SAME image (built once) with different commands.
+# restart: unless-stopped so they survive crashes and VM reboots, matching the
+# CausaView deployment posture.
+#
+# Startup ordering: the feed reads warmup cursors the signal process writes, but
+# it does NOT block on the signal process (reads whatever cursors exist, starts
+# from "now" if none). So compose can bring them up together; they converge.
+# Kafka must be healthy before either Python service tries to connect, hence the
+# depends_on + healthcheck.
+
+services:
+  kafka:
+    image: bitnami/kafka:3.7
+    restart: unless-stopped
+    environment:
+      # KRaft mode (no Zookeeper) — single-broker, controller+broker combined.
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # Let the app's topics be created on first use; for production you may
+      # prefer to pre-create them with explicit partitions/retention (see README).
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      # Broker is ready when it can list topics.
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  feed:
+    build: .
+    image: trading-system:latest
+    restart: unless-stopped
+    command: ["python", "feed_process.py"]
+    env_file: .env
+    environment:
+      # Inside the compose network Kafka is reachable as 'kafka:9092',
+      # overriding the .env default of localhost.
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  signal:
+    build: .
+    image: trading-system:latest
+    restart: unless-stopped
+    command: ["python", "signal_process.py"]
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka_data:

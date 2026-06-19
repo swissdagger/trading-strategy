@@ -1,0 +1,24 @@
+# CRITICAL: never bake secrets into the image. .env is provided at runtime via
+# env_file in docker-compose, NOT copied into the image.
+.env
+*.env
+!.env.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling / VCS
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docs / local
+RUNBOOK.md
+*.md
+.DS_Store
