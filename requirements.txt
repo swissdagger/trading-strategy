@@ -16,7 +16,7 @@ pandas>=2.0
 
 # Sumtyme SDK — the causal forecast client. Install per Sumtyme's distribution
 # (the package name/source may be a private index; adjust to your install method).
-sumtyme==2.06
+sumtyme==2.0.6
 httpx
 pydantic
 
