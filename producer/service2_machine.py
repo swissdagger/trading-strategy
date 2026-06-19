@@ -50,7 +50,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from models import OHLCPoint
+from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 
 log = logging.getLogger("producer.service2_machine")

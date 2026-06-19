@@ -50,7 +50,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
-from models import OHLCPoint
+from producer.bar import OHLCPoint
 
 
 @dataclass(frozen=True)
