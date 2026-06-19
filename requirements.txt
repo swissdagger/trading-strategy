@@ -14,9 +14,12 @@ aiokafka>=0.10
 # service_2 has.
 pandas>=2.0
 
-# Sumtyme SDK — the causal forecast client. Install per Sumtyme's distribution
-# (the package name/source may be a private index; adjust to your install method).
-# sumtyme
+pydantic
+
+httpx
+
+pandas
+sumtyme==2.0.6
 
 # --- Position-manager process (later; not needed for the signal process) ---
 # IBKR (equity/fx execution) — choose one wrapper when you build the adapter:
@@ -24,3 +27,4 @@ pandas>=2.0
 # ibapi                  # IBKR's official client
 # Binance (crypto execution):
 # python-binance>=1.0    # or your preferred async Binance client
+
