@@ -51,22 +51,28 @@ def _build_feeds(asset_configs: dict) -> dict:
     one import + one mapping entry, mirroring the feeds package's design.
     """
     feeds = {}
+    polygon_api_key = os.environ.get("POLYGON_API_KEY")
     for asset_class, cfg in asset_configs.items():
-        if not cfg.get("symbols"):
+        symbols = cfg.get("symbols")
+        if not symbols:
             continue   # nothing to poll for this class
+        timeframes = cfg["timeframes"]
         if asset_class == "crypto":
             from feeds.binance_futures import BinanceFuturesFeed
-            feeds[asset_class] = BinanceFuturesFeed()
+            feeds[asset_class] = BinanceFuturesFeed(symbols, timeframes)
         elif asset_class == "equity":
+            if not polygon_api_key:
+                raise RuntimeError("POLYGON_API_KEY not set — required for the equity feed")
             from feeds.polygon_stocks import PolygonStocksFeed
-            feeds[asset_class] = PolygonStocksFeed()
+            feeds[asset_class] = PolygonStocksFeed(polygon_api_key, symbols, timeframes)
         elif asset_class == "fx":
+            if not polygon_api_key:
+                raise RuntimeError("POLYGON_API_KEY not set — required for the fx feed")
             from feeds.polygon_forex import PolygonForexFeed
-            feeds[asset_class] = PolygonForexFeed()
+            feeds[asset_class] = PolygonForexFeed(polygon_api_key, symbols, timeframes)
         else:
             log.warning("no feed wired for asset class %r — skipping", asset_class)
     return feeds
-
 
 class FeedProcess:
     """Owns the per-class feeds and the Kafka producer."""
