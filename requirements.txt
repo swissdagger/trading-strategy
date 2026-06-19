@@ -16,7 +16,9 @@ pandas>=2.0
 
 # Sumtyme SDK — the causal forecast client. Install per Sumtyme's distribution
 # (the package name/source may be a private index; adjust to your install method).
-# sumtyme
+sumtyme==2.06
+httpx
+pydantic
 
 # --- Position-manager process (later; not needed for the signal process) ---
 # IBKR (equity/fx execution) — choose one wrapper when you build the adapter:
