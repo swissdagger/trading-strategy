@@ -227,7 +227,7 @@ class SignalProcess:
 
     async def run(self) -> None:
         """Consume bars and pump them through the router until stopped."""
-        from models import OHLCPoint
+        from producer.bar import OHLCPoint
         assert self.consumer is not None and self.router is not None
         try:
             async for msg in self.consumer:

@@ -13,7 +13,7 @@ class string ('crypto' | 'equity' | 'fx'), resolved from ASSET_CONFIGS per symbo
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+import asyncio
 
 @dataclass
 class OHLCPoint:
