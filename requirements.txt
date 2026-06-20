@@ -21,6 +21,8 @@ httpx
 pydantic
 asyncio
 
+exchange_calendars==4.13.2
+tzdata
 # --- Position-manager process (later; not needed for the signal process) ---
 # IBKR (equity/fx execution) — choose one wrapper when you build the adapter:
 # ib_async>=1.0          # maintained fork of ib_insync

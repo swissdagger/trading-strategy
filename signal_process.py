@@ -51,6 +51,7 @@ from producer.persistence import (
     make_persist_chain_propagate,
     make_persist_chain_terminate,
     make_persist_signal,
+    make_load_buffers,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainSet, ChainView, TaggedChainEvent
@@ -186,6 +187,7 @@ class SignalProcess:
                 persist_chain_terminate=make_persist_chain_terminate(self.pool),
                 load_active_chains=make_load_active_chains(
                     self.pool, symbol, asset_class, ladder),
+                load_buffers=make_load_buffers(self.pool, symbol, ladder),
             )
         return factory
 

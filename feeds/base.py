@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime, time as dtime, timedelta, timezone
+from functools import lru_cache
 from typing import Awaitable, Callable, Dict, List, Set
+from zoneinfo import ZoneInfo
+
+import exchange_calendars as xcals
+import pandas as pd
 
 from producer.bar import OHLCPoint
 
@@ -28,15 +33,130 @@ LiveDataCallback = Callable[[List[OHLCPoint]], Awaitable[None]]
 
 
 # ---------------------------------------------------------------
+# US equity/options market calendar (DST + holidays + half-days).
+#
+# Replaces the previous fixed-UTC 13:30–20:00 hardcode, which was only
+# correct during US daylight time (it was an hour off all winter) and
+# knew nothing about holidays or early closes. exchange_calendars'
+# XNYS calendar is the source of truth for WHICH days trade and the
+# DST-correct regular open/close (incl. half-day early closes).
+#
+# IMPORTANT — what XNYS does and does NOT provide:
+#   • Provides: trading-day calendar, holidays, half-days, and the
+#     DST-correct REGULAR session (09:30–16:00 ET).
+#   • Does NOT provide: pre-market / after-hours. The library models
+#     the regular session only. Equity extended hours are therefore
+#     composed here as a fixed Eastern-time envelope (PRE_OPEN_ET..
+#     POST_CLOSE_ET) around any day XNYS marks as a session — the
+#     envelope is DST-correct because it's anchored in America/New_York
+#     and converted to UTC, and it's holiday-correct because it only
+#     applies on XNYS session days.
+#
+# Options use the regular session directly (no extended hours — OPRA
+# options trade 09:30–16:00 ET only). Equity uses the extended envelope.
+# ---------------------------------------------------------------
+_NY_TZ = ZoneInfo("America/New_York")
+
+# US equity extended-hours envelope, fixed in Eastern time:
+#   pre-market 04:00 ET → after-hours close 20:00 ET.
+# Applied only on XNYS session days. On half-days the regular session
+# truncates (handled by the calendar) but after-hours still runs to
+# 20:00 ET, per product decision.
+_EQUITY_PRE_OPEN_ET = dtime(4, 0)
+_EQUITY_POST_CLOSE_ET = dtime(20, 0)
+
+# Bound the calendar's start so module load doesn't build decades of
+# sessions. The right edge is auto-set ~1 year ahead by the library;
+# see _xnys_is_session for the out-of-bounds guard that keeps a
+# long-lived process from crashing once "now" passes that edge.
+_XNYS_CALENDAR_START = "2015-01-01"
+_XNYS = xcals.get_calendar("XNYS", start=pd.Timestamp(_XNYS_CALENDAR_START))
+
+
+@lru_cache(maxsize=4096)
+def _xnys_is_session(session_date_iso: str) -> bool:
+    """True if `session_date_iso` (an ISO date string, ET calendar
+    date) is an XNYS trading day. Cached — the per-tick callers hit the
+    same handful of dates repeatedly.
+
+    Guards DateOutOfBounds: the calendar only spans to ~1 year past
+    construction, and is_session() RAISES (not returns False) beyond
+    that. Rather than let a long-running process crash on every tick
+    once it passes the edge, we fall back to a conservative weekday
+    check — matching the long-standing "when in doubt, return True and
+    let the API decide" posture. A restart rebuilds the calendar with a
+    fresh horizon, so this fallback is a safety net, not the steady
+    state.
+    """
+    try:
+        return bool(_XNYS.is_session(pd.Timestamp(session_date_iso)))
+    except Exception:
+        # Out of the calendar's range (or unparseable) — assume a
+        # weekday is a trading day. Holidays in the far future are
+        # missed by this fallback, but a crash would be far worse, and
+        # the service restart cadence keeps us off this path normally.
+        d = datetime.fromisoformat(session_date_iso)
+        return d.weekday() < 5
+
+
+def _equity_extended_envelope_utc(session_iso: str) -> "tuple[int, int]":
+    """(start_ms, end_ms) of the equity extended-hours envelope for an
+    XNYS session date, in UTC. 04:00 ET → 20:00 ET on that ET date,
+    DST-correct via zoneinfo. Caller must have already confirmed the
+    date is a session via _xnys_is_session.
+    """
+    d = datetime.fromisoformat(session_iso).date()
+    start_et = datetime.combine(d, _EQUITY_PRE_OPEN_ET, tzinfo=_NY_TZ)
+    end_et = datetime.combine(d, _EQUITY_POST_CLOSE_ET, tzinfo=_NY_TZ)
+    return (
+        int(start_et.astimezone(timezone.utc).timestamp() * 1000),
+        int(end_et.astimezone(timezone.utc).timestamp() * 1000),
+    )
+
+
+def _option_regular_bounds_utc(now_utc: datetime) -> "tuple[int, int] | None":
+    """(start_ms, end_ms) of the XNYS REGULAR session containing
+    now_utc, or None. DST- and half-day-correct (straight from the
+    calendar). Used by the option path, which has no extended hours.
+
+    The regular session never crosses UTC midnight in either DST state
+    (summer 13:30–20:00Z, winter 14:30–21:00Z), so anchoring on the UTC
+    date of now_utc is safe here — unlike the equity envelope, whose
+    winter after-hours spills past 00:00Z and must anchor on the ET
+    date.
+    """
+    session_iso = now_utc.astimezone(timezone.utc).date().isoformat()
+    if not _xnys_is_session(session_iso):
+        return None
+    try:
+        o = _XNYS.session_open(pd.Timestamp(session_iso))
+        c = _XNYS.session_close(pd.Timestamp(session_iso))
+    except Exception:
+        # Out-of-range: fall back to None (closed) rather than crash.
+        # The conservative-open fallback lives in _xnys_is_session; for
+        # precise bounds we'd rather under-report than fabricate a
+        # session window, since bounds feed the forward-fill.
+        return None
+    start_ms = int(o.timestamp() * 1000)
+    end_ms = int(c.timestamp() * 1000)
+    now_ms = int(now_utc.timestamp() * 1000)
+    if start_ms <= now_ms < end_ms:
+        return (start_ms, end_ms)
+    return None
+
+
+# ---------------------------------------------------------------
 # Session-hours helper. Used by feeds whose underlying markets have
 # closed hours, to avoid wasting rate-limit budget on calls that
 # will return empty windows during overnight/weekend gaps.
 #
 # Phase 2 wired options into this; Phase 7 added the equity cash
-# session (shares the options branch) and reinstated fx (weekly
-# Sun 22 UTC → Fri 22 UTC window). Crypto (24/7) never calls this.
-# If a future feed needs another session model, add a branch rather
-# than copying the logic into the feed itself.
+# session and reinstated fx (weekly Sun 22 UTC → Fri 22 UTC window).
+# Phase 7.x replaced the equity/options fixed-UTC hardcode with the
+# XNYS exchange calendar (DST + holidays + half-days) and split the
+# two classes: EQUITY now spans extended hours (04:00–20:00 ET),
+# OPTIONS stay regular-only (09:30–16:00 ET). Crypto (24/7) never
+# calls this. fx keeps its 24×5 arithmetic (no exchange calendar).
 #
 # All times in UTC. Caller passes `now_utc=datetime.now(timezone.utc)`.
 # ---------------------------------------------------------------
@@ -45,22 +165,25 @@ def is_market_open(asset_class: str, now_utc: datetime) -> bool:
     at `now_utc`. Conservative for the feed callers — when in doubt,
     return True and let the API decide.
     """
-    if asset_class in ("option", "equity"):
-        # US options AND US cash equities: 13:30–20:00 UTC weekdays.
-        # This is the regular-hours window for OPRA-listed options and
-        # the NYSE/NASDAQ cash session. After-hours trading exists for
-        # both but isn't aggregated the same way and we're not
-        # subscribed to it.
-        #
-        # Deliberately ONE branch for both classes so they can never
-        # drift: the equity session is definitionally the same cash
-        # session the options trade against. Note this inherits the
-        # existing fixed-UTC simplification (no DST shift, no holiday
-        # calendar) — if that's ever fixed, it fixes both at once.
-        return (
-            now_utc.weekday() < 5  # Mon=0 ... Fri=4
-            and dtime(13, 30) <= now_utc.time() < dtime(20, 0)
-        )
+    if asset_class == "equity":
+        # US cash equities INCLUDING extended hours: 04:00–20:00 ET on
+        # any XNYS trading day, DST- and holiday-correct. The envelope
+        # is anchored on the ET calendar date (NOT the UTC date): winter
+        # after-hours runs to 01:00 UTC the next calendar day, so a bar
+        # at 00:30 UTC belongs to the PREVIOUS ET date's session.
+        et = now_utc.astimezone(_NY_TZ)
+        session_iso = et.date().isoformat()
+        if not _xnys_is_session(session_iso):
+            return False
+        return _EQUITY_PRE_OPEN_ET <= et.timetz().replace(tzinfo=None) < _EQUITY_POST_CLOSE_ET
+
+    if asset_class == "option":
+        # OPRA options: REGULAR session only (09:30–16:00 ET), no
+        # extended hours. Sourced from the XNYS calendar so it's DST-
+        # and half-day-correct (the old fixed 13:30–20:00 UTC was an
+        # hour off all winter and ignored early closes).
+        return _option_regular_bounds_utc(now_utc) is not None
+
     if asset_class == "fx":
         # Forex: continuous 22:00 UTC Sunday → 22:00 UTC Friday.
         # The check here is "not the weekend gap." Mon=0..Sun=6;
@@ -123,24 +246,31 @@ def session_bounds_for(
           start_ms, end_ms = session
           # Now we can fill windows up to but not including end_ms.
     """
-    if asset_class in ("option", "equity"):
-        # Reconstruct the date in UTC and the session bounds on that
-        # date. Caller is responsible for not passing weekend or
-        # overnight timestamps — but we still check and return None
-        # rather than producing garbage bounds. One branch for both
-        # classes — same cash session, same drift-prevention rationale
-        # as is_market_open above.
+    if asset_class == "equity":
+        # Equity extended-hours envelope: 04:00–20:00 ET on an XNYS
+        # trading day, returned in UTC ms. Anchored on the ET calendar
+        # date of the bar — NOT its UTC date — because winter after-
+        # hours spills past 00:00 UTC into the next UTC day while still
+        # belonging to the prior ET session. Overnight (20:00→04:00 ET),
+        # weekends, and holidays return None, so the forward-fill treats
+        # them as step boundaries and never fabricates bars across a
+        # genuine close.
         dt = datetime.fromtimestamp(t_utc_ms / 1000.0, timezone.utc)
-        if dt.weekday() >= 5:  # Sat or Sun
+        et = dt.astimezone(_NY_TZ)
+        session_iso = et.date().isoformat()
+        if not _xnys_is_session(session_iso):
             return None
-        session_start = dt.replace(hour=13, minute=30, second=0, microsecond=0)
-        session_end = dt.replace(hour=20, minute=0, second=0, microsecond=0)
-        if dt < session_start or dt >= session_end:
-            return None
-        return (
-            int(session_start.timestamp() * 1000),
-            int(session_end.timestamp() * 1000),
-        )
+        env = _equity_extended_envelope_utc(session_iso)
+        if env[0] <= t_utc_ms < env[1]:
+            return env
+        return None
+    if asset_class == "option":
+        # Option REGULAR session via the XNYS calendar (DST + half-day
+        # correct). No extended hours. Regular session never crosses
+        # UTC midnight, so UTC-date anchoring inside
+        # _option_regular_bounds_utc is safe.
+        dt = datetime.fromtimestamp(t_utc_ms / 1000.0, timezone.utc)
+        return _option_regular_bounds_utc(dt)
     if asset_class == "crypto":
         # No session boundaries. Use sentinel so callers' arithmetic
         # works uniformly (start_ms <= bar_ts < end_ms is always true).

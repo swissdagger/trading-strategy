@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Optional
+from collections import deque
 
 
 # ---- chain-machine persistence (signals + chains tables, migration 002) ----
@@ -200,3 +201,128 @@ async def read_feed_cursors(pool) -> dict:
     for r in rows:
         out.setdefault(r["symbol"], {})[r["timeframe"]] = r["cursor_ms"]
     return out
+
+# ---- warmup buffer-seed handoff (warmup_bars table, migration 006) ----------
+#
+# The cold-start counterpart to feed_cursors. warmup_process.py back-fills
+# history and calls make_persist_warmup_bars to land it; the signal process
+# passes make_load_buffers into the machine factory so hydrate() pre-fills
+# each (symbol, timeframe) deque to WINDOW_SIZE before any live bar arrives.
+#
+# Buffer tick shape MUST match ServiceTwoChainMachine._tick_dict exactly
+# (symbol, timestamp, open, high, low, close, timeframe, asset_class) — the
+# machine appends these dicts directly, so a field mismatch would silently
+# corrupt the Sumtyme input. The single source of truth for that shape is
+# _tick_dict; this loader reproduces it.
+
+
+# Kept in sync with service2_machine.WINDOW_SIZE. Imported lazily inside the
+# loader (not at module top) so persistence.py stays importable without the
+# machine module — same lazy-import posture as the rest of the signal wiring.
+
+
+def make_persist_warmup_bars(pool):
+    """Return an async (symbol, asset_class, timeframe, points) -> None that
+    upserts a fetched history slice into warmup_bars. `points` is the
+    List[OHLCPoint] fetch_history returns (ascending by timestamp).
+
+    Idempotent on the (symbol, timeframe, timestamp_ms) PK: re-running warmup
+    re-UPSERTs the same rows rather than duplicating, so a crash mid-warmup is
+    safe to retry.
+
+    NOTE on growth: this never prunes. A stream re-seeded daily accumulates
+    rows older than the newest WINDOW_SIZE, which the loader's LIMIT ignores
+    but which still occupy space. If that matters operationally, add a periodic
+    DELETE keeping only the newest WINDOW_SIZE per (symbol, timeframe); it's
+    deliberately omitted here to keep the write path single-statement.
+    """
+    async def persist_warmup_bars(
+        symbol: str, asset_class: str, timeframe: str, points: list
+    ) -> None:
+        if not points:
+            return
+        rows = [
+            (symbol, timeframe, p.timestamp,
+             p.open, p.high, p.low, p.close, asset_class)
+            for p in points
+        ]
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO warmup_bars
+                    (symbol, timeframe, timestamp_ms,
+                     open, high, low, close, asset_class)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (symbol, timeframe, timestamp_ms)
+                DO UPDATE SET
+                    open = EXCLUDED.open, high = EXCLUDED.high,
+                    low = EXCLUDED.low, close = EXCLUDED.close,
+                    asset_class = EXCLUDED.asset_class, updated_at = now()
+                """,
+                rows,
+            )
+    return persist_warmup_bars
+
+
+def make_load_buffers(pool, symbol: str, ladder: list):
+    """Hydrate this (symbol, set)'s per-timeframe buffers from warmup_bars on
+    startup — the cold-start counterpart to make_load_active_chains.
+
+    Returns an async () -> Dict[str, deque] sized to WINDOW_SIZE, holding the
+    newest WINDOW_SIZE bars per timeframe in _tick_dict shape, ascending by
+    timestamp (deque append order = chronological, as on_bar expects).
+
+    Scope: only the timeframes in THIS set's ladder are loaded, mirroring
+    make_load_active_chains' per-set filtering — a Set A machine doesn't
+    hydrate Set B's buffers. A timeframe with no warmup rows simply yields no
+    entry; the machine creates an empty deque for it on first live bar and
+    accumulates the slow way (correct, just not pre-seeded).
+    """
+    from producer.service2_machine import WINDOW_SIZE
+
+    async def load_buffers() -> dict:
+        buffers: dict = {}
+        async with pool.acquire() as conn:
+            for tf in ladder:
+                # Newest WINDOW_SIZE rows for this stream, then reverse to
+                # ascending so deque append order is chronological. The
+                # DESC+LIMIT uses warmup_bars_stream_ts_idx; reversing in
+                # Python avoids a second sort over at most WINDOW_SIZE rows.
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, timestamp_ms, open, high, low, close,
+                           timeframe, asset_class
+                    FROM warmup_bars
+                    WHERE symbol = $1 AND timeframe = $2
+                    ORDER BY timestamp_ms DESC
+                    LIMIT $3
+                    """,
+                    symbol, tf, WINDOW_SIZE,
+                )
+                if not rows:
+                    continue
+                buf = deque(maxlen=WINDOW_SIZE)
+                for r in reversed(rows):  # DESC -> ascending
+                    # EXACT _tick_dict shape — keep these keys identical to
+                    # ServiceTwoChainMachine._tick_dict.
+                    buf.append({
+                        "symbol": r["symbol"], "timestamp": r["timestamp_ms"],
+                        "open": r["open"], "high": r["high"],
+                        "low": r["low"], "close": r["close"],
+                        "timeframe": r["timeframe"], "asset_class": r["asset_class"],
+                    })
+                buffers[tf] = buf
+        return load_buffers_log(symbol, buffers)
+    return load_buffers
+
+
+def load_buffers_log(symbol: str, buffers: dict) -> dict:
+    """Tiny helper: log what hydrate restored, return buffers unchanged.
+    Separated so the loader body stays a pure data path."""
+    import logging
+    if buffers:
+        sizes = ", ".join(f"{tf}:{len(b)}" for tf, b in buffers.items())
+        logging.getLogger("producer.persistence").info(
+            "warmup: hydrated buffers for %s (%s)", symbol, sizes
+        )
+    return buffers
