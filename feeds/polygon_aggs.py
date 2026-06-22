@@ -49,6 +49,11 @@ from producer.bar import RateLimiter
 
 logger = logging.getLogger(__name__)
 
+def _get_base_tf(tf: str) -> str:
+    """Fetch 1s bars for sub-minute timeframes to ensure Polygon returns data."""
+    if tf in ("5s", "10s", "15s", "30s", "45s"):
+        return "1s"
+    return tf
 
 class _PolygonAggsFeedBase(AssetFeed):
     """Shared Polygon /v2/aggs feed. Subclasses set `asset_class`,
@@ -194,18 +199,20 @@ class _PolygonAggsFeedBase(AssetFeed):
             logger.error(f"Unsupported {self.asset_class} timeframe: {timeframe}")
             return []
 
-        multiplier, timespan, base_ms = _parse_timeframe(timeframe)
+        base_tf = _get_base_tf(timeframe)
+        base_mult, base_span, _ = _parse_timeframe(base_tf)
+
+        tf_mult, tf_span, tf_base_ms = _parse_timeframe(timeframe)
+        
         native_symbol = self.to_native_symbol(symbol)
         client = await self._get_client()
 
         collected_points: List[dict] = []
-        resampled: List[dict] = []  # Track resampled length
-        # Window spans ~MAX_BARS_PER_CHUNK bars (not the full request)
-        # × 1.5 slack so each window comfortably contains its target bar
-        # count even across weekend/holiday gaps. Smaller windows = fast
-        # Polygon responses; we just take more of them.
+        resampled: List[dict] = []  
+        
         bars_per_chunk = min(points_needed, self.MAX_BARS_PER_CHUNK)
-        chunk_ms = int(bars_per_chunk * multiplier * base_ms * 1.5)
+        # <--- 3. USE THE RENAMED VARS HERE
+        chunk_ms = int(bars_per_chunk * tf_mult * tf_base_ms * 1.5)        
         current_to = int(datetime.now(timezone.utc).timestamp() * 1000)
         empty_chunks = 0
         # Empty-chunk tolerance must SCALE with chunk count. With small
@@ -254,7 +261,7 @@ class _PolygonAggsFeedBase(AssetFeed):
 
             url = (
                 f"https://api.polygon.io/v2/aggs/ticker/{native_symbol}"
-                f"/range/{multiplier}/{timespan}/{current_from}/{current_to}"
+                f"/range/{base_mult}/{base_span}/{current_from}/{current_to}"
             )
             params = {
                 "adjusted": "true",
@@ -444,6 +451,9 @@ class _PolygonAggsFeedBase(AssetFeed):
             multiplier, _, candle_ms = _parse_timeframe(tf)
             tf_s = (multiplier * candle_ms) // 1000
 
+            base_tf = _get_base_tf(tf)
+            base_mult, base_timespan, _ = _parse_timeframe(base_tf)
+                                                           
             # Half-candle polling, 8s floor, 600s ceiling.
             interval = min(max(tf_s // 2, 8), 600)
 
@@ -492,10 +502,11 @@ class _PolygonAggsFeedBase(AssetFeed):
                     batch: List[OHLCPoint] = []
                     for sym in symbols:
                         native = self.to_native_symbol(sym)
-                        multiplier, timespan, _ = _parse_timeframe(tf)
+                        
+                        # <--- 2. USE THE BASE TF VARIABLES HERE
                         url = (
                             f"https://api.polygon.io/v2/aggs/ticker/{native}"
-                            f"/range/{multiplier}/{timespan}/{cursors[sym]}/"
+                            f"/range/{base_mult}/{base_timespan}/{cursors[sym]}/"
                             f"{int(now.timestamp() * 1000)}"
                         )
                         params = {
