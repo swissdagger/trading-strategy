@@ -38,14 +38,14 @@ TWO_LADDER_TIMEFRAMES = ["5s", "10s", "30s", "1m", "2m", "5m", "10m"]
 # 'baseline_timeframe' — informational; the actual per-set baselines are the first
 #   entry of each ladder (5s for Set A, 30s for Set B), owned by producer/ladders.
 ASSET_CONFIGS = {
-    "crypto": {
-        "symbols": [
-            "BTCUSDT",
-        ],
-        "timeframes": list(TWO_LADDER_TIMEFRAMES),
-        "points": 5000,
-        "baseline_timeframe": "5s",
-    },
+    # "crypto": {
+    #     "symbols": [
+    #         "BTCUSDT",
+    #     ],
+    #     "timeframes": list(TWO_LADDER_TIMEFRAMES),
+    #     "points": 5000,
+    #     "baseline_timeframe": "5s",
+    # },
     "equity": {
         "symbols": [
             "AAPL"
