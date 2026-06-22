@@ -258,11 +258,12 @@ class PolygonOptionsFeed(AssetFeed):
         client = await self._get_client()
 
         collected_points: List[dict] = []
+        resampled: List[dict] = []
         chunk_ms = int(points_needed * multiplier * base_ms * 1.5)
         current_to = int(datetime.now(timezone.utc).timestamp() * 1000)
         empty_chunks = 0
 
-        while len(collected_points) < points_needed and empty_chunks < 3:
+        while len(resampled) < points_needed and empty_chunks < 3:
             current_from = current_to - chunk_ms
             limit_needed = min(points_needed - len(collected_points), self.MAX_CANDLES_PER_CALL)
 
@@ -329,7 +330,8 @@ class PolygonOptionsFeed(AssetFeed):
             if not success:
                 logger.error(f"Failed to fetch chunk for {symbol} {timeframe}")
                 break
-
+            resampled = _resample_to_timeframe(collected_points, timeframe)
+        resampled = resampled[-points_needed:]
         # Re-aggregate Polygon's raw bars to the requested timeframe.
         # Polygon may have returned mixed-resolution data (1m where
         # trades occurred, 5m elsewhere) on sparse contracts; the

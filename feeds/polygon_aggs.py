@@ -199,6 +199,7 @@ class _PolygonAggsFeedBase(AssetFeed):
         client = await self._get_client()
 
         collected_points: List[dict] = []
+        resampled: List[dict] = []  # Track resampled length
         # Window spans ~MAX_BARS_PER_CHUNK bars (not the full request)
         # × 1.5 slack so each window comfortably contains its target bar
         # count even across weekend/holiday gaps. Smaller windows = fast
@@ -235,7 +236,7 @@ class _PolygonAggsFeedBase(AssetFeed):
             )
             return []
 
-        while len(collected_points) < points_needed and empty_chunks < max_empty_chunks:
+        while len(resampled) < points_needed and empty_chunks < max_empty_chunks:
             # Floor reached: once the cursor has descended to/through
             # inception there is nothing legitimate left to fetch.
             # Break cleanly rather than burn the 3-empty-chunk budget.
@@ -383,7 +384,8 @@ class _PolygonAggsFeedBase(AssetFeed):
                     )
                     break
                 continue
-
+            resampled = _resample_to_timeframe(collected_points, timeframe)
+        resampled = resampled[-points_needed:]
         # Belt-and-suspenders: drop any collected bar at or before the
         # inception floor. The current_from clamp above prevents asking
         # for them, but a chunk that straddles the boundary can still
