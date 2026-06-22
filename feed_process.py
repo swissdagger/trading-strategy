@@ -109,7 +109,7 @@ class FeedProcess:
             try:
                 import asyncpg
                 from producer.persistence import read_feed_cursors
-                pool = await asyncpg.create_pool(self.cfg.db_url, min_size=1, max_size=2)
+                pool = await asyncpg.create_pool(self.cfg.db_url, min_size=1, max_size=2, statement_cache_size=0)
                 all_cursors = await read_feed_cursors(pool)
                 await pool.close()
                 log.info("loaded feed cursors for %d symbols", len(all_cursors))

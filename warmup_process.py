@@ -159,7 +159,7 @@ async def amain() -> None:
             "warmup_bars and feed_cursors"
         )
 
-    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=4)
+    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=4, statement_cache_size=0)
     try:
         cursors = await _warmup_all(pool)
         if cursors:

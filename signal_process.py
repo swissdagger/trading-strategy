@@ -100,7 +100,7 @@ class SignalProcess:
 
     async def start(self) -> None:
         # --- DB pool to the NEW trading project ---
-        self.pool = await asyncpg.create_pool(self.cfg.db_url, min_size=2, max_size=12)
+        self.pool = await asyncpg.create_pool(self.cfg.db_url, min_size=2, max_size=12, statement_cache_size=0)
 
         # --- Asset-class resolver from ASSET_CONFIGS (single source of truth) ---
         from config import ASSET_CONFIGS
