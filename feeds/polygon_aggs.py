@@ -49,11 +49,6 @@ from producer.bar import RateLimiter
 
 logger = logging.getLogger(__name__)
 
-def _get_base_tf(tf: str) -> str:
-    """Fetch 1s bars for sub-minute timeframes to ensure Polygon returns data."""
-    if tf in ("5s", "10s", "15s", "30s", "45s"):
-        return "1s"
-    return tf
 
 class _PolygonAggsFeedBase(AssetFeed):
     """Shared Polygon /v2/aggs feed. Subclasses set `asset_class`,
@@ -199,20 +194,17 @@ class _PolygonAggsFeedBase(AssetFeed):
             logger.error(f"Unsupported {self.asset_class} timeframe: {timeframe}")
             return []
 
-        base_tf = _get_base_tf(timeframe)
-        base_mult, base_span, _ = _parse_timeframe(base_tf)
-
-        tf_mult, tf_span, tf_base_ms = _parse_timeframe(timeframe)
-        
+        multiplier, timespan, base_ms = _parse_timeframe(timeframe)
         native_symbol = self.to_native_symbol(symbol)
         client = await self._get_client()
 
         collected_points: List[dict] = []
-        resampled: List[dict] = []  
-        
+        # Window spans ~MAX_BARS_PER_CHUNK bars (not the full request)
+        # × 1.5 slack so each window comfortably contains its target bar
+        # count even across weekend/holiday gaps. Smaller windows = fast
+        # Polygon responses; we just take more of them.
         bars_per_chunk = min(points_needed, self.MAX_BARS_PER_CHUNK)
-        # <--- 3. USE THE RENAMED VARS HERE
-        chunk_ms = int(bars_per_chunk * tf_mult * tf_base_ms * 1.5)        
+        chunk_ms = int(bars_per_chunk * multiplier * base_ms * 1.5)
         current_to = int(datetime.now(timezone.utc).timestamp() * 1000)
         empty_chunks = 0
         # Empty-chunk tolerance must SCALE with chunk count. With small
@@ -221,11 +213,38 @@ class _PolygonAggsFeedBase(AssetFeed):
         # 12h, or weekend/holiday gaps) will legitimately return several
         # empty windows in a row. The old flat `< 3` would abort such a
         # series before it reached its target. Allow empties proportional
-        # to the expected walk length (capped), so genuine sparsity is
-        # tolerated while a real outage (every chunk failing) still
-        # terminates within a bounded number of attempts.
+        # to the expected walk length, so genuine sparsity is tolerated
+        # while a real outage (every chunk failing) still terminates
+        # within a bounded number of attempts.
         expected_chunks = max(1, math.ceil(points_needed / bars_per_chunk))
-        max_empty_chunks = min(expected_chunks * 2, 12)
+
+        # ...but a flat ceiling on that budget (the old `min(..., 12)`) is
+        # WRONG for fine timeframes. Each empty chunk only rewinds the
+        # cursor by chunk_ms of WALL-CLOCK time, and chunk_ms shrinks
+        # linearly with the timeframe (5s chunk ≈ 1h; 30s chunk ≈ 6.25h).
+        # When warmup runs into a market-closed stretch (overnight, a
+        # weekend, a holiday) the most-recent wall-clock windows contain
+        # NO trades and come back empty. A flat budget of 12 lets 30s
+        # tunnel ~75h (clears a weekend) but lets 5s tunnel only ~12.5h —
+        # so 5s/10s exhaust the budget inside the closed gap and return
+        # ZERO bars, while 30s/1m+ punch through to live data. (This is
+        # exactly the observed AAPL hydration: 30s=4739 but 5s/10s=0.)
+        #
+        # Fix: size the empty-chunk budget from a fixed WALL-CLOCK gap we
+        # must always be able to clear, not from a fixed chunk count. The
+        # gap below covers a 3-day weekend plus an adjacent market holiday
+        # (e.g. Fri close → Tue open across a Monday holiday ≈ 4 days of
+        # closed wall-clock) with margin. Coarse timeframes already clear
+        # this with few chunks; fine timeframes get however many chunks
+        # that span requires. A genuine outage still terminates because
+        # the budget, while larger, remains bounded.
+        MAX_CLOSED_GAP_MS = 4 * 24 * 60 * 60 * 1000  # 4 days
+        gap_chunks = math.ceil(MAX_CLOSED_GAP_MS / chunk_ms)
+        # Hard ceiling so a pathological tiny chunk_ms can't make the
+        # budget unbounded; 600 chunks × MAX_BARS_PER_CHUNK is far more
+        # walk than any real seed needs and still terminates a true outage
+        # in finite time.
+        max_empty_chunks = min(max(expected_chunks * 2, gap_chunks), 600)
 
         # Ticker-recycling guard. If this symbol has an inception
         # floor, never page back past it — Polygon serves a recycled
@@ -243,7 +262,7 @@ class _PolygonAggsFeedBase(AssetFeed):
             )
             return []
 
-        while len(resampled) < points_needed and empty_chunks < max_empty_chunks:
+        while len(collected_points) < points_needed and empty_chunks < max_empty_chunks:
             # Floor reached: once the cursor has descended to/through
             # inception there is nothing legitimate left to fetch.
             # Break cleanly rather than burn the 3-empty-chunk budget.
@@ -261,7 +280,7 @@ class _PolygonAggsFeedBase(AssetFeed):
 
             url = (
                 f"https://api.polygon.io/v2/aggs/ticker/{native_symbol}"
-                f"/range/{base_mult}/{base_span}/{current_from}/{current_to}"
+                f"/range/{multiplier}/{timespan}/{current_from}/{current_to}"
             )
             params = {
                 "adjusted": "true",
@@ -379,7 +398,7 @@ class _PolygonAggsFeedBase(AssetFeed):
                 logger.warning(
                     f"First chunk failed for {symbol} {timeframe}; "
                     f"advancing past it and retrying older window "
-                    f"(empty_chunks={empty_chunks + 1}/3)."
+                    f"(empty_chunks={empty_chunks + 1}/{max_empty_chunks})."
                 )
                 current_to = current_from - 1
                 empty_chunks += 1
@@ -391,8 +410,7 @@ class _PolygonAggsFeedBase(AssetFeed):
                     )
                     break
                 continue
-            resampled = _resample_to_timeframe(collected_points, timeframe)
-        resampled = resampled[-points_needed:]
+
         # Belt-and-suspenders: drop any collected bar at or before the
         # inception floor. The current_from clamp above prevents asking
         # for them, but a chunk that straddles the boundary can still
@@ -451,9 +469,6 @@ class _PolygonAggsFeedBase(AssetFeed):
             multiplier, _, candle_ms = _parse_timeframe(tf)
             tf_s = (multiplier * candle_ms) // 1000
 
-            base_tf = _get_base_tf(tf)
-            base_mult, base_timespan, _ = _parse_timeframe(base_tf)
-                                                           
             # Half-candle polling, 8s floor, 600s ceiling.
             interval = min(max(tf_s // 2, 8), 600)
 
@@ -502,11 +517,10 @@ class _PolygonAggsFeedBase(AssetFeed):
                     batch: List[OHLCPoint] = []
                     for sym in symbols:
                         native = self.to_native_symbol(sym)
-                        
-                        # <--- 2. USE THE BASE TF VARIABLES HERE
+                        multiplier, timespan, _ = _parse_timeframe(tf)
                         url = (
                             f"https://api.polygon.io/v2/aggs/ticker/{native}"
-                            f"/range/{base_mult}/{base_timespan}/{cursors[sym]}/"
+                            f"/range/{multiplier}/{timespan}/{cursors[sym]}/"
                             f"{int(now.timestamp() * 1000)}"
                         )
                         params = {
