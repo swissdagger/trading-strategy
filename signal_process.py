@@ -217,15 +217,16 @@ class SignalProcess:
 
     async def _publish(self, tev: TaggedChainEvent) -> None:
         """Router publish sink: send to Kafka chain-events (audit + any other
-        consumers) AND feed the in-process strategy runtime. Both, so the audit
-        log exists and the strategy reacts with no extra hop."""
+        consumers) AND feed the in-process strategy runtime."""
         # Kafka (fire to the events topic for durability / other consumers)
         try:
             await self.producer.send(self.cfg.events_topic, _tagged_to_wire(tev))
         except Exception:
             log.exception("failed to publish tagged event to Kafka (continuing)")
-        # In-process strategy
-        await self.runtime.on_event(tev)
+            
+        # --- FIX: Call the locked method directly because FanoutRouter 
+        # already holds the per-symbol lock for this event. ---
+        await self.runtime._on_event_locked(tev)
 
     async def run(self) -> None:
         """Consume bars and pump them through the router until stopped."""
