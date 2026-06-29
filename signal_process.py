@@ -231,12 +231,15 @@ class SignalProcess:
         """Consume bars and pump them through the router until stopped."""
         from producer.bar import OHLCPoint
         assert self.consumer is not None and self.router is not None
+        
+        # Keep track of background tasks
+        background_tasks = set()
+        
         try:
             async for msg in self.consumer:
                 if self._stop.is_set():
                     break
                 raw = msg.value
-                # Skip status envelopes (WARMUP_START/LIVE_POLLING) on raw-prices.
                 if isinstance(raw, dict) and raw.get("type") == "status":
                     continue
                 try:
@@ -244,15 +247,22 @@ class SignalProcess:
                 except Exception:
                     log.exception("bad bar payload, skipping: %r", raw)
                     continue
-                # Drop bars for symbols not in our universe BEFORE routing, so the
-                # factory's resolve() is only ever called for known symbols. A
-                # foreign symbol on the bar topic is not an error here — just not
-                # ours to process.
+                
                 if not self.resolver.known(bar.symbol):
                     log.debug("bar for unknown symbol %s, skipping", bar.symbol)
                     continue
-                await self.router.on_bar(bar)
+                
+                # --- FIX: Spawn as a concurrent task instead of awaiting sequentially ---
+                task = asyncio.create_task(self.router.on_bar(bar))
+                background_tasks.add(task)
+                
+                # Clean up completed tasks so memory doesn't leak
+                task.add_done_callback(background_tasks.discard)
+                
         finally:
+            # Optionally wait for pending tasks to finish before stopping
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
             await self.stop()
 
     async def stop(self) -> None:
