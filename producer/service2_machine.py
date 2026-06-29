@@ -119,6 +119,7 @@ class ServiceTwoChainMachine(ChainMachine):
         persist_chain_terminate: PersistChainTerminate,
         load_active_chains: Optional[Callable[[], Awaitable[List[dict]]]] = None,
         load_buffers: Optional[Callable[[], Awaitable[Dict[str, deque]]]] = None,
+        forecast_timeout_s: float = 30.0,
     ):
         self.symbol = symbol
         self.asset_class = asset_class
@@ -135,6 +136,7 @@ class ServiceTwoChainMachine(ChainMachine):
         self._persist_term = persist_chain_terminate
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
+        self._forecast_timeout_s = forecast_timeout_s
 
         # --- per-(symbol,set) state (was module-level, keyed by (ac,symbol)) ---
         self._lock = asyncio.Lock()
@@ -199,22 +201,79 @@ class ServiceTwoChainMachine(ChainMachine):
         api_ready_df, placeholder_dt = self._prepare_df(df, bar.timeframe)
         interval, interval_unit = self._to_interval(bar.timeframe)
 
-        # Blocking Sumtyme call off the event loop — never await it directly.
-        forecast = await asyncio.to_thread(
-            self._forecast_fn,
-            time_series_type="ohlc",
-            data_input=api_ready_df,
-            interval=interval,
-            interval_unit=interval_unit,
-            reasoning_mode="reactive",
-            timeframe_dependent=False,
-        )
-        if isinstance(forecast, Exception) or not forecast:
+        # Blocking Sumtyme call off the event loop — never await it directly, and
+        # BOUND it. Without a timeout, a hung forecast call wedges the single
+        # consume loop indefinitely: the to_thread worker blocks, the committed
+        # offset freezes, and the DB silently stops advancing (observed: a multi-day
+        # stall). wait_for converts a hang into a TimeoutError that flows into the
+        # existing "treat as no forecast" path below (return []), so one slow/stuck
+        # forecast skips its bar instead of halting the pipeline.
+        #
+        # NOTE: wait_for cancels the AWAIT, not the underlying thread — the worker
+        # keeps running the blocked SDK call until the OS call returns. Set a request
+        # timeout on the Sumtyme client too (so the thread actually unblocks rather
+        # than leaking a stuck worker on repeated timeouts).
+        try:
+            forecast = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._forecast_fn,
+                    time_series_type="ohlc",
+                    data_input=api_ready_df,
+                    interval=interval,
+                    interval_unit=interval_unit,
+                    reasoning_mode="reactive",
+                    timeframe_dependent=False,
+                ),
+                timeout=self._forecast_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            # The hang path. LOUD on purpose: this is the failure that silently
+            # froze the pipeline for days. One per stuck bar; a burst of these
+            # means Sumtyme is down/degraded, not a one-off.
+            log.warning(
+                "forecast TIMEOUT after %ss for %s/%s ts=%s — skipping bar "
+                "(repeated timeouts = Sumtyme unreachable/degraded)",
+                self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
+            )
+            return []
+        except Exception:
+            # The SDK raised (network, 4xx/5xx, bad payload). Previously a raised
+            # exception here would unwind out of on_bar -> run() and stop the
+            # consume loop entirely (silent DB freeze). Catch, log with traceback,
+            # skip the bar — the loop keeps draining.
+            log.exception(
+                "forecast ERROR for %s/%s ts=%s — skipping bar",
+                self.symbol, bar.timeframe, bar.timestamp,
+            )
+            return []
+
+        # Sumtyme returned but the result is unusable. The SDK can hand back an
+        # Exception object or a falsy/empty dict instead of raising; that used to
+        # be a SILENT `return []`. Make it visible — a steady stream of these means
+        # the forecast is failing in a way that doesn't raise, which you want to
+        # see, not have hidden.
+        if isinstance(forecast, Exception):
+            log.warning(
+                "forecast returned an Exception object for %s/%s ts=%s: %r — skipping bar",
+                self.symbol, bar.timeframe, bar.timestamp, forecast,
+            )
+            return []
+        if not forecast:
+            log.warning(
+                "forecast returned empty/falsy result (%r) for %s/%s ts=%s — skipping bar",
+                forecast, self.symbol, bar.timeframe, bar.timestamp,
+            )
             return []
 
         signal_value = list(forecast.values())[0]
         current_price = bar.close
         bar_iso = _epoch_ms_to_iso(bar.timestamp)
+
+        # Success path is observable at DEBUG: a healthy pipeline emits a steady
+        # stream of these; sudden silence (with bars still arriving) localises a
+        # stall to *after* the forecast returns. Cheap heartbeat for the loop.
+        log.debug("forecast OK %s/%s ts=%s -> signal=%s",
+                  self.symbol, bar.timeframe, bar.timestamp, signal_value)
 
         # Persist the raw signal (research/audit). Failure here is recoverable —
         # the next bar's UPSERT re-writes it — so log-and-continue, not raise.
