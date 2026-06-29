@@ -103,12 +103,10 @@ class StrategyRuntime:
         n = sum(len(v) for v in self._open_by_symbol.values())
         log.info("runtime restored %d open positions for exit evaluation", n)
 
-    async def on_raw_event(self, raw: dict) -> None:
-        """Single ingress for each causal-events message. Builds the tagged event
-        (raises if untagged — not from the two-ladder machine), then does all
-        work under the symbol lock in the required order: apply-to-view, then
-        entry, then exit sweep."""
-        ev = TaggedChainEvent.from_raw(raw)   # raises on missing 'set' tag
+    async def on_event(self, ev: TaggedChainEvent) -> None:
+        """Single ingress for an already-built tagged event. Does all work under
+        the symbol lock in the required order: apply-to-view, then entry, then
+        exit sweep."""
         async with self._lock(ev.symbol):
             # 1. Fold into the view FIRST so strategy sees current state.
             self.view.apply(ev)
@@ -117,6 +115,13 @@ class StrategyRuntime:
             # 3. Exit sweep: re-evaluate every open position on this symbol against
             #    the freshly-updated view.
             await self._sweep_exits(ev.symbol, ev.timestamp)
+
+    async def on_raw_event(self, raw: dict) -> None:
+        """Ingress for a raw causal-events dict (e.g. from Kafka). Builds the
+        tagged event (raises if untagged — not from the two-ladder machine),
+        then delegates to on_event."""
+        ev = TaggedChainEvent.from_raw(raw)   # raises on missing 'set' tag
+        await self.on_event(ev)
 
     async def _try_entry(self, ev: TaggedChainEvent) -> None:
         pkey = await self.entry.on_event(ev)
