@@ -199,6 +199,7 @@ class _PolygonAggsFeedBase(AssetFeed):
         client = await self._get_client()
 
         collected_points: List[dict] = []
+        resampled: List[dict] = []
         # Window spans ~MAX_BARS_PER_CHUNK bars (not the full request)
         # × 1.5 slack so each window comfortably contains its target bar
         # count even across weekend/holiday gaps. Smaller windows = fast
@@ -262,7 +263,7 @@ class _PolygonAggsFeedBase(AssetFeed):
             )
             return []
 
-        while len(collected_points) < points_needed and empty_chunks < max_empty_chunks:
+        while len(resampled) < points_needed and empty_chunks < max_empty_chunks:
             # Floor reached: once the cursor has descended to/through
             # inception there is nothing legitimate left to fetch.
             # Break cleanly rather than burn the 3-empty-chunk budget.
@@ -273,8 +274,21 @@ class _PolygonAggsFeedBase(AssetFeed):
                 # Clamp this chunk's lower bound to inception so we ask
                 # Polygon only for the [inception, current_to] slice.
                 current_from = floor_ms
+            # `resampled` is recomputed below from the running
+            # `collected_points`, so this reflects the actual number of
+            # OUTPUT bars we have so far — not raw bars. Resampling can
+            # be lossy (a chunk boundary can split a window so one side
+            # never accumulates a full bucket, sparse/holiday gaps drop
+            # windows entirely), so raw-bar count alone is NOT a safe
+            # proxy for "have we collected enough." Sizing limit_needed
+            # off the real shortfall, and re-deriving that shortfall
+            # every iteration, is what makes the loop keep paging back
+            # until 5000 OUTPUT bars actually exist (previously it
+            # silently undershot to ~4900 whenever resampling dropped a
+            # few windows, because the loop's exit check never saw the
+            # resampled count at all).
             limit_needed = min(
-                points_needed - len(collected_points),
+                points_needed - len(resampled),
                 self.MAX_BARS_PER_CHUNK,
             )
 
@@ -337,6 +351,19 @@ class _PolygonAggsFeedBase(AssetFeed):
                         collected_points.extend(results)
                         current_to = results[-1]["t"] - 1
                         empty_chunks = 0
+                        # Re-resample on every successful chunk (not
+                        # just once at the end) so the loop's own exit
+                        # check — len(resampled) < points_needed — is
+                        # measuring real OUTPUT bars instead of a stale
+                        # value that's always 0 until the loop exits.
+                        # _resample_to_timeframe buckets by window_start
+                        # and tracks _first_t/_last_t per bucket itself,
+                        # so it's order-independent — no need to sort
+                        # collected_points first (confirmed from the
+                        # source in polygon_options.py).
+                        resampled = _resample_to_timeframe(
+                            collected_points, timeframe,
+                        )
                     else:
                         current_to = current_from - 1
                         empty_chunks += 1
@@ -410,6 +437,8 @@ class _PolygonAggsFeedBase(AssetFeed):
                     )
                     break
                 continue
+            
+
 
         # Belt-and-suspenders: drop any collected bar at or before the
         # inception floor. The current_from clamp above prevents asking
@@ -426,6 +455,7 @@ class _PolygonAggsFeedBase(AssetFeed):
                 )
 
         resampled = _resample_to_timeframe(collected_points, timeframe)
+        resampled = resampled[-points_needed:]
 
         return [
             OHLCPoint(
