@@ -229,13 +229,28 @@ class SignalProcess:
         await self.runtime._on_event_locked(tev)
 
     async def run(self) -> None:
-        """Consume bars and pump them through the router until stopped."""
+        """Consume bars and pump them through the router until stopped.
+
+        Bars are awaited SEQUENTIALLY (not spawned as concurrent tasks). This is
+        load-bearing, not an oversight: FanoutRouter.on_bar takes the per-symbol
+        lock, and StrategyRuntime shares that same lock map — the publish sink
+        (_publish, below) calls runtime._on_event_locked() on the assumption that
+        the caller (the router, mid on_bar) already holds the symbol's lock. If
+        bars were dispatched concurrently, two bars for the SAME symbol could run
+        at once: their on_bar calls would contend for the lock while a third
+        could read/mutate the ChainView out of order, and the timestamp-ordered
+        propagation logic in the chain machine (next_sig["timestamp"] >=
+        chain["last_timestamp"]) would no longer see bars in the order Kafka
+        delivered them. That combination silently breaks chain propagation and
+        the entry/exit decision logic without raising — the chains table still
+        fills (it's lock-independent), but trade_signals does not. If
+        cross-symbol throughput is needed, the correct shape is per-symbol
+        ordered workers (one queue/task per symbol), not a blanket create_task
+        per bar — ask before reintroducing concurrency here.
+        """
         from producer.bar import OHLCPoint
         assert self.consumer is not None and self.router is not None
-        
-        # Keep track of background tasks
-        background_tasks = set()
-        
+
         try:
             async for msg in self.consumer:
                 if self._stop.is_set():
@@ -248,22 +263,13 @@ class SignalProcess:
                 except Exception:
                     log.exception("bad bar payload, skipping: %r", raw)
                     continue
-                
+
                 if not self.resolver.known(bar.symbol):
                     log.debug("bar for unknown symbol %s, skipping", bar.symbol)
                     continue
-                
-                # --- FIX: Spawn as a concurrent task instead of awaiting sequentially ---
-                task = asyncio.create_task(self.router.on_bar(bar))
-                background_tasks.add(task)
-                
-                # Clean up completed tasks so memory doesn't leak
-                task.add_done_callback(background_tasks.discard)
-                
+
+                await self.router.on_bar(bar)
         finally:
-            # Optionally wait for pending tasks to finish before stopping
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
             await self.stop()
 
     async def stop(self) -> None:
