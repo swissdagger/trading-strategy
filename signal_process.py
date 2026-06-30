@@ -47,6 +47,8 @@ from producer.ladders import LADDERS
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
+    make_load_chain_view_seed,
+    make_load_open_positions,
     make_persist_chain_init,
     make_persist_chain_propagate,
     make_persist_chain_terminate,
@@ -192,27 +194,50 @@ class SignalProcess:
         return factory
 
     def _runtime_hooks(self):
-        """Persistence for the strategy's open-position watch set. On a signal-only
-        deployment this can be in-memory (the consuming team owns position state),
-        but persisting to exit_state.rule_state lets the position manager resume
-        the SAME watch later. Minimal in-memory version here; swap for DB-backed
-        when the position manager is switched on."""
-        from strategy.runtime import RuntimeHooks
-        store: dict = {}
+        """Persistence for the strategy's open-position watch set.
+
+        load_open_positions is DB-backed (make_load_open_positions, reading
+        trade_signals) so the open set survives restarts — see that function's
+        docstring for why no new table is needed.
+
+        save_open_position / remove_open_position are deliberately NO-OPS, not
+        an oversight: SignalWriter already durably persists every ENTER/EXIT to
+        trade_signals AT THE MOMENT the decision is made (that's what
+        load_open_positions reads back). A previous version of these hooks
+        wrote to a separate in-memory dict that was never actually durable —
+        it looked like a persistence layer but provided none, and on a restart
+        the strategy's open-position tracking silently reset to empty even
+        though trade_signals knew better the whole time. Removing that fake
+        persistence is the fix, not an oversight to restore."""
+        from strategy.runtime import RuntimeHooks, OpenPosition
+
+        load_open_rows = make_load_open_positions(self.pool)
 
         async def load_open():
-            return list(store.values())
+            rows = await load_open_rows()
+            return [
+                OpenPosition(
+                    position_key=r["position_key"], symbol=r["symbol"],
+                    asset_class=r["asset_class"], chain_prime_id=r["chain_id"],
+                    trade_direction=1 if r["direction"] == "LONG" else -1,
+                )
+                for r in rows
+            ]
 
         async def save_open(p):
-            store[p.position_key] = p
+            pass   # already durable: SignalWriter.emit_entry wrote this ENTER
 
         async def remove_open(k):
-            store.pop(k, None)
+            pass   # already durable: SignalWriter.emit_exit wrote the EXIT
 
         return RuntimeHooks(
             load_open_positions=load_open,
             save_open_position=save_open,
             remove_open_position=remove_open,
+            # DB-backed: ChainView hydration must reflect real persisted chain
+            # state across restarts (unlike open positions above, which are
+            # genuinely fine to lose on a signal-only deployment).
+            load_chain_view_seed=make_load_chain_view_seed(self.pool),
         )
 
     async def _publish(self, tev: TaggedChainEvent) -> None:

@@ -69,6 +69,12 @@ class RuntimeHooks:
     load_open_positions: Callable[[], Awaitable[list[OpenPosition]]]
     save_open_position: Callable[[OpenPosition], Awaitable[None]]
     remove_open_position: Callable[[str], Awaitable[None]]   # by position_key
+    # Optional: load every active chain (all symbols, both sets) to hydrate the
+    # ChainView at startup — see chain_view.ChainView.seed_active and
+    # producer.persistence.make_load_chain_view_seed. Optional (defaults to
+    # None) so existing callers / tests that don't wire DB-backed chain
+    # hydration keep working unchanged; start() simply skips seeding if absent.
+    load_chain_view_seed: Optional[Callable[[], Awaitable[list[dict]]]] = None
 
 
 class StrategyRuntime:
@@ -102,6 +108,22 @@ class StrategyRuntime:
             self._open_by_symbol[p.symbol][p.position_key] = p
         n = sum(len(v) for v in self._open_by_symbol.values())
         log.info("runtime restored %d open positions for exit evaluation", n)
+
+        # Hydrate the ChainView itself, separately from open positions. Without
+        # this, every restart resets the strategy's view of which chains are
+        # active to empty — even though both the DB and the producer-side
+        # machine still know — and entry/exit decisions would only ever see
+        # chains that happen to emit a FRESH event after this restart. See
+        # ChainView.seed_active for why this can't be reconstructed from events.
+        if self.hooks.load_chain_view_seed is not None:
+            seeds = await self.hooks.load_chain_view_seed()
+            for s in seeds:
+                self.view.seed_active(
+                    symbol=s["symbol"], set_=ChainSet(s["set"]),
+                    chain_id=s["chain_id"], direction=s["direction"],
+                    peak_level=s["peak_level"],
+                )
+            log.info("runtime seeded ChainView with %d active chains from DB", len(seeds))
 
     async def on_event(self, ev: TaggedChainEvent) -> None:
         """Single ingress for an already-built tagged event when the lock is NOT held."""

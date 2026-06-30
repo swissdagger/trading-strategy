@@ -123,6 +123,31 @@ class ChainView:
     def _bucket(self, symbol: str, set_: ChainSet) -> Dict[str, ChainRecord]:
         return self._chains.setdefault(symbol, {}).setdefault(set_, {})
 
+    def seed_active(
+        self, symbol: str, set_: ChainSet, chain_id: str,
+        direction: int, peak_level: int,
+    ) -> None:
+        """Directly register an already-active chain WITHOUT an event — used
+        ONLY at startup to hydrate the view from the persisted `chains` table
+        (the consumer-side counterpart to the chain machine's own
+        hydrate-on-restart). A chain that was active before a restart may never
+        emit another event (e.g. a Set B chain already at its ladder's top can
+        only ever terminate from here, never propagate again) — without this,
+        such a chain is permanently invisible to entry/exit decisions after any
+        restart, even though it's still active in the DB and in the machine.
+
+        Not used during live processing; apply() is for that, since it derives
+        state from event sequencing rather than taking peak_level as given.
+        Idempotent / order-independent: if called more than once for the same
+        chain_id (or interleaved with an early live event for it), the higher
+        peak_level wins, matching apply()'s "peak only ascends" rule."""
+        bucket = self._bucket(symbol, set_)
+        existing = bucket.get(chain_id)
+        if existing is None:
+            bucket[chain_id] = ChainRecord(chain_id, direction, peak_level)
+        elif peak_level > existing.peak_level:
+            existing.peak_level = peak_level
+
     def apply(self, ev: TaggedChainEvent) -> None:
         """Fold one event into the view. initiate/propagate upsert the chain and
         advance its peak level; terminate removes it (a terminated chain is no
