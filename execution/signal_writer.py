@@ -45,17 +45,21 @@ def position_key(chain_id: str, side: TradeSide) -> str:
     return f"{chain_id}:{'L' if side == TradeSide.LONG else 'S'}"
 
 
-def _signal_id(position_key_: str, action: str, discriminator: str) -> str:
+def _signal_id(strategy: str, position_key_: str, action: str, discriminator: str) -> str:
     """Deterministic signal id. Same logical decision -> same id.
 
-    discriminator distinguishes signals that share (position_key, action) but are
-    genuinely different decisions — for an ENTER there is only ever one per
-    position so the discriminator is empty; for an EXIT it is the exit reason (a
-    position is exited once, but carrying the reason keeps the id meaningful and
-    guards against a future where re-exit semantics change). Hashed to a compact,
-    table-safe id; the inputs are all reproducible so the output is too.
+    Now includes `strategy`: two strategies can decide on the same chain (same
+    position_key + action), and their signals MUST be distinct rows, not
+    deduped into one. Folding strategy into the hash makes the id distinct per
+    strategy while staying deterministic (same strategy + decision -> same id,
+    so replays still dedupe within a strategy). Pre-multi-strategy ids used
+    strategy 'two_ladder'; that value reproduces the original ids for that
+    strategy, so its historical dedupe behaviour is unchanged.
+
+    discriminator distinguishes signals sharing (strategy, position_key, action)
+    — empty for ENTER (one per position), the exit reason for EXIT.
     """
-    raw = f"sig1|{position_key_}|{action}|{discriminator}"
+    raw = f"sig1|{strategy}|{position_key_}|{action}|{discriminator}"
     return "sig1." + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -68,10 +72,19 @@ class SignalWriterHooks:
 
 
 class SignalWriter:
-    """Persists entry/exit decisions as trade_signals rows."""
+    """Persists entry/exit decisions as trade_signals rows.
 
-    def __init__(self, hooks: SignalWriterHooks):
+    Carries the STRATEGY name that produced these decisions, folded into each
+    signal_id (so two strategies don't collide on the PK) and written to the
+    trade_signals.strategy column (migration 011). Defaults to 'two_ladder' so a
+    single-strategy deployment and the pre-multi-strategy history are unchanged.
+    In the multi-strategy runtime, each strategy gets its own SignalWriter bound
+    to its name.
+    """
+
+    def __init__(self, hooks: SignalWriterHooks, strategy: str = "two_ladder"):
         self.hooks = hooks
+        self.strategy = strategy
 
     async def emit_entry(
         self,
@@ -88,7 +101,7 @@ class SignalWriter:
         Returns the position_key the consumer will track this position by (and
         which a later exit must reference)."""
         pkey = position_key(chain_id, side)
-        sig_id = _signal_id(pkey, "ENTER", "")
+        sig_id = _signal_id(self.strategy, pkey, "ENTER", "")
         row = {
             "signal_id": sig_id,
             "position_key": pkey,
@@ -97,6 +110,7 @@ class SignalWriter:
             "action": "ENTER",
             "symbol": symbol,
             "asset_class": asset_class,
+            "strategy": self.strategy,
             "trigger_level": trigger_level,
             "decision_price": decision_price,
             "exit_reason": None,
@@ -128,7 +142,7 @@ class SignalWriter:
         (the table carries enough to detect it — see 004's note). Returns the
         position_key."""
         pkey = position_key(chain_id, side)
-        sig_id = _signal_id(pkey, "EXIT", reason.value)
+        sig_id = _signal_id(self.strategy, pkey, "EXIT", reason.value)
         row = {
             "signal_id": sig_id,
             "position_key": pkey,
@@ -137,6 +151,7 @@ class SignalWriter:
             "action": "EXIT",
             "symbol": symbol,
             "asset_class": asset_class,
+            "strategy": self.strategy,
             "trigger_level": trigger_level,
             "decision_price": decision_price,
             "exit_reason": reason.value,

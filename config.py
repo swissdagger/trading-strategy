@@ -38,14 +38,20 @@ TWO_LADDER_TIMEFRAMES = ["5s", "10s", "30s", "1m", "2m", "5m", "10m"]
 # 'baseline_timeframe' — informational; the actual per-set baselines are the first
 #   entry of each ladder (5s for Set A, 30s for Set B), owned by producer/ladders.
 ASSET_CONFIGS = {
-    # "crypto": {
-    #     "symbols": [
-    #         "BTCUSDT",
-    #     ],
-    #     "timeframes": list(TWO_LADDER_TIMEFRAMES),
-    #     "points": 5000,
-    #     "baseline_timeframe": "5s",
-    # },
+    "crypto": {
+        "symbols": [
+            "BTCUSDT",
+        ],
+        # The four_chain strategy's ladder [1m,3m,5m,15m,1h] — all >= 1m, all
+        # Binance-native, so warmup seeds 5000 bars per timeframe and the ws
+        # feed streams them natively (no sub-minute derivation needed here).
+        # If a sub-minute strategy is later added on crypto, extend this to the
+        # union of all crypto strategies' ladder timeframes.
+        "timeframes": ["1m", "3m", "5m", "15m", "1h"],
+        "points": 5000,
+        "baseline_timeframe": "1m",
+        "transport": "ws",
+    },
     "equity": {
         "symbols": [
             "AAPL"
@@ -53,6 +59,18 @@ ASSET_CONFIGS = {
         "timeframes": list(TWO_LADDER_TIMEFRAMES),
         "points": 5000,
         "baseline_timeframe": "5s",
+        # 'transport' selects the live-data path for this class:
+        #   "rest" (default) — the polling AssetFeed (PolygonStocksFeed, ...)
+        #   "ws"             — the websocket AssetFeed (PolygonStocksWSFeed)
+        # Absent key => "rest", so existing configs are unchanged. Only the
+        # LIVE path differs; warmup and reconnect-backfill use the REST feed
+        # either way. Migrate one class at a time; fall back to "rest" if a
+        # ws feed misbehaves in early live trading. All three classes now
+        # have ws feeds (equity/fx via Polygon clusters, crypto via Binance).
+        # Note: crypto sub-minute rungs (5s/10s/30s) are DERIVED from the
+        # Binance 1s kline and cannot be REST-backfilled on reconnect — they
+        # self-heal live. See feeds/binance_ws for detail.
+        "transport": "ws",
     },
     # "fx": {
     #     "symbols": [
@@ -71,3 +89,79 @@ def all_tracked_symbols() -> list[str]:
     for cfg in ASSET_CONFIGS.values():
         out.extend(cfg.get("symbols", []))
     return out
+
+
+# Valid live-data transports. "rest" = the polling feeds; "ws" = the
+# websocket feeds. Kept as a module constant so feed_process and config
+# validation agree on the allowed set.
+VALID_TRANSPORTS = ("rest", "ws")
+
+# Asset classes that actually HAVE a websocket feed today. A class not
+# listed here must not be configured with transport="ws" — the feed
+# builder would have nothing to instantiate.
+WS_CAPABLE_CLASSES = ("equity", "fx", "crypto")
+
+
+def transport_for(asset_class: str) -> str:
+    """The configured live-data transport for a class: 'ws' or 'rest'.
+
+    Defaults to 'rest' when the key is absent (existing configs unchanged).
+    Raises on an unknown transport VALUE. Whether a class actually HAS a ws
+    feed is a feed-construction concern, checked in feed_process._build_feeds
+    (which raises RuntimeError, the codebase's startup-misconfig convention) —
+    kept out of here so this stays a pure config-value accessor.
+    """
+    cfg = ASSET_CONFIGS.get(asset_class, {})
+    transport = cfg.get("transport", "rest")
+    if transport not in VALID_TRANSPORTS:
+        raise ValueError(
+            f"{asset_class}: unknown transport {transport!r}; "
+            f"expected one of {VALID_TRANSPORTS}"
+        )
+    return transport
+
+# ---------------------------------------------------------------------------
+# Master trade-enable DEFAULT (execution/trade_enable.py).
+# The boot/fallback state for live order placement. The trade_enabled DB row
+# (migration 010) is the LIVE override that wins once running; this is only the
+# starting state and the fallback if the row can't be read. False = boot with
+# trading OFF (the safe default — go live deliberately, never by accident).
+# ---------------------------------------------------------------------------
+TRADE_ENABLED_DEFAULT = False
+
+# ---------------------------------------------------------------------------
+# STRATEGIES — the multi-strategy registry config (strategy/registry.py).
+# Each entry: enabled, the symbols it trades ('*' = all tracked), the LADDERS
+# it reads chains from (strategy/ladder_registry.py), and opaque params. A
+# disabled strategy is never instantiated. The union of all enabled strategies'
+# ladders is what the system computes (compute-once); shared ladders are
+# computed once. Add a strategy: register its factory + add an entry here.
+# ---------------------------------------------------------------------------
+STRATEGIES = {
+    "two_ladder": {
+        "enabled": True,
+        "symbols": "*",              # all tracked symbols
+        "ladders": ["A", "B"],       # the original two-ladder design
+        "params": {},
+    },
+    "four_chain": {
+        "enabled": True,              # ladder is streamed + warmed (crypto config)
+        "symbols": ["BTCUSDT"],
+        "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
+        "params": {"retention_hours": 3},
+    },
+    # Example of a future strategy on different ladders (disabled):
+    # "mean_revert": {
+    #     "enabled": False,
+    #     "symbols": ["EURUSD"],
+    #     "ladders": ["C"],           # e.g. a 1m/5m/1h ladder registered at startup
+    #     "params": {"lookback": 20},
+    # },
+}
+
+# Extra ladders to register beyond the built-in A and B (name -> timeframes).
+# A strategy referencing a ladder name not here (and not A/B) fails at startup.
+EXTRA_LADDERS = {
+    "FC": ["1m", "3m", "5m", "15m", "1h"],   # four_chain strategy's ladder
+}
+

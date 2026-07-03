@@ -1,0 +1,26 @@
+-- ============================================================================
+-- 007_drop_signals_asset_class_idx.sql   (OPTIONAL — write-latency tuning)
+--
+-- Drops ix_signals_asset_class. This index is maintained on EVERY insert into
+-- signals (the highest-volume table in the system), but it is low-selectivity:
+-- asset_class has only three possible values ('crypto'|'equity'|'fx'), so an
+-- index on it alone rarely helps a query — Postgres will usually seq-scan or
+-- prefer ix_signals_symbol_ts anyway. The per-insert maintenance cost is paid
+-- on the hot path regardless of whether any query uses it.
+--
+-- APPLY THIS ONLY IF your research queries do not filter by asset_class alone.
+-- If you DO have such queries and they matter, keep the index — the write cost
+-- is the price of that read path. If those queries also constrain symbol or
+-- time (the common case), ix_signals_symbol_ts already serves them and this
+-- index is redundant.
+--
+-- Reversible: re-create with the original definition if a need appears.
+--   CREATE INDEX ix_signals_asset_class ON signals (asset_class);
+--
+-- Note: with the batched async writer, signals inserts now arrive in batches
+-- rather than one-per-bar, which already amortizes index maintenance somewhat;
+-- dropping a redundant index compounds that. Independent of the writer change,
+-- though — safe to apply or skip on its own.
+-- ============================================================================
+
+DROP INDEX IF EXISTS ix_signals_asset_class;

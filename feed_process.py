@@ -42,36 +42,107 @@ class FeedConfig:
         self.db_url = os.environ.get("TRADING_DB_URL")   # for reading feed_cursors
 
 
-def _build_feeds(asset_configs: dict) -> dict:
-    """Instantiate one AssetFeed per asset class present in ASSET_CONFIGS.
+def _build_rest_feed(asset_class: str, symbols: list, timeframes: list, polygon_api_key: str | None):
+    """Instantiate the REST (polling) AssetFeed for one class, or None if the
+    class is unknown. This is the ONE place each REST feed is constructed —
+    used both for transport='rest' (it IS the live feed) and transport='ws'
+    (it becomes the ws feed's backfill engine), so the two paths can't build
+    the REST feed differently.
 
-    Imports the concrete feeds lazily so the module loads without the feed deps
-    present (and so a class with no symbols configured doesn't force its feed's
-    import). Maps asset_class -> feed instance. Extend this when adding a class:
-    one import + one mapping entry, mirroring the feeds package's design.
+    Lazy imports keep the module loadable without every feed's deps present
+    and avoid importing a feed for a class that has no symbols configured.
     """
+    if asset_class == "crypto":
+        from feeds.binance_futures import BinanceFuturesFeed
+        return BinanceFuturesFeed(symbols, timeframes)
+    if asset_class == "equity":
+        if not polygon_api_key:
+            raise RuntimeError("POLYGON_API_KEY not set — required for the equity feed")
+        from feeds.polygon_stocks import PolygonStocksFeed
+        return PolygonStocksFeed(polygon_api_key, symbols, timeframes)
+    if asset_class == "fx":
+        if not polygon_api_key:
+            raise RuntimeError("POLYGON_API_KEY not set — required for the fx feed")
+        from feeds.polygon_forex import PolygonForexFeed
+        return PolygonForexFeed(polygon_api_key, symbols, timeframes)
+    return None
+
+
+def _build_ws_feed(asset_class: str, backfill_feed, polygon_api_key: str | None):
+    """Instantiate the websocket AssetFeed for one class, composing the given
+    REST feed as its reconnect-backfill engine. Returns None if the class has
+    no ws feed (config.transport_for already rejects ws for such classes, so
+    this is defence in depth, not the primary guard).
+
+    The ws feed and its backfill sibling share the same api_key, symbols, and
+    timeframes — the sibling was built by _build_rest_feed for exactly this
+    class, so the backfill path fetches the identical history the REST
+    transport would.
+    """
+    if asset_class == "equity":
+        from feeds.polygon_ws import PolygonStocksWSFeed
+        return PolygonStocksWSFeed(polygon_api_key, backfill_feed)
+    if asset_class == "fx":
+        from feeds.polygon_ws import PolygonForexWSFeed
+        return PolygonForexWSFeed(polygon_api_key, backfill_feed)
+    if asset_class == "crypto":
+        # Binance ws needs no api_key (public market streams); the backfill
+        # sibling (BinanceFuturesFeed) is the outage-fetch engine, though it
+        # only covers 1m+ rungs — sub-minute rungs self-heal live. See
+        # binance_ws for the backfill-asymmetry note.
+        from feeds.binance_ws import BinanceFuturesWSFeed
+        return BinanceFuturesWSFeed(backfill_feed)
+    return None
+
+
+def _build_feeds(asset_configs: dict) -> dict:
+    """Instantiate one live AssetFeed per asset class present in ASSET_CONFIGS,
+    selecting the polling (rest) or websocket (ws) transport per class via
+    config.transport_for. Maps asset_class -> feed instance.
+
+    Extend for a new class: add its branch to _build_rest_feed (and, if it
+    gains a websocket, _build_ws_feed) — the same one-import-one-entry shape
+    as before, now split by transport.
+
+    For a ws-transport class, the REST feed is still built (as the backfill
+    engine) and wrapped by the ws feed; the ws feed is what goes live. Both
+    satisfy the identical AssetFeed contract, so everything downstream of
+    _build_feeds (start_live, the callback, cursor handoff, Kafka publish)
+    is transport-agnostic.
+    """
+    from config import transport_for
+
     feeds = {}
     polygon_api_key = os.environ.get("POLYGON_API_KEY")
     for asset_class, cfg in asset_configs.items():
         symbols = cfg.get("symbols")
         if not symbols:
-            continue   # nothing to poll for this class
+            continue   # nothing to stream for this class
         timeframes = cfg["timeframes"]
-        if asset_class == "crypto":
-            from feeds.binance_futures import BinanceFuturesFeed
-            feeds[asset_class] = BinanceFuturesFeed(symbols, timeframes)
-        elif asset_class == "equity":
-            if not polygon_api_key:
-                raise RuntimeError("POLYGON_API_KEY not set — required for the equity feed")
-            from feeds.polygon_stocks import PolygonStocksFeed
-            feeds[asset_class] = PolygonStocksFeed(polygon_api_key, symbols, timeframes)
-        elif asset_class == "fx":
-            if not polygon_api_key:
-                raise RuntimeError("POLYGON_API_KEY not set — required for the fx feed")
-            from feeds.polygon_forex import PolygonForexFeed
-            feeds[asset_class] = PolygonForexFeed(polygon_api_key, symbols, timeframes)
-        else:
+
+        rest_feed = _build_rest_feed(asset_class, symbols, timeframes, polygon_api_key)
+        if rest_feed is None:
             log.warning("no feed wired for asset class %r — skipping", asset_class)
+            continue
+
+        transport = transport_for(asset_class)
+        if transport == "ws":
+            ws_feed = _build_ws_feed(asset_class, rest_feed, polygon_api_key)
+            if ws_feed is None:
+                # ws requested for a class with no ws feed (e.g. crypto until
+                # binance_ws lands). Fail loudly at startup — a silent fall
+                # back to polling would hide a real misconfiguration. Same
+                # RuntimeError convention as the missing-API-key check above.
+                raise RuntimeError(
+                    f"{asset_class}: transport='ws' but no websocket feed exists "
+                    f"for this class. Use transport='rest' or add a ws feed."
+                )
+            feeds[asset_class] = ws_feed
+            log.info("class %r using WEBSOCKET transport (rest feed as backfill)",
+                     asset_class)
+        else:
+            feeds[asset_class] = rest_feed
+            log.info("class %r using REST (polling) transport", asset_class)
     return feeds
 
 class FeedProcess:
