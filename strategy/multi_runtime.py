@@ -43,7 +43,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Optional
 
-from strategy.chain_view import ChainView, TaggedChainEvent
+from strategy.chain_view import ChainSet, ChainView, TaggedChainEvent
 from strategy.registry import (
     Strategy,
     StrategyRegistry,
@@ -104,6 +104,12 @@ class RuntimeHooks:
     load_open_positions: Callable[[], Awaitable[list[OpenPosition]]]
     save_open_position: Callable[[OpenPosition], Awaitable[None]]
     remove_open_position: Callable[[str], Awaitable[None]]   # by tracking_key
+    # Optional: load every active chain (all symbols, both sets) to hydrate the
+    # shared two-ladder ChainView at startup — see chain_view.ChainView.seed_active
+    # and producer.persistence.make_load_chain_view_seed. Optional (defaults to
+    # None) so existing callers/tests that don't wire DB-backed chain hydration
+    # keep working unchanged; start() simply skips seeding when it's absent.
+    load_chain_view_seed: Optional[Callable[[], Awaitable[list[dict]]]] = None
 
 
 class MultiStrategyRuntime:
@@ -131,30 +137,50 @@ class MultiStrategyRuntime:
         return self._locks[symbol]
 
     async def start(self) -> None:
-        """Restore open positions so exit evaluation resumes after a restart."""
+        """Restore open positions so exit evaluation resumes after a restart,
+        then hydrate the shared two-ladder ChainView from the DB so entry/exit
+        decisions see chains that were active before the restart (not just ones
+        that emit a fresh event after it). See ChainView.seed_active for why the
+        view can't be reconstructed from the live event stream alone."""
         for p in await self.hooks.load_open_positions():
             self._open_by_symbol[p.symbol][p.tracking_key] = p
         n = sum(len(v) for v in self._open_by_symbol.values())
         log.info("multi-runtime restored %d open positions for exit evaluation", n)
 
-    async def on_raw_event(self, raw: dict) -> None:
-        """Single ingress per causal-events message. Parses the raw message into
-        a tagged event, then processes it (apply-to-view, entry fan-out, exit
-        sweep) under the symbol lock."""
-        ev = TaggedChainEvent.from_raw(raw)
-        await self.on_raw_event_direct(ev)
+        # Hydrate the shared two-ladder ChainView, separately from open positions.
+        if self.view is not None and self.hooks.load_chain_view_seed is not None:
+            seeds = await self.hooks.load_chain_view_seed()
+            for s in seeds:
+                self.view.seed_active(
+                    symbol=s["symbol"], set_=ChainSet(s["set"]),
+                    chain_id=s["chain_id"], direction=s["direction"],
+                    peak_level=s["peak_level"],
+                )
+            log.info("multi-runtime seeded ChainView with %d active chains from DB",
+                     len(seeds))
 
     async def on_raw_event(self, raw: dict) -> None:
-        """Single ingress per causal-events message (a raw dict from the router,
-        carrying `ladder` and, for A/B ladders, `set`). Acquires the symbol lock
-        and processes."""
+        """Single ingress per causal-events message: a RAW event dict from the
+        router (carrying `ladder` and, for A/B ladders, `set`). Acquires the
+        symbol lock, then processes (fold-to-view for A/B, entry fan-out, exit
+        sweep) via _process_raw_locked.
+
+        The caller must NOT already hold the symbol lock — this is the entry
+        point for callers OUTSIDE the shared-lock region (e.g. a Kafka consumer
+        loop, or the tests). The in-lock entry point the router's publish sink
+        uses is _process_raw_locked directly (see _publish in signal_process),
+        which is why processing lives there and this method is a thin
+        lock-acquire wrapper around it."""
         symbol = raw["symbol"]
         async with self._lock(symbol):
             await self._process_raw_locked(raw)
 
+    # Backward-compatible alias: some callers/tests drive the runtime with a raw
+    # dict via on_raw_event_direct. It has the same contract as on_raw_event
+    # (takes a raw dict, acquires the lock, processes), so it simply delegates.
     async def on_raw_event_direct(self, raw: dict) -> None:
-        """Alias kept for callers/tests that drive the runtime with a raw dict
-        while NOT holding the lock. Acquires the lock and processes."""
+        """Alias for on_raw_event, kept for callers/tests using the older name.
+        Same contract: raw dict in, lock acquired here, processed."""
         await self.on_raw_event(raw)
 
     async def _process_raw_locked(self, raw: dict) -> None:

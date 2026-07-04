@@ -135,6 +135,71 @@ def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
         return out
     return load_active_chains
 
+def make_load_chain_view_seed(pool):
+    """Load EVERY active chain (all symbols, both sets) as ChainView seed rows,
+    for consumer-side hydrate-on-restart (runtime.start -> ChainView.seed_active).
+ 
+    Returns a list of dicts, one per active chain, each carrying exactly what
+    ChainView.seed_active needs:
+ 
+        {"symbol", "set", "chain_id", "direction", "peak_level"}
+ 
+      * set        — "A" | "B", classified from the chain's BASELINE timeframe
+                     (active_timeframes[0]), per migration 008: we classify from
+                     active_timeframes rather than history[0] so this needs no
+                     per-step data at all. A chain whose baseline tf belongs to
+                     neither set's ladder baseline is skipped (defensive — it
+                     belongs to some other ladder, e.g. the four-chain FC ladder,
+                     which the two-ladder ChainView must not adopt).
+      * direction  — -1 | +1, straight from the column.
+      * peak_level — propagation_levels, the highest level reached. ChainView
+                     stores peak (not current) level and only ascends it, so
+                     propagation_levels is the right source.
+ 
+    Only active chains are read (partial index ix_chains_active). Unlike
+    make_load_active_chains this is NOT filtered by symbol/asset_class — the
+    ChainView is global across all symbols, so one query hydrates everything.
+    """
+    from strategy.chain_view import SET_A_LADDER, SET_B_LADDER, ChainSet
+ 
+    # baseline timeframe -> ChainSet. Baseline is ladder[0].
+    _SET_FOR_BASELINE = {
+        SET_A_LADDER[0]: ChainSet.A,   # "5s" -> A
+        SET_B_LADDER[0]: ChainSet.B,   # "30s" -> B
+    }
+ 
+    async def load_chain_view_seed() -> list:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT chain_id, symbol, direction,
+                       propagation_levels, active_timeframes
+                FROM chains
+                WHERE active = true
+                """
+            )
+        out = []
+        for r in rows:
+            tfs = list(r["active_timeframes"]) if r["active_timeframes"] else []
+            if not tfs:
+                # No timeframes recorded — cannot classify a set; skip defensively.
+                continue
+            set_ = _SET_FOR_BASELINE.get(tfs[0])
+            if set_ is None:
+                # Baseline tf isn't an A/B baseline — chain belongs to another
+                # ladder (e.g. four-chain). The two-ladder ChainView must not
+                # adopt it.
+                continue
+            out.append({
+                "symbol": r["symbol"],
+                "set": set_.value,             # "A" | "B" — seed_active wraps in ChainSet
+                "chain_id": r["chain_id"],
+                "direction": int(r["direction"]),
+                "peak_level": int(r["propagation_levels"]),
+            })
+        return out
+ 
+    return load_chain_view_seed
 
 # ---- signal-writer persistence (trade_signals table, migration 004) --------
 
@@ -164,6 +229,52 @@ def make_insert_signal(pool):
         return result.endswith(" 1")
     return insert_signal
 
+def make_load_open_positions(pool):
+    """Load positions currently OPEN per the trade_signals log: an ENTER with no
+    matching EXIT for the same (strategy, position_key). Used by the signal
+    process to rebuild the runtime's open-position watch set on restart so exit
+    evaluation resumes for positions entered before the restart.
+ 
+    Returns list[dict] with keys: position_key, symbol, asset_class, chain_id,
+    direction ('LONG'|'SHORT'), strategy — exactly what
+    signal_process._runtime_hooks().load_open() maps into OpenPosition.
+ 
+    Matching is on (strategy, position_key) together (migrations 004/011): a
+    position_key is unique only within a strategy, so an EXIT closes only its
+    OWN strategy's ENTER.
+ 
+    For each still-open (strategy, position_key) we return the ENTER row's
+    identity fields (symbol/asset_class/chain_id/direction are fixed at ENTER;
+    an EXIT only references the key). If the same key was entered, exited, and
+    re-entered, the NOT EXISTS correlated on decided_at ordering below treats it
+    as open iff the LATEST action is an ENTER — see the subquery note.
+    """
+    async def load_open_positions() -> list:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                -- The latest action per (strategy, position_key). A position is
+                -- OPEN iff its most recent decision is an ENTER (no EXIT has
+                -- superseded it). DISTINCT ON picks the newest row per key by
+                -- decided_at (then created_at as a tiebreak for equal decided_at).
+                SELECT position_key, symbol, asset_class, chain_id,
+                       direction::text AS direction, strategy
+                FROM (
+                    SELECT DISTINCT ON (strategy, position_key)
+                           strategy, position_key, symbol, asset_class,
+                           chain_id, direction, action
+                    FROM trade_signals
+                    ORDER BY strategy, position_key,
+                             decided_at DESC, created_at DESC
+                ) latest
+                WHERE action = 'ENTER'
+                """
+            )
+        # asyncpg Records are mapping-like; the caller uses r["..."] and
+        # r.get("strategy", ...). Convert to plain dicts so .get works.
+        return [dict(r) for r in rows]
+ 
+    return load_open_positions
 
 # ---- warmup-bars persistence (warmup_bars table, migration 006) -------------
 
