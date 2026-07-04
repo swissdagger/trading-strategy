@@ -184,7 +184,7 @@ STRATEGIES = {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
         "symbols": ["BTCUSDT"],
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
-        "params": {"retention_hours": 3},
+        "params": {"retention_hours": 24},
     },
     # Example of a future strategy on different ladders (disabled):
     # "mean_revert": {
