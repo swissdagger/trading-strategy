@@ -320,6 +320,56 @@ def make_persist_warmup_bars(pool):
             )
     return persist_warmup_bars
 
+def make_load_buffers(pool, symbol: str, timeframes: list):
+    """Hydrate one machine's per-timeframe buffers from warmup_bars (migration
+    006) so forecasting can start immediately on restart instead of waiting
+    days-to-weeks for coarse buffers to refill from the live stream.
+ 
+    Returns a zero-arg async loader producing {timeframe: deque(maxlen=WINDOW_SIZE)}
+    of tick dicts shaped exactly like ServiceTwoChainMachine._tick_dict. Only the
+    timeframes in `timeframes` are loaded (this machine's ladder); a timeframe
+    with no seeded rows yields an empty deque (it simply fills live).
+ 
+    Newest WINDOW_SIZE rows per (symbol, timeframe) are read via the
+    timestamp_ms DESC index, then reversed to ascending so the deque is
+    chronological (oldest at the left, newest at the right) — the order on_bar's
+    append + maxlen eviction assumes.
+    """
+    from producer.service2_machine import WINDOW_SIZE
+ 
+    async def load_buffers() -> dict:
+        buffers: dict = {}
+        async with pool.acquire() as conn:
+            for tf in timeframes:
+                rows = await conn.fetch(
+                    """
+                    SELECT symbol, timestamp_ms, open, high, low, close,
+                           asset_class, timeframe
+                    FROM warmup_bars
+                    WHERE symbol = $1 AND timeframe = $2
+                    ORDER BY timestamp_ms DESC
+                    LIMIT $3
+                    """,
+                    symbol, tf, WINDOW_SIZE,
+                )
+                # rows are newest-first; reverse to oldest-first for the deque.
+                dq = deque(maxlen=WINDOW_SIZE)
+                for r in reversed(rows):
+                    dq.append({
+                        "symbol": r["symbol"],
+                        "timestamp": r["timestamp_ms"],   # epoch ms, matches _tick_dict
+                        "open": r["open"],
+                        "high": r["high"],
+                        "low": r["low"],
+                        "close": r["close"],
+                        "timeframe": r["timeframe"],
+                        "asset_class": r["asset_class"],
+                    })
+                buffers[tf] = dq
+        return buffers
+ 
+    return load_buffers
+
 
 # ---- feed-cursor handoff (feed_cursors table, migration 005) ----------------
 
