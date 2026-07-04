@@ -42,12 +42,15 @@ ASSET_CONFIGS = {
         "symbols": [
             "BTCUSDT",
         ],
-        # The four_chain strategy's ladder [1m,3m,5m,15m,1h] — all >= 1m, all
-        # Binance-native, so warmup seeds 5000 bars per timeframe and the ws
-        # feed streams them natively (no sub-minute derivation needed here).
-        # If a sub-minute strategy is later added on crypto, extend this to the
-        # union of all crypto strategies' ladder timeframes.
-        "timeframes": ["1m", "3m", "5m", "15m", "1h"],
+        # UNION of every enabled crypto strategy's ladder timeframes:
+        #   - four_chain [1m,3m,5m,15m,1h] — all Binance-native.
+        #   - two_ladder Set A [5s,10s,30s,1m,2m] ∪ Set B [30s,1m,2m,5m,10m].
+        # The two_ladder rungs Binance can't serve natively are DERIVED by the
+        # feeds: sub-minute (5s/10s/30s) from the 1s kline, and coarse (2m/10m)
+        # from a native base (2m←1m, 10m←5m). Warmup seeds the coarse and
+        # native rungs to 5000; sub-minute rungs are cold-start (self-heal
+        # live). See feeds/binance_futures._get_base_tf and feeds/binance_ws.
+        "timeframes": ["5s", "10s", "30s", "1m", "2m", "3m", "5m", "10m", "15m", "1h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "ws",

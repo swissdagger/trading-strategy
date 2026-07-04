@@ -36,18 +36,69 @@ _BINANCE_INTERVALS: Set[str] = {
 
 # Sub-minute rungs we can DERIVE from the 1s kline. Mirrors
 # feeds/binance_ws._DERIVED_INTERVALS.
+#
+# NOTE: this set is ONLY the sub-minute (1s-sourced) derivations. Coarse
+# derivations like 2m and 10m — which Binance also lacks natively but which
+# resample cleanly from a coarser native base (1m, 5m) — are NOT listed here;
+# they are resolved by _get_base_tf's general "largest native divisor" rule
+# below and reported by supported_timeframes(). Keeping this set 1s-only
+# preserves the sub-minute vs coarse distinction that matters for backfill:
+# 1s-derived rungs can't be REST-backfilled (Binance REST bottoms out at 1m),
+# whereas coarse derived rungs CAN (their base kline is REST-available).
 _DERIVED_INTERVALS: Set[str] = {"1s", "5s", "10s", "15s", "30s"}
 
-# The full set this feed can serve = native ∪ derived.
-_SUPPORTED: Set[str] = _BINANCE_INTERVALS | _DERIVED_INTERVALS
+
+def _tf_ms(tf: str) -> int:
+    """Milliseconds in one bar of `tf`. Local, dependency-free (mirrors
+    _parse_timeframe's arithmetic) so the base-resolver can run at import
+    time without constructing anything."""
+    multiplier, _, base_ms = _parse_timeframe(tf)
+    return multiplier * base_ms
 
 
-# Base timeframe a target rung is built from. A native rung is its OWN base
-# (fetched directly, no resample); a sub-minute rung is derived from 1s.
-def _get_base_tf(tf: str) -> str:
-    if tf in _DERIVED_INTERVALS and tf != "1s":
+def _largest_native_divisor(tf: str) -> str | None:
+    """The coarsest NATIVE interval that divides `tf` evenly and is strictly
+    finer than it — the ideal resample base (fewest source bars, exact
+    windows). Returns None if no native interval divides `tf` (then `tf`
+    can't be derived and isn't supported).
+
+    Example: 10m → 5m (10m / 5m = 2, exact) beats 1m (also exact) because it
+    means 2 source bars per window instead of 10. 2m → 1m. 7m → None (no
+    native interval divides 7 minutes evenly).
+    """
+    tf_ms = _tf_ms(tf)
+    best: str | None = None
+    best_ms = 0
+    for native in _BINANCE_INTERVALS:
+        n_ms = _tf_ms(native)
+        if n_ms < tf_ms and tf_ms % n_ms == 0 and n_ms > best_ms:
+            best, best_ms = native, n_ms
+    return best
+
+
+# Base timeframe a target rung is built from. Three cases:
+#   - native rung  → itself (fetched directly, no resample)
+#   - sub-minute   → "1s" (Binance's finest kline)
+#   - coarse derived (e.g. 2m, 10m) → largest native interval that divides it
+def _get_base_tf(tf: str) -> str | None:
+    if tf in _BINANCE_INTERVALS:
+        return tf
+    if tf in _DERIVED_INTERVALS:  # sub-minute (incl. the 1s passthrough)
         return "1s"
-    return tf
+    # Coarse non-native rung: derive from the best native base, if one exists.
+    return _largest_native_divisor(tf)
+
+
+# The coarse (non-native, non-sub-minute) rungs this feed derives. Kept
+# EXPLICIT rather than enumerated: the ladder uses exactly 2m and 10m, and
+# listing them is clearer than generating every native multiple and inviting
+# exotic rungs no strategy asks for. Add a rung here when a strategy needs it;
+# _get_base_tf already knows how to resolve any native-divisible label, so
+# this list is the only edit a new coarse rung requires.
+_COARSE_DERIVED_INTERVALS: Set[str] = {"2m", "10m"}
+
+# The full set this feed can serve = native ∪ sub-minute-derived ∪ coarse-derived.
+_SUPPORTED: Set[str] = _BINANCE_INTERVALS | _DERIVED_INTERVALS | _COARSE_DERIVED_INTERVALS
 
 
 _KLINES_LIMIT = 1500
