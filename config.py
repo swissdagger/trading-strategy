@@ -121,13 +121,49 @@ def transport_for(asset_class: str) -> str:
     return transport
 
 # ---------------------------------------------------------------------------
-# Master trade-enable DEFAULT (execution/trade_enable.py).
-# The boot/fallback state for live order placement. The trade_enabled DB row
-# (migration 010) is the LIVE override that wins once running; this is only the
-# starting state and the fallback if the row can't be read. False = boot with
-# trading OFF (the safe default — go live deliberately, never by accident).
+# Master trade MODE default (execution/trade_enable.py). Three states:
+#   "off"   — place no orders.
+#   "paper" — place orders against the PAPER venue (fake money): the shakeout.
+#   "live"  — place orders against the LIVE venue (real money).
+# The trade_enabled DB row's `mode` (migration 012) is the LIVE override that
+# wins once running; this is only the boot/fallback mode. Default "off" — go to
+# paper or live deliberately, never by accident.
 # ---------------------------------------------------------------------------
-TRADE_ENABLED_DEFAULT = False
+TRADE_MODE_DEFAULT = "off"
+
+# Per-venue PAPER and LIVE connection endpoints. The adapter factory
+# (execution/adapter_factory.py) picks by mode: paper mode -> paper endpoint
+# (IB gateway 4002), live mode -> live endpoint (4001). FILL IN real accounts.
+VENUE_ENDPOINTS = {
+    "ibkr": {
+        "paper": {
+            "host": "127.0.0.1",
+            "port": 4002,               # IB Gateway PAPER
+            "client_id": 1,
+            "account": "",              # paper account (DU...)
+        },
+        "live": {
+            "host": "127.0.0.1",
+            "port": 4001,               # IB Gateway LIVE
+            "client_id": 1,
+            "account": "",              # live account (U...)
+        },
+    },
+    "binance": {
+        # Paper = Binance USD-M futures TESTNET (demo-fapi). Live = production.
+        # Fill in API keys per environment (env vars recommended over literals).
+        "paper": {
+            "api_key": "",
+            "api_secret": "",
+            "base_url": "https://demo-fapi.binance.com",
+        },
+        "live": {
+            "api_key": "",
+            "api_secret": "",
+            "base_url": "https://fapi.binance.com",
+        },
+    },
+}
 
 # ---------------------------------------------------------------------------
 # STRATEGIES — the multi-strategy registry config (strategy/registry.py).
@@ -164,4 +200,3 @@ STRATEGIES = {
 EXTRA_LADDERS = {
     "FC": ["1m", "3m", "5m", "15m", "1h"],   # four_chain strategy's ladder
 }
-

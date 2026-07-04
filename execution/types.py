@@ -109,6 +109,14 @@ class Fill:
     filled_at_ms: int             # venue execution time, epoch ms
     fee: Decimal = Decimal(0)
     fee_currency: Optional[str] = None
+    # The venue's order id this fill belongs to. Every venue stamps a fill with
+    # its parent order (Binance userTrades.orderId, IB execution.orderId), so a
+    # fill arriving asynchronously on the stream can be attributed to the trade
+    # whose order produced it — the executor maps venue_order_id -> trade at
+    # submit time. Optional because a fill discovered during reconcile (before we
+    # know our orders) may lack it; such fills are persisted and left for the
+    # position reconcile to explain.
+    venue_order_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

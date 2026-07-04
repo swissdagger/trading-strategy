@@ -1,99 +1,105 @@
-# IB execution adapter + master on/off
+# IB execution adapter + master mode switch (off / paper / live)
 
-Live order execution via Interactive Brokers, with a master enable/disable that
-no-ops safely when off.
+Live order execution via Interactive Brokers, with a three-state master switch:
+place no orders (off), place orders against the paper venue (paper, fake money),
+or against the live venue (live, real money).
 
 ## Pieces
 
-1. **`execution/ibkr_adapter.py`** — `IBKRAdapter`, a concrete `ExecutionAdapter`
-   over IB Gateway/TWS using **`ib_async`** (the maintained successor to the
-   archived `ib_insync`). Serves equity + fx. Implements the full ABC: session
-   lifecycle with trading-session verification, marketable-limit submit,
-   cancel, native amend, fill streaming, and reconcile.
-
-2. **`execution/trade_enable.py`** — `TradeEnableState`, the master on/off state.
-   Config default + live DB override, refreshed via NOTIFY + poll.
-
-3. **`execution/gated_adapter.py`** — `GatedAdapter`, wraps any adapter and
-   suppresses order placement when disabled, passing reads through.
-
-4. **`migrations/010_trade_enabled.sql`** — the `trade_enabled` singleton (like
-   `kill_switch`) plus a change-NOTIFY trigger. Apply after 009.
-
-5. **`config.TRADE_ENABLED_DEFAULT`** — the boot/fallback state (default
-   `False`).
+1. **`execution/ibkr_adapter.py`** — `IBKRAdapter` on **`ib_async`** (the
+   maintained successor to the archived `ib_insync`). Serves equity + fx.
+   Endpoint-agnostic: it takes host/port/account, so the SAME class connects to
+   paper or live depending on the params it's given.
+2. **`execution/trade_enable.py`** — `TradeEnableState`, the three-state mode
+   (off/paper/live), config default + live DB override, NOTIFY + poll refresh,
+   plus an `on_mode_change` reconnect hook.
+3. **`execution/adapter_factory.py`** — builds the adapter for a mode, picking
+   the paper vs live endpoint. LIVE -> live endpoint; PAPER and OFF -> paper
+   endpoint (OFF never builds live).
+4. **`execution/gated_adapter.py`** — no-ops orders when `is_enabled()` is false
+   (i.e. mode == off); reads pass through.
+5. **`migrations/010_trade_enabled.sql`** + **`012_trade_mode.sql`** — the
+   singleton, the `mode` column, and the sync/notify triggers.
+6. **`config.TRADE_MODE_DEFAULT`** + **`config.VENUE_ENDPOINTS`**.
 
 ## Why ib_async, not ib_insync
 
 `ib_insync` was archived (read-only) in March 2024 after its author's passing
-and no longer receives TWS-API-compatibility fixes. `ib_async`
-(`ib-api-reloaded/ib_async`) is the actively maintained drop-in successor. For a
-system moving real money, building on the maintained library is the correct
-call. The `ExecutionAdapter` ABC's docstrings still say "ib_insync" — that's
-just prose; the dependency choice lives in the concrete adapter.
+and no longer gets TWS-API fixes. `ib_async` is the maintained successor. The
+ABC's docstrings say "ib_insync" — prose only; the dependency lives in the
+concrete adapter.
 
-## The on/off design
-
-The switch is a **wrapper**, not `if enabled` scattered through the IB code:
+## The three-state model
 
 ```
-executor → GatedAdapter → IBKRAdapter → IB Gateway
-                ↑
-         TradeEnableState (config default + live DB row)
+executor -> GatedAdapter -> IBKRAdapter -> IB Gateway (paper 4002 | live 4001)
+                 ^                ^
+         TradeEnableState   adapter_factory picks the endpoint by mode
 ```
 
-- **Off:** `submit_order` returns `REJECTED` with a `GATED_` reason and touches
-  no venue; `cancel_order`/`amend_order` return benign terminal results.
-  `reconcile`/`get_positions`/`connect`/`start_fill_stream` still work, so you
-  can observe the venue with trading off.
-- **On:** everything passes through to IB.
+- **off:** `submit_order` returns a `GATED_` reject, no venue contact. Reads
+  still work.
+- **paper:** orders go to the paper gateway (4002) + paper account — real order
+  flow, real fills/reconcile, FAKE money. The shakeout mode.
+- **live:** orders go to the live gateway (4001) — real money.
 
-This keeps the dangerous venue code free of enable-logic and puts the safety
-switch in one auditable place. It composes with `kill_switch`: the executor
-checks `kill_switch`, the gate checks `trade_enabled`, and **both** must allow an
-order. The two are independent — `trade_enabled` is the ordinary power switch,
-`kill_switch` the emergency stop.
+Both paper and live are "enabled" (`is_enabled()` true); only off gates orders.
+This composes with `kill_switch`: executor checks kill_switch, the gate checks
+mode != off, and BOTH must allow an order.
+
+## Paper<->live is a RECONNECT, not just a flag
+
+The venue is chosen at `connect()` time. Switching between paper and live
+changes which gateway the adapter is connected to, so it needs a reconnect — not
+a pure in-memory flip. `TradeEnableState` fires `on_mode_change(old, new)`; wire
+it to rebuild + reconnect the adapter when the endpoint kind changes:
+
+```python
+from execution.adapter_factory import build_ibkr_adapter, endpoint_kind_for_mode
+
+current = {"adapter": None}
+
+async def on_mode_change(old, new):
+    if endpoint_kind_for_mode(old) == endpoint_kind_for_mode(new):
+        return  # off<->paper: same (paper) venue, no rebuild
+    # venue changed (to/from live): rebuild + reconnect, gating orders in the gap
+    new_raw, kind = build_ibkr_adapter(config.VENUE_ENDPOINTS["ibkr"], new)
+    await new_raw.connect()
+    current["adapter"] = new_raw   # swap; executor uses the gated wrapper over this
+
+mode = TradeEnableState(dsn, pool,
+    config_default=config.TRADE_MODE_DEFAULT, on_mode_change=on_mode_change)
+await mode.start()
+
+raw, kind = build_ibkr_adapter(config.VENUE_ENDPOINTS["ibkr"], mode.mode())
+current["adapter"] = raw
+adapter = GatedAdapter(raw, mode)     # executor uses this
+```
+
+`off<->paper` needs no rebuild (both paper). Anything to/from `live` rebuilds.
+During the swap, the GatedAdapter keeps gating on `is_enabled()`, and the app
+should quiesce order submission until the new connection is confirmed so no
+order goes to the wrong venue in the gap.
 
 ## Flipping the switch live
 
 ```sql
--- Enable trading (takes effect within ~1 refresh, via NOTIFY):
-UPDATE trade_enabled SET enabled = true, reason = 'go-live', set_by = 'ops'
- WHERE id = true;
-
--- Disable instantly:
-UPDATE trade_enabled SET enabled = false, reason = 'pause' WHERE id = true;
+-- Go to paper (shakeout):
+UPDATE trade_enabled SET mode='paper', reason='shakeout', set_by='ops' WHERE id=true;
+-- Go live (real money):
+UPDATE trade_enabled SET mode='live', reason='go-live' WHERE id=true;
+-- Stop:
+UPDATE trade_enabled SET mode='off', reason='pause' WHERE id=true;
 ```
 
-No redeploy — same reason `kill_switch` is a row. The default boots **disabled**;
-going live is a deliberate act.
-
-## Wiring (in the executor process, when built)
-
-```python
-enable = TradeEnableState(dsn, pool, config_default=config.TRADE_ENABLED_DEFAULT)
-await enable.start()
-
-ib = IBKRAdapter(host="127.0.0.1", port=4001, account=BOT_ACCOUNT)
-adapter = GatedAdapter(ib, enable)          # <-- executor uses this
-
-# boot sequence (from the ABC):
-await adapter.connect()                      # confirms trading session
-snapshot = await adapter.reconcile()         # diff against DB (executor)
-await adapter.start_fill_stream(on_fill)     # async fills -> executor
-# ... then submit_order/cancel/amend as trades open and close.
-```
-
-`on_fill` is the executor's fill handler (dedupe on `venue_exec_id`, write
-`fills`, advance quantities). This adapter only reports.
+`enabled` is kept consistent automatically (a trigger derives it from mode), so
+any legacy reader of `enabled` still works. Boots **off**; going to paper or
+live is deliberate.
 
 ## Testing note
 
-Adapter mapping logic (order direction, fill mapping, contract build, status
-map) and the gate are unit-tested without a gateway. `TradeEnableState` is
-integration-tested against real Postgres. The parts that need a **live IB
-paper session** — the connect handshake, real order round-trips, live fill
-streaming — must be shaken out against IB paper (port 4002) before going live.
-Start with `TRADE_ENABLED_DEFAULT=False` and flip the row on only after the
-paper reconcile looks right.
-```
+Adapter mapping/gating and the mode logic (including the reconnect callback) are
+tested — the latter against real Postgres. The parts needing a live IB session
+(connect handshake, order round-trips, live fills) must be shaken out against IB
+**paper** (4002) first — which is exactly what `mode='paper'` is for. Boot with
+`TRADE_MODE_DEFAULT='off'`, flip to `paper`, watch it, then `live`.

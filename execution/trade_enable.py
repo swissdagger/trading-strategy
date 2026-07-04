@@ -1,47 +1,54 @@
 """
-execution/trade_enable.py — the master trade-enable state.
+execution/trade_enable.py — the master trade-mode state (off / paper / live).
 
-Single source of truth for "may QISS place live orders right now." Read by the
-GatedAdapter before every order-placing call. Two inputs, in precedence order:
+Single source of truth for QISS's execution mode. Read by the GatedAdapter (to
+gate orders) and by the adapter-selection layer (to pick the paper vs live
+venue endpoint). Three states:
 
-  1. LIVE DB OVERRIDE — the trade_enabled singleton (migration 010). Once the
-     process is running, this row is authoritative: flipping it turns live
-     execution on/off instantly, no redeploy (same reason kill_switch is a row).
+  OFF   — place no orders at all.
+  PAPER — place orders against the PAPER venue (IB port 4002 / Binance testnet):
+          real order flow, real pricing/fills/reconcile, FAKE money.
+  LIVE  — place orders against the LIVE venue: real money.
 
-  2. CONFIG DEFAULT — config.TRADE_ENABLED_DEFAULT. Only used as the STARTING
-     state / fallback if the DB row can't be read at all. The DB wins whenever
-     it's readable.
+Two inputs, in precedence order (unchanged from the original boolean design):
 
-The design goal from the requirement: "master enable/disable that no-ops safely
-when off, config default + live DB override." This class owns the state; the
-GatedAdapter owns the no-op-when-off behaviour.
+  1. LIVE DB OVERRIDE — the trade_enabled singleton's `mode` (migration 012).
+     Authoritative once running; flip it to change mode with no redeploy.
+  2. CONFIG DEFAULT — config.TRADE_MODE_DEFAULT. The boot/fallback mode; used
+     until the DB row is read, or if it never can be.
 
-## Freshness: NOTIFY fast path + poll backstop
+## is_enabled() is preserved
 
-A naive reader would query the row on every order — a DB round-trip on the hot
-path. Instead this caches the state and refreshes it two ways:
+The GatedAdapter still calls is_enabled() — now DERIVED as (mode != OFF). So
+both PAPER and LIVE are "enabled" (orders flow); only OFF gates them. Existing
+callers of is_enabled() keep working; mode-aware callers use mode().
 
-  - FAST: LISTEN on 'trade_enabled_changed' (migration 010's trigger). A flip
-    updates the cache near-instantly.
-  - BACKSTOP: a periodic poll (default 5s) re-reads the row, so a missed NOTIFY
-    (listener disconnected during the flip) self-corrects within one interval.
+## Paper<->live changes the VENUE, so it needs a reconnect
 
-This is the same belt-and-suspenders pattern as the signal listener: push for
-speed, poll for guarantee. The cached read that the GatedAdapter calls is then
-just an in-memory bool — no per-order DB hit.
+Unlike OFF (which the GatedAdapter honours instantly by no-oping orders),
+switching between PAPER and LIVE changes which gateway the adapter is connected
+to — established at connect() time. A pure in-memory flag flip is NOT enough: the
+adapter must reconnect to the other endpoint. So this class fires an
+`on_mode_change(old, new)` async callback whenever the mode changes; the
+application wires that to reconnect/reselect the adapter for the new mode's
+venue. The callback runs off the refresh loop, so a mode flip propagates to a
+reconnect without a redeploy — but it is the application's job to actually
+perform the reconnect there. Until the reconnect completes, the GatedAdapter
+keeps gating on is_enabled() so no order goes to the wrong venue in the gap
+(the application should gate/queue during the swap; see the wiring guide).
 
 ## Fail-safe default
 
-If the state can't be determined (DB unreachable at startup and no cached
-value), is_enabled() returns FALSE. For a system moving real money, "unsure =>
-don't trade" is the only safe default. An operator turning trading ON is a
-deliberate act; drifting ON due to an error must be impossible.
+If the mode can't be determined (DB unreachable at startup, no cached value),
+mode() returns the config default, and if THAT is unset it is OFF. "Unsure =>
+don't trade" — drifting into PAPER or LIVE by error must be impossible.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from enum import Enum
+from typing import Awaitable, Callable, Optional
 
 import asyncpg
 
@@ -54,12 +61,24 @@ _RECONNECT_BASE_S = 1.0
 _RECONNECT_MAX_S = 30.0
 
 
-class TradeEnableState:
-    """Caches the master trade-enable flag, refreshed via NOTIFY + poll.
+class TradeMode(str, Enum):
+    OFF = "off"
+    PAPER = "paper"
+    LIVE = "live"
 
-    Lifecycle: construct, `await start()` (does the initial read + starts the
-    refresh task), then call is_enabled() freely (in-memory, no I/O). `await
-    stop()` on shutdown.
+
+# Fired when the mode changes: (old_mode, new_mode) -> awaitable. The app wires
+# this to reconnect/reselect the adapter when the VENUE changes (paper<->live,
+# or off->paper/live selecting the endpoint the next connect uses).
+ModeChangeCallback = Callable[[TradeMode, TradeMode], Awaitable[None]]
+
+
+class TradeEnableState:
+    """Caches the master trade mode (off/paper/live), refreshed via NOTIFY +
+    poll. Preserves is_enabled() as (mode != OFF) for existing callers.
+
+    Lifecycle: construct, `await start()`, then call mode()/is_enabled() freely
+    (in-memory, no I/O). `await stop()` on shutdown.
     """
 
     def __init__(
@@ -67,47 +86,62 @@ class TradeEnableState:
         dsn: str,
         pool: asyncpg.Pool,
         *,
-        config_default: bool = False,
+        config_default: TradeMode = TradeMode.OFF,
+        on_mode_change: Optional[ModeChangeCallback] = None,
         poll_interval_s: float = _POLL_INTERVAL_S,
         statement_cache_size: int = 0,
     ):
         """
-        dsn:  connection string for the dedicated LISTEN connection.
-        pool: shared pool, for the poll/read queries.
-        config_default: the boot/fallback state (config.TRADE_ENABLED_DEFAULT).
-              Used only until the DB row is read, or if it never can be.
+        config_default: boot/fallback mode (config.TRADE_MODE_DEFAULT). Accepts a
+              TradeMode or a str ('off'|'paper'|'live'). Used only until the DB
+              row is read, or if it never can be.
+        on_mode_change: optional async callback fired on every mode change, for
+              the adapter reconnect/reselect. Not called for the initial read
+              (there's no 'previous' mode to transition from) — the app selects
+              the initial venue from mode() at startup.
         """
         self._dsn = dsn
         self._pool = pool
-        self._config_default = config_default
+        self._config_default = TradeMode(config_default)
+        self._on_mode_change = on_mode_change
         self._poll_interval_s = poll_interval_s
         self._stmt_cache = statement_cache_size
 
-        # Cached state. None => not yet determined (is_enabled falls back to the
-        # fail-safe below until the first successful read).
-        self._enabled: Optional[bool] = None
+        # Cached mode. None => not yet determined (falls back to config default).
+        self._mode: Optional[TradeMode] = None
         self._running = False
         self._conn: Optional[asyncpg.Connection] = None
         self._refresh_now = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
-    def is_enabled(self) -> bool:
-        """The current master trade-enable state, in memory (no I/O).
+    # ---- accessors (in-memory, no I/O) ----
 
-        Fail-safe: if the state has not yet been determined (initial read hasn't
-        succeeded), returns the config default — which itself defaults to False.
-        Never returns True unless something (DB row or explicit config default)
-        affirmatively said so.
-        """
-        if self._enabled is None:
+    def mode(self) -> TradeMode:
+        """Current mode. Fail-safe: config default until the first successful
+        read; config default itself defaults to OFF."""
+        if self._mode is None:
             return self._config_default
-        return self._enabled
+        return self._mode
+
+    def is_enabled(self) -> bool:
+        """Derived: are we placing orders at all (paper OR live)? Preserves the
+        GatedAdapter's existing contract."""
+        return self.mode() != TradeMode.OFF
+
+    def is_live(self) -> bool:
+        """True only in LIVE (real money). The adapter-selection layer uses this
+        (and is_paper) to pick the venue endpoint."""
+        return self.mode() == TradeMode.LIVE
+
+    def is_paper(self) -> bool:
+        return self.mode() == TradeMode.PAPER
+
+    # ---- lifecycle ----
 
     async def start(self) -> None:
-        """Do the initial read and start the background refresh task."""
         self._running = True
-        await self._read_once()   # populate cache before returning
-        self._task = asyncio.create_task(self._refresh_loop(), name="trade-enable-refresh")
+        await self._read_once(initial=True)   # populate before returning
+        self._task = asyncio.create_task(self._refresh_loop(), name="trade-mode-refresh")
 
     async def stop(self) -> None:
         self._running = False
@@ -119,38 +153,47 @@ class TradeEnableState:
                 pass
         await self._close_conn()
 
-    async def refresh(self) -> bool:
-        """Force an immediate re-read from the DB and return the new state.
-        Useful at boot after connect()/reconcile, or in tests."""
+    async def refresh(self) -> TradeMode:
+        """Force an immediate re-read and return the new mode."""
         await self._read_once()
-        return self.is_enabled()
+        return self.mode()
 
     # ---- internals ----
 
-    async def _read_once(self) -> None:
-        """Read the singleton row into the cache. On failure, leave the cache as
-        it is (so a transient DB blip doesn't flip us to the fail-safe if we
-        already had a good value)."""
+    async def _read_once(self, initial: bool = False) -> None:
+        """Read the singleton's mode into the cache. On a mode CHANGE (and not
+        the initial read), fire on_mode_change so the app can reconnect the
+        adapter to the new venue. On failure, keep the last known mode."""
         try:
             row = await self._pool.fetchrow(
-                "SELECT enabled FROM trade_enabled WHERE id = true"
+                "SELECT mode FROM trade_enabled WHERE id = true"
             )
             if row is not None:
-                new_state = bool(row["enabled"])
-                if new_state != self._enabled:
-                    log.info("trade_enabled -> %s", new_state)
-                self._enabled = new_state
+                new_mode = TradeMode(row["mode"])
             else:
-                # Row missing entirely (migration not applied?). Fail safe.
-                if self._enabled is not False:
-                    log.warning("trade_enabled row missing; treating as DISABLED")
-                self._enabled = False
+                if self._mode is not TradeMode.OFF:
+                    log.warning("trade_enabled row missing; treating as OFF")
+                new_mode = TradeMode.OFF
         except Exception:
-            log.exception("failed to read trade_enabled; keeping last known state")
+            log.exception("failed to read trade mode; keeping last known")
+            return
+
+        old_mode = self._mode
+        if new_mode != old_mode:
+            log.info("trade mode: %s -> %s", old_mode, new_mode)
+        self._mode = new_mode
+
+        # Fire the reconnect hook on a genuine change (not the initial read, and
+        # only once we had a prior value to transition from).
+        if (not initial and old_mode is not None and new_mode != old_mode
+                and self._on_mode_change is not None):
+            try:
+                await self._on_mode_change(old_mode, new_mode)
+            except Exception:
+                log.exception("on_mode_change callback failed for %s -> %s",
+                              old_mode, new_mode)
 
     async def _refresh_loop(self) -> None:
-        """Maintain a LISTEN connection and poll periodically, refreshing the
-        cache on either trigger. Reconnects with backoff."""
         attempt = 0
         while self._running:
             try:
@@ -166,12 +209,12 @@ class TradeEnableState:
                         pass  # periodic poll
                     self._refresh_now.clear()
                     if self._conn is None or self._conn.is_closed():
-                        raise ConnectionError("trade_enabled LISTEN connection lost")
+                        raise ConnectionError("trade mode LISTEN connection lost")
                     await self._read_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("trade_enable refresh loop error")
+                log.exception("trade mode refresh loop error")
             finally:
                 await self._close_conn()
 

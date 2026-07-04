@@ -42,8 +42,7 @@ from typing import Optional
 import asyncpg
 
 from execution.signal_writer import SignalWriter, SignalWriterHooks
-from producer.fanout_router import FanoutRouter
-from producer.ladders import LADDERS
+from producer.fanout_router_multi import MultiLadderRouter
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
@@ -56,9 +55,12 @@ from producer.persistence import (
     make_load_buffers,
 )
 from producer.service2_machine import ServiceTwoChainMachine
-from strategy.chain_view import ChainSet, ChainView, TaggedChainEvent
-from strategy.runtime import StrategyRuntime
+from strategy.chain_view import ChainView, TaggedChainEvent
+from strategy.ladder_registry import default_registry
+from strategy.registry import StrategyRegistry, Strategy
+from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
 from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
+from strategy.four_chain_adapter import make_four_chain
 
 log = logging.getLogger("signal_process")
 
@@ -95,8 +97,10 @@ class SignalProcess:
         self.pool: Optional[asyncpg.Pool] = None
         self.consumer = None
         self.producer = None
-        self.router: Optional[FanoutRouter] = None
-        self.runtime: Optional[StrategyRuntime] = None
+        self.router: Optional[MultiLadderRouter] = None
+        self.runtime: Optional[MultiStrategyRuntime] = None
+        self.ladders = None            # LadderRegistry, built in start()
+        self.strategies = None         # StrategyRegistry, built in start()
         self.resolver = None   # ClassResolver, built in start() from ASSET_CONFIGS
         self._stop = asyncio.Event()
 
@@ -131,26 +135,62 @@ class SignalProcess:
         await self.consumer.start()
         await self.producer.start()
 
-        # --- Signal writer (-> trade_signals) ---
-        writer = SignalWriter(SignalWriterHooks(insert_signal=make_insert_signal(self.pool)))
+        # --- Signal writer factory (per-strategy, tagged with the name) ---
+        insert_signal = make_insert_signal(self.pool)
 
-        # --- Shared per-symbol lock map (router + runtime) ---
-        # FanoutRouter creates its own default map; we build the runtime to share
-        # it. We construct the router first, then hand its lock map to the runtime.
-        view = ChainView()
-        self.router = FanoutRouter(
+        def make_writer(strategy_name: str) -> SignalWriter:
+            return SignalWriter(
+                SignalWriterHooks(insert_signal=insert_signal),
+                strategy=strategy_name,
+            )
+
+        # --- Ladder registry: built-in A/B plus any extras from config ---
+        from config import EXTRA_LADDERS, STRATEGIES
+        self.ladders = default_registry()
+        for name, tfs in EXTRA_LADDERS.items():
+            self.ladders.register(name, tfs)
+
+        # --- Strategy registry: register factories, build enabled from config ---
+        view = ChainView()   # the two-ladder shared view (A/B only)
+        self.strategies = StrategyRegistry()
+        self.strategies.register_factory(
+            "two_ladder",
+            lambda *, name, symbols, ladders, params: Strategy(
+                name=name,
+                entry=TwoLadderEntry(view, make_writer(name)),
+                exit=TwoLadderExit(view, make_writer(name)),
+                symbols=symbols, ladders=ladders,
+            ),
+        )
+        self.strategies.register_factory(
+            "four_chain",
+            lambda *, name, symbols, ladders, params: make_four_chain(
+                name=name, symbols=symbols, ladders=ladders, params=params,
+                view_registry=self.ladders, writer_factory=make_writer,
+            ),
+        )
+        # All tracked symbols across the enabled strategies feed 'symbols: "*"'.
+        all_symbols = _all_configured_symbols()
+        self.strategies.build_from_config(STRATEGIES, all_symbols=all_symbols)
+
+        # --- Multi-ladder router: one machine per (symbol, ladder) across the
+        # union of all enabled strategies' ladders (compute-once) ---
+        self.router = MultiLadderRouter(
+            registry=self.ladders,
             make_machine=self._make_factory(client),
             publish=self._publish,
         )
-        self.runtime = StrategyRuntime(
+        # --- Multi-strategy runtime, sharing the router's lock map ---
+        self.runtime = MultiStrategyRuntime(
             view=view,
-            entry=TwoLadderEntry(view, writer),
-            exit_rule=TwoLadderExit(view, writer),
+            registry=self.strategies,
             hooks=self._runtime_hooks(),
             locks=self.router._locks,   # SHARE the router's lock map
         )
         await self.runtime.start()
-        log.info("signal process started: bars<-%s, events->%s",
+        log.info("signal process started: strategies=%s ladders=%s bars<-%s events->%s",
+                 [s.name for s in self.strategies.active()],
+                 self.strategies.all_ladders(),
                  self.cfg.bars_topic, self.cfg.events_topic)
 
     def _make_factory(self, client):
@@ -169,8 +209,7 @@ class SignalProcess:
             build_sumtyme_df,
         )
 
-        def factory(symbol: str, set_: ChainSet) -> ServiceTwoChainMachine:
-            ladder = LADDERS[set_]
+        def factory(symbol: str, ladder_name: str, timeframes: list) -> ServiceTwoChainMachine:
             # Resolve the symbol's real asset class from ASSET_CONFIGS. The factory
             # is only ever called for symbols we've seen a bar for, and the run
             # loop skips unknown symbols before routing, so resolve() will succeed
@@ -178,7 +217,7 @@ class SignalProcess:
             asset_class = self.resolver.resolve(symbol)
             return ServiceTwoChainMachine(
                 symbol=symbol, asset_class=asset_class,
-                ladder=ladder,
+                ladder=timeframes,
                 forecast_fn=client.forecast_path,
                 prepare_df_fn=prepare_dataframe_for_sumtyme,
                 to_interval_fn=to_sumtyme_interval,
@@ -188,41 +227,43 @@ class SignalProcess:
                 persist_chain_propagate=make_persist_chain_propagate(self.pool),
                 persist_chain_terminate=make_persist_chain_terminate(self.pool),
                 load_active_chains=make_load_active_chains(
-                    self.pool, symbol, asset_class, ladder),
-                load_buffers=make_load_buffers(self.pool, symbol, ladder),
+                    self.pool, symbol, asset_class, timeframes),
+                load_buffers=make_load_buffers(self.pool, symbol, timeframes),
             )
         return factory
 
     def _runtime_hooks(self):
-        """Persistence for the strategy's open-position watch set.
+        """Persistence for the multi-strategy open-position watch set.
 
-        load_open_positions is DB-backed (make_load_open_positions, reading
-        trade_signals) so the open set survives restarts — see that function's
-        docstring for why no new table is needed.
+        load_open_positions is DB-backed (reading trade_signals, now including
+        the strategy column) so the open set survives restarts, per strategy.
+        Positions are keyed by the NAMESPACED tracking_key (strategy/position_key)
+        so two strategies' positions on one chain stay distinct.
 
-        save_open_position / remove_open_position are deliberately NO-OPS, not
-        an oversight: SignalWriter already durably persists every ENTER/EXIT to
-        trade_signals AT THE MOMENT the decision is made (that's what
-        load_open_positions reads back). A previous version of these hooks
-        wrote to a separate in-memory dict that was never actually durable —
-        it looked like a persistence layer but provided none, and on a restart
-        the strategy's open-position tracking silently reset to empty even
-        though trade_signals knew better the whole time. Removing that fake
-        persistence is the fix, not an oversight to restore."""
-        from strategy.runtime import RuntimeHooks, OpenPosition
+        save/remove are deliberately NO-OPS: SignalWriter already durably
+        persists every ENTER/EXIT to trade_signals at decision time (that's what
+        load reads back). See the original single-strategy note — the reasoning
+        is unchanged; only the shape (namespaced) differs."""
+        from strategy.registry import namespaced_position_key
 
         load_open_rows = make_load_open_positions(self.pool)
 
         async def load_open():
             rows = await load_open_rows()
-            return [
-                OpenPosition(
-                    position_key=r["position_key"], symbol=r["symbol"],
-                    asset_class=r["asset_class"], chain_prime_id=r["chain_id"],
+            out = []
+            for r in rows:
+                strategy = r.get("strategy", "two_ladder")
+                base_pkey = r["position_key"]
+                out.append(OpenPosition(
+                    tracking_key=namespaced_position_key(strategy, base_pkey),
+                    strategy_name=strategy,
+                    position_key=base_pkey,
+                    symbol=r["symbol"],
+                    asset_class=r["asset_class"],
+                    chain_prime_id=r["chain_id"],
                     trade_direction=1 if r["direction"] == "LONG" else -1,
-                )
-                for r in rows
-            ]
+                ))
+            return out
 
         async def save_open(p):
             pass   # already durable: SignalWriter.emit_entry wrote this ENTER
@@ -234,44 +275,46 @@ class SignalProcess:
             load_open_positions=load_open,
             save_open_position=save_open,
             remove_open_position=remove_open,
-            # DB-backed: ChainView hydration must reflect real persisted chain
-            # state across restarts (unlike open positions above, which are
-            # genuinely fine to lose on a signal-only deployment).
-            load_chain_view_seed=make_load_chain_view_seed(self.pool),
         )
 
-    async def _publish(self, tev: TaggedChainEvent) -> None:
+    async def _publish(self, raw: dict) -> None:
         """Router publish sink: send to Kafka chain-events (audit + any other
-        consumers) AND feed the in-process strategy runtime."""
-        # Kafka (fire to the events topic for durability / other consumers)
+        consumers) AND feed the in-process multi-strategy runtime.
+
+        The router produces RAW event dicts (carrying `ladder` and, for A/B,
+        `set`). We forward the dict to Kafka and to the runtime. The runtime's
+        _process_raw_locked is called DIRECTLY (not on_raw_event) because the
+        router already holds this symbol's lock — and the router and runtime
+        SHARE one lock map, so re-acquiring would deadlock on the non-reentrant
+        asyncio.Lock."""
+        # Kafka (fire to the events topic for durability / other consumers).
         try:
-            await self.producer.send(self.cfg.events_topic, _tagged_to_wire(tev))
+            await self.producer.send(self.cfg.events_topic, raw)
         except Exception:
             log.exception("failed to publish tagged event to Kafka (continuing)")
-            
-        # --- FIX: Call the locked method directly because FanoutRouter 
-        # already holds the per-symbol lock for this event. ---
-        await self.runtime._on_event_locked(tev)
+
+        # Feed the runtime under the lock the router already holds.
+        await self.runtime._process_raw_locked(raw)
 
     async def run(self) -> None:
         """Consume bars and pump them through the router until stopped.
 
         Bars are awaited SEQUENTIALLY (not spawned as concurrent tasks). This is
-        load-bearing, not an oversight: FanoutRouter.on_bar takes the per-symbol
-        lock, and StrategyRuntime shares that same lock map — the publish sink
-        (_publish, below) calls runtime._on_event_locked() on the assumption that
-        the caller (the router, mid on_bar) already holds the symbol's lock. If
-        bars were dispatched concurrently, two bars for the SAME symbol could run
-        at once: their on_bar calls would contend for the lock while a third
-        could read/mutate the ChainView out of order, and the timestamp-ordered
-        propagation logic in the chain machine (next_sig["timestamp"] >=
-        chain["last_timestamp"]) would no longer see bars in the order Kafka
-        delivered them. That combination silently breaks chain propagation and
-        the entry/exit decision logic without raising — the chains table still
-        fills (it's lock-independent), but trade_signals does not. If
-        cross-symbol throughput is needed, the correct shape is per-symbol
-        ordered workers (one queue/task per symbol), not a blanket create_task
-        per bar — ask before reintroducing concurrency here.
+        load-bearing, not an oversight: MultiLadderRouter.on_bar takes the
+        per-symbol lock, and MultiStrategyRuntime shares that same lock map — the
+        publish sink (_publish, below) calls runtime._process_raw_locked() on the
+        assumption that the caller (the router, mid on_bar) already holds the
+        symbol's lock. If bars were dispatched concurrently, two bars for the
+        SAME symbol could run at once: their on_bar calls would contend for the
+        lock while a third could read/mutate the ChainView out of order, and the
+        timestamp-ordered propagation logic in the chain machine
+        (next_sig["timestamp"] >= chain["last_timestamp"]) would no longer see
+        bars in the order Kafka delivered them. That combination silently breaks
+        chain propagation and the entry/exit decision logic without raising — the
+        chains table still fills (it's lock-independent), but trade_signals does
+        not. If cross-symbol throughput is needed, the correct shape is
+        per-symbol ordered workers (one queue/task per symbol), not a blanket
+        create_task per bar — ask before reintroducing concurrency here.
         """
         from producer.bar import OHLCPoint
         assert self.consumer is not None and self.router is not None
@@ -306,6 +349,18 @@ class SignalProcess:
         if self.pool is not None:
             await self.pool.close()
         log.info("signal process stopped cleanly")
+
+
+def _all_configured_symbols() -> list:
+    """Union of all symbols across ASSET_CONFIGS — the tracked universe, used to
+    expand a strategy's 'symbols: "*"' to every tracked symbol."""
+    from config import ASSET_CONFIGS
+    out = []
+    for cfg in ASSET_CONFIGS.values():
+        for s in cfg.get("symbols", []):
+            if s not in out:
+                out.append(s)
+    return out
 
 
 def _tagged_to_wire(tev: TaggedChainEvent) -> dict:
