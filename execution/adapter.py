@@ -40,13 +40,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import Awaitable, Callable, List, Set
+from typing import Awaitable, Callable, List, Optional, Set
 
 from execution.types import (
+    AccountEquity,
     Fill,
     OrderRequest,
     OrderResult,
     ReconcileResult,
+    Touch,
     VenuePosition,
 )
 
@@ -135,6 +137,72 @@ class ExecutionAdapter(ABC):
         """Current positions only (lighter than full reconcile). Used by the
         periodic watchdog to catch position drift during normal operation,
         distinct from the boot reconcile."""
+
+    # ----------------------------------------------------------------------
+    # Market data / account reads — callable any time after connect().
+    # Distinct from reconcile/get_positions: these feed PRICING and SIZING,
+    # not reconciliation. The 001 schema has no quotes/equity tables by
+    # design, so the venue is the only source — hence they live on the adapter.
+    # ----------------------------------------------------------------------
+    @abstractmethod
+    async def get_touch(self, symbol: str, asset_class: str) -> Optional[Touch]:
+        """Return the venue's CURRENT best bid/ask for `symbol`, or None if no
+        two-sided quote is available right now (halted, pre-open, no book).
+
+        The executor prices every marketable limit off this touch, so it is
+        fetched fresh at order time — NOT cached and NOT stored in the DB (the
+        001 schema has no quotes table, by design). A None return means the
+        executor cannot price an order for this symbol and must skip/defer it
+        rather than guess a price; returning a stale or one-sided touch would be
+        worse than None.
+
+        IBKR: a snapshot market-data request (reqTickers) on the qualified
+        contract; equity/fx bid/ask. FX quotes are the pair's touch.
+        Binance: the futures bookTicker (best bid/ask) for the symbol — the same
+        venue orders fill at, so no cross-venue reference skew.
+
+        bid/ask are Decimal (str-converted at the venue boundary) so downstream
+        pricing stays in Decimal.
+        """
+
+    @abstractmethod
+    async def get_account_equity(self) -> AccountEquity:
+        """Return the account's current equity, for position sizing.
+
+        Read live from the venue (the DB stores no equity). Used by the sizing
+        policy — e.g. "5% of equity per position" reads total here, converts to a
+        quantity via the symbol's price, and rounds to the venue's step size.
+
+        IBKR: NetLiquidation (and AvailableFunds) from the account summary — the
+        same summary connect() already reads to confirm the trading session.
+        Binance USD-M: total and available balance from the futures account
+        (the USDT-margined wallet).
+
+        Raises if equity cannot be read (an unreadable account is a sizing-blocking
+        condition — better to fail the entry loudly than size off a stale/zero
+        number). Decimal throughout.
+        """
+
+    @abstractmethod
+    async def get_step_size(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        """Return the venue's minimum QUANTITY increment (lot/step size) for
+        `symbol`, or None if it can't be determined.
+
+        Sizing floors a computed quantity to this so a sub-increment order can't
+        be rejected. A separate concern from PRICE tick size (which the executor's
+        marketable-limit pricing already respects via the adapter's price
+        formatting); this is the QUANTITY granularity only.
+
+        IBKR: the qualified contract's minimum size / size increment from contract
+        details (whole shares for most equity; fx has its own lot). Cached with the
+        contract, since it doesn't change intraday.
+        Binance USD-M: the LOT_SIZE filter's stepSize from exchangeInfo for the
+        symbol. Cached per symbol.
+
+        None means "unknown" — the sizing policy then returns the un-floored
+        quantity and relies on the adapter to express it in the symbol's
+        precision at submit. Decimal, str-converted at the venue boundary.
+        """
 
     # ----------------------------------------------------------------------
     # Order placement — preconditions: connect() returned, reconcile() diffed,

@@ -186,3 +186,39 @@ class ReconcileResult:
     # that landed during a crash window and were never written locally. Bounded
     # by the adapter to a sane recent window.
     recent_fills: List[Fill] = field(default_factory=list)
+
+
+
+@dataclass(frozen=True)
+class Touch:
+    """Current venue best bid/ask for a symbol, used to price a marketable limit.
+
+    The unit of pricing truth, fetched live from the venue adapter (IB snapshot
+    for equity/fx, Binance bookTicker for crypto) at order time — NOT stored in
+    the DB (the 001 schema deliberately has no quotes table). bid/ask are Decimal
+    so all downstream pricing arithmetic (price_marketable_limit) stays in Decimal;
+    the float->Decimal boundary is crossed once, in the adapter, via str().
+
+    Previously defined in signal_executor.py; moved here so the adapter layer can
+    return it without an import cycle.
+    """
+    bid: Decimal
+    ask: Decimal
+
+
+@dataclass(frozen=True)
+class AccountEquity:
+    """A venue account's current equity, for position sizing.
+
+    total is the account's total equity in `currency` (IB: NetLiquidation from
+    the account summary; Binance USD-M: total wallet/margin balance in USDT).
+    available is the portion free for new positions (IB: AvailableFunds; Binance:
+    availableBalance) — sizing that respects buying power uses this, while a
+    simple "% of equity" rule uses total. available is Optional because not every
+    venue read cheaply distinguishes it; when absent, sizing falls back to total.
+
+    Decimal throughout, str-converted at the venue boundary, same as Touch.
+    """
+    total: Decimal
+    currency: str
+    available: Optional[Decimal] = None

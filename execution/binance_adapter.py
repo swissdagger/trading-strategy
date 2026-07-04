@@ -55,12 +55,14 @@ import httpx
 from execution import client_order_id as coid
 from execution.adapter import ExecutionAdapter, FillCallback
 from execution.types import (
+    AccountEquity,
     Fill,
     OrderIntent,
     OrderRequest,
     OrderResult,
     OrderStatus,
     ReconcileResult,
+    Touch,
     TradeSide,
     VenueOrder,
     VenuePosition,
@@ -132,6 +134,9 @@ class BinanceAdapter(ExecutionAdapter):
         # venue_exec_id we've already delivered, so the poller doesn't re-deliver
         # (the executor also dedupes, but this avoids needless callbacks).
         self._seen_exec_ids: Set[str] = set()
+        # Minimum quantity increment per venue symbol (LOT_SIZE.stepSize), for
+        # sizing to floor to a tradeable lot. Cached — it doesn't change intraday.
+        self._step_sizes: Dict[str, Decimal] = {}
 
     # ----------------------------------------------------------------------
     # Signing / request
@@ -153,6 +158,15 @@ class BinanceAdapter(ExecutionAdapter):
         headers = {"X-MBX-APIKEY": self._api_key}
         client = await self._get_client()
         resp = await client.request(method, self._base + path, params=p, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _public_request(self, path: str, params: dict) -> dict:
+        """Unsigned GET for public market-data endpoints (bookTicker, exchangeInfo).
+        No timestamp, no signature, no API key. Same client/timeout as signed.
+        """
+        client = await self._get_client()
+        resp = await client.get(self._base + path, params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -282,6 +296,78 @@ class BinanceAdapter(ExecutionAdapter):
                 avg_price=_dec(r["entryPrice"]) if r.get("entryPrice") else None,
             ))
         return out
+
+    # ----------------------------------------------------------------------
+    # Market data / account reads
+    # ----------------------------------------------------------------------
+    async def get_touch(self, symbol: str, asset_class: str) -> Optional[Touch]:
+        """Best bid/ask from the futures bookTicker. None if the symbol has no
+        two-sided quote (delisted, halted) or the read fails."""
+        venue_symbol = self.to_venue_symbol(symbol)
+        try:
+            r = await self._public_request(
+                "/fapi/v1/ticker/bookTicker", {"symbol": venue_symbol},
+            )
+        except Exception:
+            log.exception("get_touch: bookTicker failed for %s", symbol)
+            return None
+
+        bid_raw = r.get("bidPrice")
+        ask_raw = r.get("askPrice")
+        if bid_raw is None or ask_raw is None:
+            return None
+        bid = _dec(bid_raw)
+        ask = _dec(ask_raw)
+        # Binance returns "0" for an absent side; require a real two-sided quote.
+        if bid <= 0 or ask <= 0 or ask < bid:
+            log.warning("get_touch: implausible quote for %s bid=%s ask=%s", symbol, bid, ask)
+            return None
+        return Touch(bid=bid, ask=ask)
+
+    async def get_account_equity(self) -> AccountEquity:
+        """Total + available USDT balance from the futures account. Raises if the
+        balance can't be read or has no USDT asset (USD-M futures are USDT-margined,
+        so no USDT balance means nothing to size against)."""
+        rows = await self._signed_request("GET", "/fapi/v2/balance", {})
+        for r in rows:
+            if r.get("asset") == "USDT":
+                total = _dec(r["balance"])            # total wallet balance
+                available = _dec(r["availableBalance"]) if r.get("availableBalance") is not None else None
+                return AccountEquity(total=total, currency="USDT", available=available)
+        raise RuntimeError("Binance balance has no USDT asset — cannot read equity")
+
+    async def get_step_size(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        """LOT_SIZE.stepSize from exchangeInfo for the symbol, cached per symbol.
+
+        exchangeInfo is a public endpoint (uses _public_request). Each symbol
+        carries a `filters` array; the LOT_SIZE filter's `stepSize` is the quantity
+        increment. Queried per-symbol and cached. Returns None on any miss, and the
+        sizing policy then leaves the qty un-floored."""
+        venue_symbol = self.to_venue_symbol(symbol)
+        cached = self._step_sizes.get(venue_symbol)
+        if cached is not None:
+            return cached
+        try:
+            info = await self._public_request(
+                "/fapi/v1/exchangeInfo", {"symbol": venue_symbol},
+            )
+        except Exception:
+            log.exception("get_step_size: exchangeInfo failed for %s", symbol)
+            return None
+
+        symbols = info.get("symbols") or []
+        row = next((sym for sym in symbols if sym.get("symbol") == venue_symbol), None)
+        if row is None:
+            log.warning("get_step_size: %s not in exchangeInfo", venue_symbol)
+            return None
+        lot = next((f for f in row.get("filters", []) if f.get("filterType") == "LOT_SIZE"), None)
+        if lot is None or not lot.get("stepSize"):
+            return None
+        step = _dec(lot["stepSize"])
+        if step <= 0:
+            return None
+        self._step_sizes[venue_symbol] = step
+        return step
 
     async def _open_orders(self) -> List[VenueOrder]:
         rows = await self._signed_request("GET", "/fapi/v1/openOrders", {})

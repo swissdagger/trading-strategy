@@ -58,12 +58,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, Optional
 
 from execution.adapter import ExecutionAdapter
+from execution.observability import Metrics, build_health_document
 from execution.pricing import CapConfig, price_marketable_limit
 from execution import client_order_id as coid
 from execution.types import (
@@ -73,6 +75,7 @@ from execution.types import (
     OrderResult,
     OrderStatus,
     ReconcileResult,
+    Touch,
     TradeSide,
     ExitReason,
 )
@@ -83,13 +86,6 @@ log = logging.getLogger("executor.signal")
 # ---------------------------------------------------------------------------
 # Injected value types
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Touch:
-    """Current venue best bid/ask for pricing a marketable limit."""
-    bid: Decimal
-    ask: Decimal
-
 
 @dataclass
 class OpenTrade:
@@ -204,6 +200,7 @@ class SignalExecutor:
         hooks: ExecutorHooks,
         *,
         locks: Optional[Dict[str, asyncio.Lock]] = None,
+        metrics: Optional["Metrics"] = None,
     ):
         self.adapter = adapter
         self.hooks = hooks
@@ -220,9 +217,51 @@ class SignalExecutor:
         # from each OrderResult.venue_order_id.
         self._order_to_key: Dict[str, tuple[str, str]] = {}
         self._booted = False
+        # Signals the escalation loop to exit and marks the executor stopping.
+        # Shared by run_escalation_loop() and stop() so the host has one switch.
+        self._stop = asyncio.Event()
+        # Optional observability. metrics is a plain counter store (or None, in
+        # which case every _m*() call is a no-op — the executor never depends on
+        # it). last_tick_at is the wall-clock of the escalation loop's most
+        # recent pass; health uses its age to detect a wedged loop.
+        self._metrics = metrics
+        self._last_tick_at: Optional[float] = None
 
     def _lock(self, symbol: str) -> asyncio.Lock:
         return self._locks[symbol]
+
+    # ----------------------------------------------------------------------
+    # Observability — all no-ops when no Metrics was injected, so instrumenting
+    # a hot path never forces the dependency and never branches at the call site
+    # beyond this one guard.
+    # ----------------------------------------------------------------------
+    def _mincr(self, name: str, by: int = 1) -> None:
+        if self._metrics is not None:
+            self._metrics.incr(name, by)
+
+    def _mgauge(self, name: str, value: float) -> None:
+        if self._metrics is not None:
+            self._metrics.gauge(name, value)
+
+    def health_snapshot(self) -> dict:
+        """The /health document: liveness (booted + escalation loop ticking) plus
+        current open/closing/halted counts and the metrics snapshot. Pass this
+        method as HealthServer's snapshot_fn. Cheap and side-effect-free, so it's
+        safe to call on every health probe.
+
+        Uses a throwaway Metrics if none was injected, so the surface still
+        serves a coherent document (with zeroed counters) rather than erroring
+        when the executor is run without observability wired."""
+        closing = sum(1 for t in self._open.values() if t.state == "CLOSING")
+        halted = sum(1 for t in self._open.values() if t.state == "HALTED")
+        return build_health_document(
+            booted=self._booted,
+            last_tick_at=self._last_tick_at,
+            open_trades=len(self._open),
+            closing_trades=closing,
+            halted_trades=halted,
+            metrics=self._metrics if self._metrics is not None else Metrics(),
+        )
 
     # ----------------------------------------------------------------------
     # Boot — the mandated sequence. Must complete before handle_signal acts.
@@ -244,6 +283,8 @@ class SignalExecutor:
         await self.adapter.start_fill_stream(self._on_fill)
 
         self._booted = True
+        self._mgauge("executor_booted", 1)
+        self._mgauge("open_trades", len(self._open))
         log.info("executor boot complete: %d open trades under management", len(self._open))
 
     async def _reconcile(self, snapshot: ReconcileResult, db_trades: list[OpenTrade]) -> None:
@@ -291,6 +332,7 @@ class SignalExecutor:
 
     async def _halt(self, t: OpenTrade, reason: str) -> None:
         t.state = "HALTED"
+        self._mincr("trades_halted")
         await self.hooks.update_trade_state(t.trade_id, "HALTED", reason)
         log.error("trade %s HALTED: %s", t.trade_id, reason)
 
@@ -307,11 +349,13 @@ class SignalExecutor:
         symbol = row["symbol"]
         async with self._lock(symbol):
             action = row["action"]
+            self._mincr("signals_handled")
             if action == "ENTER":
                 await self._on_enter(row)
             elif action == "EXIT":
                 await self._on_exit(row)
             else:
+                self._mincr("signals_unknown_action")
                 log.warning("unknown signal action %r for %s", action, row.get("signal_id"))
 
     # ----------------------------------------------------------------------
@@ -515,6 +559,14 @@ class SignalExecutor:
         signal handling. Call periodically (e.g. every second) from the executor
         host's loop; kept as a single pass so it's trivially testable."""
         now = self.hooks.now_ms()
+        # Refresh the live-count gauges once per pass — cheap, and the pass runs
+        # on the loop cadence, so the operator's view stays current without
+        # threading a gauge update through every state mutation.
+        self._mgauge("open_trades", len(self._open))
+        self._mgauge("closing_trades",
+                     sum(1 for t in self._open.values() if t.state == "CLOSING"))
+        self._mgauge("halted_trades",
+                     sum(1 for t in self._open.values() if t.state == "HALTED"))
         # Snapshot to avoid mutating the dict mid-iteration (escalation may pop).
         for key, trade in list(self._open.items()):
             if trade.state != "CLOSING":
@@ -531,6 +583,44 @@ class SignalExecutor:
             async with self._lock(trade.symbol):
                 await self._escalate(trade, key)
 
+    async def run_escalation_loop(self, tick_seconds: float = 1.0) -> None:
+        """Periodic host driver for the escalation ladder: call
+        run_escalation_once() every `tick_seconds` until stop() is set. This is
+        the TIMER half of the ladder — fills advance trades on the adapter's
+        event-driven stream, while elapsed exit windows are advanced here.
+
+        Launch it from the executor host alongside the SignalListener, e.g.
+        `asyncio.create_task(executor.run_escalation_loop())`, and call stop()
+        (or cancel the task) to shut it down. A single pass never raises to here
+        (each trade's escalation is guarded), but we still wrap the pass so a
+        transient error can't kill the loop and freeze every other CLOSING
+        trade's ladder — mirroring the exit-manager tick's discipline.
+
+        Cadence uses wait_for on the stop event rather than a bare sleep so a
+        stop is observed immediately instead of after the current tick elapses.
+        """
+        log.info("escalation loop started (%.2fs tick)", tick_seconds)
+        while not self._stop.is_set():
+            try:
+                await self.run_escalation_once()
+            except Exception:
+                log.exception("escalation pass failed; continuing")
+            # Record wall-clock AFTER the pass returns: a pass that wedges never
+            # updates this, so health sees a stale tick — which is the point. Use
+            # time.time() (not the injectable ms clock) because health compares
+            # this against time.time(); keeping one clock avoids a false 'fresh'.
+            self._last_tick_at = time.time()
+            self._mincr("escalation_passes")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=tick_seconds)
+            except asyncio.TimeoutError:
+                pass   # normal: no stop within the tick, run the next pass
+        log.info("escalation loop stopped")
+
+    def stop(self) -> None:
+        """Signal the escalation loop to exit at its next wake. Idempotent."""
+        self._stop.set()
+
     async def _escalate(self, trade: OpenTrade, key) -> None:
         """Advance one rung (caller holds the symbol lock). If there's a rung
         beyond the current one, re-issue there; else HALT."""
@@ -546,6 +636,7 @@ class SignalExecutor:
             self._open.pop(key, None)
             return
         next_rung = trade.exit_rung + 1
+        self._mincr("escalations_issued")
         log.info("escalating exit for %s: rung %d -> %d (remaining=%s)",
                  trade.trade_id, trade.exit_rung, next_rung, remaining)
         await self._issue_exit(trade, key, rung=next_rung)
@@ -616,11 +707,14 @@ class SignalExecutor:
         remaining unclosed quantity (filled_qty - exit_filled_qty)."""
         newly = await self.hooks.persist_fill(_fill_row(fill, trade_id=trade.trade_id))
         if not newly:
+            self._mincr("fills_duplicate")
             return
         if fill.intent == OrderIntent.ENTRY:
             trade.filled_qty += fill.qty
+            self._mincr("fills_entry")
         else:
             trade.exit_filled_qty += fill.qty
+            self._mincr("fills_exit")
 
 
 # ---------------------------------------------------------------------------

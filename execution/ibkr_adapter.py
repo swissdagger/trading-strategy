@@ -48,6 +48,7 @@ the same separation the ABC mandates.
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 from decimal import Decimal
 from typing import Dict, List, Optional, Set
@@ -65,12 +66,14 @@ from ib_async import (
 from execution import client_order_id as coid
 from execution.adapter import ExecutionAdapter, FillCallback
 from execution.types import (
+    AccountEquity,
     Fill,
     OrderIntent,
     OrderRequest,
     OrderResult,
     OrderStatus,
     ReconcileResult,
+    Touch,
     TradeSide,
     VenueOrder,
     VenuePosition,
@@ -142,6 +145,10 @@ class IBKRAdapter(ExecutionAdapter):
         # Map orderRef -> the IB Order we placed, so cancel/amend by
         # client_order_id can find the live order object.
         self._orders_by_ref: Dict[str, IBTrade] = {}
+        # Minimum quantity increment per symbol (from contract details), for
+        # sizing to floor to a tradeable lot. Cleared on reconnect with the
+        # contract cache.
+        self._step_sizes: Dict[str, Decimal] = {}
 
     # ----------------------------------------------------------------------
     # Session lifecycle
@@ -177,6 +184,7 @@ class IBKRAdapter(ExecutionAdapter):
         # Fresh session — drop any stale contract/order caches.
         self._contracts.clear()
         self._orders_by_ref.clear()
+        self._step_sizes.clear()
         log.info("IB trading session confirmed (accounts=%s)", self._ib.managedAccounts())
 
     async def _trading_session_live(self) -> bool:
@@ -304,6 +312,106 @@ class IBKRAdapter(ExecutionAdapter):
                 avg_price=_dec(p.avgCost) if p.avgCost else None,
             ))
         return out
+
+    # ----------------------------------------------------------------------
+    # Market data / account reads
+    # ----------------------------------------------------------------------
+    async def get_touch(self, symbol: str, asset_class: str) -> Optional[Touch]:
+        """IB snapshot best bid/ask for the qualified contract. None when no valid
+        two-sided quote is available (NaN/absent — out of hours, halted, no book)."""
+        try:
+            contract = await self._contract_for(symbol, asset_class)
+        except Exception:
+            log.exception("get_touch: contract qualification failed for %s", symbol)
+            return None
+
+        # One-shot snapshot; reqTickersAsync resolves when the snapshot is populated.
+        try:
+            tickers = await self._ib.reqTickersAsync(contract)
+        except Exception:
+            log.exception("get_touch: reqTickers failed for %s", symbol)
+            return None
+        if not tickers:
+            return None
+        t = tickers[0]
+
+        bid = getattr(t, "bid", None)
+        ask = getattr(t, "ask", None)
+        # IB reports missing quotes as NaN (or -1). Require a real, positive,
+        # two-sided quote; anything else is "no touch" rather than a guess.
+        if bid is None or ask is None:
+            return None
+        if (isinstance(bid, float) and math.isnan(bid)) or (isinstance(ask, float) and math.isnan(ask)):
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            log.warning("get_touch: implausible quote for %s bid=%s ask=%s", symbol, bid, ask)
+            return None
+
+        return Touch(bid=_dec(bid), ask=_dec(ask))
+
+    async def get_account_equity(self) -> AccountEquity:
+        """NetLiquidation / AvailableFunds from the account summary — the same read
+        connect() uses to confirm the session. Raises if equity can't be read."""
+        summary = await self._ib.reqAccountSummaryAsync()
+        if not summary:
+            raise RuntimeError("IB account summary empty — cannot read equity")
+
+        # summary is a flat list of AccountValue(account, tag, value, currency).
+        # Filter to the configured bot account when set; else take whatever account
+        # the summary reports (single-account bot).
+        def _pick(tag: str) -> Optional[tuple[str, str]]:
+            for row in summary:
+                if self._account and row.account != self._account:
+                    continue
+                if row.tag == tag:
+                    return row.value, row.currency
+            return None
+
+        net = _pick("NetLiquidation")
+        if net is None:
+            raise RuntimeError("IB account summary missing NetLiquidation")
+        total_val, currency = net
+
+        avail = _pick("AvailableFunds")
+        available = _dec(avail[0]) if avail is not None else None
+
+        return AccountEquity(
+            total=_dec(total_val),
+            currency=currency or "USD",
+            available=available,
+        )
+
+    async def get_step_size(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        """Minimum quantity increment from IB contract details, cached per symbol.
+
+        Prefer sizeIncrement (the granularity), fall back to minSize, and treat a
+        missing/zero value as "unknown" (None) rather than guessing — the sizing
+        policy then leaves the qty un-floored and submit-time formatting handles
+        precision."""
+        cached = self._step_sizes.get(symbol)
+        if cached is not None:
+            return cached
+        try:
+            contract = await self._contract_for(symbol, asset_class)
+        except Exception:
+            log.exception("get_step_size: contract qualification failed for %s", symbol)
+            return None
+        try:
+            details = await self._ib.reqContractDetailsAsync(contract)
+        except Exception:
+            log.exception("get_step_size: reqContractDetails failed for %s", symbol)
+            return None
+        if not details:
+            return None
+        d = details[0]
+        # sizeIncrement is the tradeable granularity; minSize is the floor. Prefer
+        # the increment. Both are floats on ContractDetails.
+        raw = getattr(d, "sizeIncrement", 0) or getattr(d, "minSize", 0)
+        if not raw or raw <= 0:
+            return None
+        step = _dec(raw)
+        self._step_sizes[symbol] = step
+        return step
 
     async def _open_orders(self) -> List[VenueOrder]:
         trades = await self._ib.reqAllOpenOrdersAsync()
