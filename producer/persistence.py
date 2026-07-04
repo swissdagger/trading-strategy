@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Optional
-
+from collections import deque
 
 # ---- chain-machine persistence (signals + chains tables, migration 002) ----
 
