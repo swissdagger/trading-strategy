@@ -60,6 +60,11 @@ log = logging.getLogger("warmup_process")
 # on top of that. Raise via env if first warmup proves slow.
 MAX_CONCURRENT_FETCHES = int(os.environ.get("WARMUP_MAX_CONCURRENT", "8"))
 
+def _is_sub_minute(timeframe: str) -> bool:
+    """True for 5s/10s/15s/30s etc. — any timeframe expressed in seconds.
+    A timeframe is sub-minute iff it ends in 's' (the wire uses '5s'/'30s' for
+    seconds and '1m'/'2m'/'1h' for minute-and-coarser)."""
+    return timeframe.endswith("s")
 
 async def _seed_one_stream(
     feed,
@@ -70,6 +75,14 @@ async def _seed_one_stream(
     sem: asyncio.Semaphore,
     cursor_out: Dict[str, Dict[str, int]],
 ) -> None:
+    
+    # Sub-minute rungs are cold-start only (stale history). Skip the seed AND
+    # the cursor write so the live feed starts them from "now", not ~24h ago.
+    if _is_sub_minute(timeframe):
+        log.info("skip warmup for %s:%s %s — sub-minute is cold-start "
+                 "(stale history); it will fill live", asset_class, symbol, timeframe)
+        return
+
     """Fetch up to WINDOW_SIZE bars for one (symbol, timeframe) and upsert them
     into warmup_bars. Records the newest timestamp into cursor_out for the
     feed-cursor handoff. Failures are logged, not raised — one dead stream
