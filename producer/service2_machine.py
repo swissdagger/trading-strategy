@@ -167,6 +167,14 @@ class ServiceTwoChainMachine(ChainMachine):
             return
         if self._load_buffers is not None:
             self._buffers = await self._load_buffers()
+            # Buffer-fill visibility: the seeded length per timeframe, once per
+            # machine. A rung at WINDOW_SIZE forecasts on its first live bar; a
+            # rung at 0 is cold-start (either sub-minute, which we skip on
+            # purpose, or a hydration miss worth investigating). This is the
+            # single fastest signal for "warm buffer but no forecast?".
+            log.info("hydrated buffers for %s ladder=%s: %s",
+                     self.symbol, self.baseline_timeframe,
+                     {tf: len(dq) for tf, dq in self._buffers.items()})
         if self._load_active_chains is not None:
             for chain in await self._load_active_chains():
                 self._active_chains[chain["chain_id"]] = chain
