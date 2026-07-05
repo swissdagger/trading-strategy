@@ -182,6 +182,27 @@ class StreamingFeedBase(AssetFeed, ABC):
         sibling fetch identical history — there is one implementation."""
         return await self._backfill_feed.fetch_history(symbol, timeframe, points_needed)
 
+    def has_subminute_source(self) -> bool:
+        """True if the composed REST sibling can seed sub-minute rungs from a
+        tick source (trades/quotes). Lets warmup decide whether to trade-seed
+        sub-minute or take the cold start WITHOUT reaching past this wrapper —
+        the ws feed is the object warmup holds, so the capability question must
+        be answerable here. Mirrors the optional-capability probe idiom already
+        used for fetch_range (see fetch_range_or_recent)."""
+        return hasattr(self._backfill_feed, "fetch_subminute_history")
+
+    async def fetch_subminute_history(
+        self, symbol: str, timeframe: str, since_ms: int,
+    ) -> List[OHLCPoint]:
+        """Delegated to the composed REST feed's trades/quotes-based seeder,
+        the same way fetch_history delegates to the sibling. Only meaningful
+        when has_subminute_source() is True; callers must gate on that (the
+        REST sibling for a class with no sub-minute tick source, e.g. crypto,
+        does not implement this method)."""
+        return await self._backfill_feed.fetch_subminute_history(
+            symbol, timeframe, since_ms,
+        )
+
     # ---- Source-specific hooks (subclasses implement) ----
 
     @abstractmethod

@@ -96,6 +96,23 @@ def _timeframe_ms(timeframe: str) -> int:
     unit_to_ms = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
     return multiplier * unit_to_ms.get(unit, 60_000)
 
+
+def _subminute_seed_fn(feed):
+    """Resolve the sub-minute seeding coroutine for a feed, or None if the feed
+    can't seed sub-minute from a tick source.
+
+    Transport-agnostic by design: _build_feeds hands warmup either a REST feed
+    (which implements fetch_subminute_history directly) or a ws feed WRAPPING a
+    REST sibling (which exposes has_subminute_source()/fetch_subminute_history
+    that delegate to the sibling). Probing the method name alone is not enough —
+    the ws wrapper always HAS the method, but only its has_subminute_source()
+    reports whether the wrapped sibling can actually seed. Check that first, then
+    fall back to a direct method probe for the plain-REST case."""
+    has_probe = getattr(feed, "has_subminute_source", None)
+    if callable(has_probe):
+        return getattr(feed, "fetch_subminute_history") if has_probe() else None
+    return getattr(feed, "fetch_subminute_history", None)
+
 async def _seed_one_stream(
     feed,
     asset_class: str,
@@ -112,7 +129,7 @@ async def _seed_one_stream(
     # ~now, so unlike the stale-aggregate path (the original cold-start bug) the
     # cursor written from them is CORRECT and does not rewind the live poller.
     if _is_sub_minute(timeframe):
-        seed_fn = getattr(feed, "fetch_subminute_history", None)
+        seed_fn = _subminute_seed_fn(feed)
         if seed_fn is None:
             # Feed has no sub-minute tick source (e.g. crypto/Binance — no
             # sub-minute REST at all). Keep the pure cold-start: no seed, no
