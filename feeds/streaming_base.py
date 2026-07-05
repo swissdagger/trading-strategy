@@ -182,27 +182,6 @@ class StreamingFeedBase(AssetFeed, ABC):
         sibling fetch identical history — there is one implementation."""
         return await self._backfill_feed.fetch_history(symbol, timeframe, points_needed)
 
-    def has_subminute_source(self) -> bool:
-        """True if the composed REST sibling can seed sub-minute rungs from a
-        tick source (trades/quotes). Lets warmup decide whether to trade-seed
-        sub-minute or take the cold start WITHOUT reaching past this wrapper —
-        the ws feed is the object warmup holds, so the capability question must
-        be answerable here. Mirrors the optional-capability probe idiom already
-        used for fetch_range (see fetch_range_or_recent)."""
-        return hasattr(self._backfill_feed, "fetch_subminute_history")
-
-    async def fetch_subminute_history(
-        self, symbol: str, timeframe: str, target_bars: int,
-    ) -> List[OHLCPoint]:
-        """Delegated to the composed REST feed's trades/quotes-based seeder,
-        the same way fetch_history delegates to the sibling. Only meaningful
-        when has_subminute_source() is True; callers must gate on that (the
-        REST sibling for a class with no sub-minute tick source, e.g. crypto,
-        does not implement this method)."""
-        return await self._backfill_feed.fetch_subminute_history(
-            symbol, timeframe, target_bars,
-        )
-
     # ---- Source-specific hooks (subclasses implement) ----
 
     @abstractmethod
@@ -383,6 +362,20 @@ class StreamingFeedBase(AssetFeed, ABC):
                 self._advance_cursors(emitted)
                 await callback(emitted)
 
+    def _can_backfill_tf(self, tf: str) -> bool:
+        """Whether the composed REST sibling can actually backfill this timeframe.
+
+        Default True: the Polygon REST feeds backfill every target timeframe
+        (their fetch_history resamples from per-second/minute aggregates the REST
+        API serves). A feed whose REST sibling CANNOT serve some timeframe — e.g.
+        Binance, whose futures REST klines bottom out at 1m so sub-minute rungs
+        would (incorrectly) request interval=1s and 400 — overrides this to skip
+        those rungs. Skipped rungs simply resume live after reconnect (for
+        sub-minute crypto they self-heal from fresh 1s klines); attempting REST
+        backfill on them only produces a 400-storm that delays live resumption.
+        """
+        return True
+
     async def _backfill_outage(
         self,
         symbols: List[str],
@@ -398,14 +391,25 @@ class StreamingFeedBase(AssetFeed, ABC):
         callback (see module docstring: the live/backfill split). Bars at or
         before a symbol/tf's existing cursor are skipped — the cursor is the
         dedupe boundary, same discipline as the REST feeds' live path.
+
+        Timeframes the REST sibling can't serve (_can_backfill_tf) are skipped
+        entirely — they resume live rather than hammering REST with requests
+        that will fail.
         """
         now_ms = self._now_ms()
+        backfillable = [tf for tf in timeframes if self._can_backfill_tf(tf)]
+        skipped = [tf for tf in timeframes if tf not in backfillable]
+        if skipped:
+            logger.info(
+                "[%s] backfill skipping non-REST-servable tfs %s (resume live)",
+                self.name, skipped,
+            )
         logger.info(
-            "[%s] backfilling outage: %.1fs across %d symbols",
-            self.name, (now_ms - since_ms) / 1000.0, len(symbols),
+            "[%s] backfilling outage: %.1fs across %d symbols (%d tfs)",
+            self.name, (now_ms - since_ms) / 1000.0, len(symbols), len(backfillable),
         )
         for symbol in symbols:
-            for tf in timeframes:
+            for tf in backfillable:
                 try:
                     bars = await fetch_range_or_recent(
                         self._backfill_feed, symbol, tf, since_ms, now_ms,

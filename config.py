@@ -42,18 +42,20 @@ ASSET_CONFIGS = {
         "symbols": [
             "BTCUSDT",
         ],
-        # UNION of every enabled crypto strategy's ladder timeframes:
-        #   - four_chain [1m,3m,5m,15m,1h] — all Binance-native.
-        #   - two_ladder Set A [5s,10s,30s,1m,2m] ∪ Set B [30s,1m,2m,5m,10m].
-        # The two_ladder rungs Binance can't serve natively are DERIVED by the
-        # feeds: sub-minute (5s/10s/30s) from the 1s kline, and coarse (2m/10m)
-        # from a native base (2m←1m, 10m←5m). Warmup seeds the coarse and
-        # native rungs to 5000; sub-minute rungs are cold-start (self-heal
-        # live). See feeds/binance_futures._get_base_tf and feeds/binance_ws.
-        "timeframes": ["5s", "10s", "30s", "1m", "2m", "3m", "5m", "10m", "15m", "1h"],
+        # four_chain's ladder [1m,3m,5m,15m,1h] — all >= 1m, all Binance-native.
+        # Served by CONTINUOUS REST polling (BinanceFuturesFeed.start_live runs a
+        # per-timeframe poll loop at ~tf/2 cadence, closed-window-only, relaunched
+        # on error by feed_process). transport is 'rest' NOT 'ws': the Binance
+        # futures WEBSOCKET (fstream) is unreachable from this host — Binance
+        # silences futures market data to cloud/datacenter egress IPs, so the ws
+        # connects but delivers zero frames. REST (fapi) is reachable and is all
+        # four_chain needs (no sub-minute rungs here). Sub-minute crypto would
+        # require the ws and is therefore not available from this host — two_ladder
+        # is scoped off crypto for that reason (see non_crypto_symbols).
+        "timeframes": ["1m", "3m", "5m", "15m", "1h"],
         "points": 5000,
         "baseline_timeframe": "1m",
-        "transport": "ws",
+        "transport": "rest",
     },
     "equity": {
         "symbols": [
@@ -90,6 +92,28 @@ def all_tracked_symbols() -> list[str]:
     """Every symbol across all classes — convenience for feed startup / health."""
     out: list[str] = []
     for cfg in ASSET_CONFIGS.values():
+        out.extend(cfg.get("symbols", []))
+    return out
+
+
+def non_crypto_symbols() -> list[str]:
+    """Every tracked symbol EXCEPT crypto ones.
+
+    two_ladder runs a SUB-MINUTE ladder (5s/10s/30s in Set A/B). Crypto
+    sub-minute bars can only come from the Binance futures WEBSOCKET (REST
+    klines bottom out at 1m), and that websocket is unreachable from this
+    host's cloud egress IP — Binance silences futures market data to
+    datacenter IPs. So two_ladder cannot function on crypto here regardless
+    of code. Scoping two_ladder to non-crypto symbols keeps it on the
+    equity/fx venues where sub-minute data is available, while still
+    auto-including any NEW equity/fx symbol added later (the reason this is a
+    helper, not a hardcoded list). Crypto runs only four_chain, whose ladder
+    is 1m+ and served fine by continuous REST polling.
+    """
+    out: list[str] = []
+    for asset_class, cfg in ASSET_CONFIGS.items():
+        if asset_class == "crypto":
+            continue
         out.extend(cfg.get("symbols", []))
     return out
 
@@ -179,7 +203,11 @@ VENUE_ENDPOINTS = {
 STRATEGIES = {
     "two_ladder": {
         "enabled": True,
-        "symbols": "*",              # all tracked symbols
+        # Non-crypto only: two_ladder's sub-minute rungs (5s/10s/30s) can't be
+        # sourced for crypto from this host (Binance futures ws is IP-blocked;
+        # REST klines don't go sub-minute). Resolved just below the dict to the
+        # current non-crypto universe so new equity/fx symbols auto-join.
+        "symbols": [],               # set to non_crypto_symbols() below
         "ladders": ["A", "B"],       # the original two-ladder design
         "params": {},
     },
@@ -197,6 +225,13 @@ STRATEGIES = {
     #     "params": {"lookback": 20},
     # },
 }
+
+# two_ladder trades every non-crypto tracked symbol. Assigned here (not in the
+# literal above) because non_crypto_symbols() is defined earlier in the module
+# but the STRATEGIES literal can't reference config values mid-definition
+# cleanly; this keeps the crypto-exclusion knowledge in config.py rather than
+# leaking a marker string into the strategy registry.
+STRATEGIES["two_ladder"]["symbols"] = non_crypto_symbols()
 
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.

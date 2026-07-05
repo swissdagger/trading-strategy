@@ -18,21 +18,15 @@ configured target timeframe is served one of two ways:
           target bar. Routing it through BarAggregator would be a wasteful
           no-op and risks re-bucketing an already-final bar.
 
-  DERIVED: any target Binance doesn't serve natively, built by aggregating
-          the closed klines of a finer NATIVE base:
-            - sub-minute (5s/10s/30s, and a passthrough 1s) derive from 1s;
-            - coarse rungs Binance lacks (2m, 10m) derive from the largest
-              native base that divides them evenly (2m←1m, 10m←5m).
-          Each base has one @kline_<base> subscription feeding one aggregator
-          configured with only the rungs that source from that base, so a 1m
-          kline is never mis-bucketed into a 5s window. This is the same
-          OHLC bucketing Polygon's per-second bars get — see BarAggregator.
+  DERIVED (sub-minute: 5s/10s/30s, and a passthrough 1s): subscribe to
+          <sym>@kline_1s, take closed 1s klines, and feed them as source
+          bars into BarAggregator, which buckets them into the target rung
+          exactly as Polygon's per-second bars are bucketed. One 1s
+          subscription feeds ALL derived rungs for a symbol.
 
-So a symbol configured for {5s, 10s, 1m, 2m, 5m, 10m} opens: @kline_1s
-(feeding 5s + 10s), @kline_1m and @kline_5m (emitted directly as native 1m/5m
-AND feeding the 2m and 10m aggregators respectively). All on ONE websocket
-connection via combined streams. A base kline that is ALSO a native target
-(1m, 5m here) is subscribed once and dispatched to both paths in _handle_frame.
+So a symbol configured for {5s, 10s, 1m, 5m} opens: one @kline_1s stream
+(feeding 5s + 10s via the aggregator) plus @kline_1m and @kline_5m streams
+(emitted directly). All on ONE websocket connection via combined streams.
 
 ## Backfill asymmetry (an honest constraint, not a bug)
 
@@ -42,9 +36,6 @@ fetch_history covers them. It CANNOT backfill sub-minute rungs: Binance's
 REST klines don't go below 1m and the REST feed doesn't request 1s. So:
 
   - NATIVE rungs (1m+): backfilled normally on reconnect.
-  - COARSE DERIVED rungs (2m/10m): ALSO backfilled — the REST feed derives
-    them from its own 1m/5m klines (see binance_futures._get_base_tf), so a
-    reconnect gap in a 2m/10m rung fills exactly like a native rung.
   - DERIVED sub-minute rungs (5s/10s/30s): NOT backfilled — the outage
     leaves a small gap that self-heals as fresh 1s klines resume feeding
     the aggregator. For a strategy on 5s bars this is a few missing bars
@@ -78,10 +69,6 @@ import websockets
 
 from feeds.bar_aggregator import BarAggregator
 from feeds.base import is_market_open
-from feeds.binance_futures import (
-    _COARSE_DERIVED_INTERVALS,
-    _get_base_tf,
-)
 from feeds.streaming_base import StreamingFeedBase
 from producer.bar import OHLCPoint
 
@@ -101,16 +88,13 @@ _NATIVE_INTERVALS: Set[str] = {
 # Sub-minute rungs we can DERIVE by aggregating the native 1s kline. 1s
 # itself is a passthrough (the 1s kline emitted directly). Extend if the
 # ladder ever uses other sub-minute rungs.
-_SUBMINUTE_DERIVED_INTERVALS: Set[str] = {"1s", "5s", "10s", "15s", "30s"}
-
-# All derived rungs = sub-minute (1s-sourced) ∪ coarse (native-base-sourced,
-# e.g. 2m from 1m, 10m from 5m). _COARSE_DERIVED_INTERVALS is imported from the
-# REST sibling so the two feeds cannot disagree on which coarse rungs exist —
-# the same single-source-of-truth discipline the module docstrings call out.
-_DERIVED_INTERVALS: Set[str] = _SUBMINUTE_DERIVED_INTERVALS | _COARSE_DERIVED_INTERVALS
+_DERIVED_INTERVALS: Set[str] = {"1s", "5s", "10s", "15s", "30s"}
 
 # The full set this feed can serve = native ∪ derived.
 _SUPPORTED: Set[str] = _NATIVE_INTERVALS | _DERIVED_INTERVALS
+
+# The source interval for all DERIVED rungs.
+_DERIVE_SOURCE = "1s"
 
 _FSTREAM_BASE = "wss://fstream.binance.com/stream"
 
@@ -132,16 +116,22 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
         # Split configured timeframes into native vs derived at start_live.
         self._native_tfs: List[str] = []
         self._derived_tfs: List[str] = []
-        # Derived rungs grouped by the native base kline they aggregate from:
-        #   {"1s": ["5s","30s"], "1m": ["2m"], "5m": ["10m"]}
-        # One aggregator per base, each configured with ONLY the rungs that
-        # source from that base — so a 1m base kline never gets bucketed into
-        # a 5s window. Native klines touch none of these. Built in start_live.
-        self._derived_by_base: Dict[str, List[str]] = {}
-        self._base_aggs: Dict[str, BarAggregator] = {}
+        # A dedicated aggregator for the DERIVED rungs only. Native klines
+        # never touch it. Built in start_live once we know the timeframes.
+        self._derive_agg: BarAggregator | None = None
 
     def supported_timeframes(self) -> Set[str]:
         return _SUPPORTED
+
+    def _can_backfill_tf(self, tf: str) -> bool:
+        """Binance futures REST klines bottom out at 1m. A DERIVED sub-minute
+        rung (5s/10s/30s/1s) would make the REST sibling request interval=1s,
+        which Binance futures REST rejects with 400. So only NATIVE (1m+) rungs
+        are REST-backfillable; derived rungs are skipped and self-heal live from
+        fresh 1s klines once the ws reconnects (see the backfill-asymmetry note
+        in this module's docstring). This is the enforcement of that documented
+        constraint the base loop needs."""
+        return tf in _NATIVE_INTERVALS
 
     def to_native_symbol(self, symbol: str) -> str:
         return symbol  # Binance uses the bare ticker (BTCUSDT)
@@ -161,36 +151,17 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
         self._native_tfs = [tf for tf in timeframes if tf in _NATIVE_INTERVALS]
         self._derived_tfs = [tf for tf in timeframes if tf in _DERIVED_INTERVALS]
 
-        # Group each derived rung under the native base it aggregates from.
-        # _get_base_tf resolves every derived rung to its base: sub-minute → 1s,
-        # coarse → the largest native divisor (2m→1m, 10m→5m). Native rungs
-        # aren't in _derived_tfs, so they never reach here. This is the
-        # wire-level plan: one @kline_<base> subscription per base, each
-        # feeding one aggregator (built in start_live).
-        self._derived_by_base = {}
-        for tf in self._derived_tfs:
-            base = _get_base_tf(tf)
-            self._derived_by_base.setdefault(base, []).append(tf)
-
     def _stream_names(self, symbols: List[str]) -> List[str]:
         """Every combined-stream name this feed needs: one @kline_<tf> per
-        (symbol, native tf), plus one @kline_<base> per (symbol, distinct
-        derived base) — 1s for sub-minute rungs, 1m/5m for coarse rungs.
-        A base that's also a native target is subscribed once (dedup)."""
+        (symbol, native tf), plus one @kline_1s per symbol if any derived
+        rung is configured (a single 1s stream feeds all derived rungs)."""
         names: List[str] = []
         for sym in symbols:
             lower = sym.lower()
             for tf in self._native_tfs:
                 names.append(f"{lower}@kline_{tf}")
-            # One base-kline subscription per distinct derived base (1s for
-            # sub-minute, 1m/5m for coarse rungs). A base already subscribed
-            # as a NATIVE target isn't re-subscribed — the same closed kline
-            # frame serves both the native emit and the aggregator (dispatched
-            # in _handle_frame). Dedup guards that overlap.
-            for base in self._derived_by_base:
-                stream = f"{lower}@kline_{base}"
-                if stream not in names:
-                    names.append(stream)
+            if self._derived_tfs:
+                names.append(f"{lower}@kline_{_DERIVE_SOURCE}")
         return names
 
     # ---- StreamingFeedBase hooks ----
@@ -212,14 +183,76 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
         )
         return conn
 
+    _SUBSCRIBE_ID = 1
+    _SUBSCRIBE_ACK_TIMEOUT_S = 10.0
+
     async def _subscribe(self, conn, symbols: List[str]) -> None:
-        """Subscribe to all needed streams via a SUBSCRIBE control frame."""
+        """Subscribe to all needed streams via a SUBSCRIBE control frame, then
+        CONFIRM Binance's ack before returning.
+
+        Binance replies to a SUBSCRIBE with {"result": null, "id": <id>}. Without
+        reading it, a silently-rejected subscription is indistinguishable from a
+        working one until the staleness watchdog fires ~30s later — the failure
+        mode that produced a permanent reconnect loop when the ws was unreachable.
+        Reading the ack (with a bounded timeout) surfaces a bad subscription
+        immediately as a ConnectionError, which the supervisor treats as a
+        reconnect trigger — same posture as the Polygon feed confirming
+        auth_success. A non-error ack frame that is actually market data (Binance
+        can interleave) is tolerated: we scan a few frames for the matching id.
+        """
         names = self._stream_names(symbols)
         await conn.send(json.dumps({
             "method": "SUBSCRIBE",
             "params": names,
-            "id": 1,
+            "id": self._SUBSCRIBE_ID,
         }))
+
+        # Read frames until we see the ack for our id, or time out. Binance may
+        # interleave a market frame before the ack; scan a bounded number.
+        acked = False
+        for _ in range(10):
+            try:
+                raw = await asyncio.wait_for(
+                    conn.recv(), timeout=self._SUBSCRIBE_ACK_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                raise ConnectionError(
+                    f"[{self.name}] no SUBSCRIBE ack within "
+                    f"{self._SUBSCRIBE_ACK_TIMEOUT_S:.0f}s — subscription likely "
+                    f"rejected or stream unreachable (streams={len(names)})"
+                )
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(msg, dict) and msg.get("id") == self._SUBSCRIBE_ID:
+                # {"result": null, "id": 1} on success; an "error" object on
+                # failure. Binance uses result=null for a clean subscribe.
+                if msg.get("error") is not None:
+                    raise ConnectionError(
+                        f"[{self.name}] SUBSCRIBE rejected: {msg['error']}"
+                    )
+                acked = True
+                break
+            # Not the ack. In Binance's protocol the ack is the FIRST frame on a
+            # fresh connection (it's the direct response to the control frame), so
+            # this branch is not expected to hit. If a data frame does arrive
+            # first, we drop it rather than plumb it into the aggregator from here
+            # (that would spread consume-path wiring into subscribe for an edge
+            # that essentially never occurs); log it so the drop is never silent.
+            # One dropped source frame is within the reconnect tolerance the feed
+            # already accepts.
+            if isinstance(msg, dict) and "data" in msg:
+                logger.warning(
+                    "[%s] data frame arrived before SUBSCRIBE ack; dropping it "
+                    "(within reconnect tolerance)", self.name,
+                )
+        if not acked:
+            raise ConnectionError(
+                f"[{self.name}] SUBSCRIBE ack not seen in first frames "
+                f"(streams={len(names)})"
+            )
+
         logger.info(
             "[%s] subscribed %d streams (%d native tfs, %d derived tfs, %d symbols)",
             self.name, len(names), len(self._native_tfs),
@@ -227,15 +260,14 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
         )
 
     def _parse_message(self, raw) -> List[tuple]:
-        """Return DERIVED-path source bars (closed base klines) for one frame,
-        as (base, sym, start_ms, o, h, l, c) tuples.
+        """Return DERIVED-path source bars (closed 1s klines) for one frame.
 
         This satisfies StreamingFeedBase's abstract contract and is kept
         consistent with _handle_frame, but note this feed overrides _consume
-        (Binance mixes native klines + derived-base klines on one connection),
-        so the live path uses _handle_frame directly. This method is the
-        source-bar projection of _handle_frame, useful for testing and for any
-        caller that wants just the aggregator-bound source bars.
+        (Binance mixes native + 1s bars on one connection), so the live path
+        uses _handle_frame directly. This method is the 1s-only projection of
+        _handle_frame, useful for testing and for any caller that wants just
+        the aggregator-bound source bars.
         """
         _native, source_bars = self._handle_frame(raw)
         return source_bars
@@ -273,13 +305,9 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
             emitted: List[OHLCPoint] = []
             # Native closed klines: emit directly (already final target bars).
             emitted.extend(native_bars)
-            # Base source klines: feed each into the aggregator for ITS base,
-            # which buckets it only into the derived rungs that source from
-            # that base (1s→sub-minute, 1m→2m, 5m→10m).
-            for (base, symbol, src_t, o, h, l, c) in source_bars:
-                agg = self._base_aggs.get(base)
-                if agg is not None:
-                    emitted.extend(agg.add_source_bar(symbol, src_t, o, h, l, c))
+            # 1s source bars: aggregate into derived rungs.
+            for (symbol, src_t, o, h, l, c) in source_bars:
+                emitted.extend(aggregator.add_source_bar(symbol, src_t, o, h, l, c))
 
             if emitted:
                 emitted.sort(key=lambda p: (p.timestamp, p.timeframe))
@@ -291,14 +319,8 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
 
         native_bars: list[OHLCPoint] — closed klines at a NATIVE target tf,
                      ready to emit directly.
-        source_bars: list[tuple] — closed base klines as (base, sym, start_ms,
-                     o,h,l,c) for the per-base aggregator to bucket into derived
-                     rungs. `base` names which aggregator to feed.
-
-        A single closed kline can populate BOTH lists: when 1m is a native
-        target AND the base for 2m, the 1m frame emits directly as a 1m bar and
-        also feeds the 2m aggregator. So native emit and source routing are
-        INDEPENDENT checks below, not an if/elif.
+        source_bars: list[tuple] — closed 1s klines as (sym, start_ms,
+                     o,h,l,c) for the aggregator to bucket into derived rungs.
 
         Non-kline frames (subscription acks {"result":null,"id":1}, or
         not-yet-closed klines with x==false) yield nothing.
@@ -325,8 +347,11 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
             logger.warning("[%s] skipping malformed kline: %r", self.name, k)
             return native_bars, source_bars
 
-        # Native emit: this interval is a configured native target.
-        if interval in _NATIVE_INTERVALS and interval in self._native_tfs:
+        if interval == _DERIVE_SOURCE and self._derived_tfs:
+            # 1s kline → source bar for the aggregator.
+            source_bars.append((symbol, start_ms, o, h, l, c))
+        elif interval in _NATIVE_INTERVALS and interval in self._native_tfs:
+            # Native closed kline → emit directly as its target bar.
             native_bars.append(OHLCPoint(
                 symbol=symbol,
                 timestamp=start_ms,
@@ -334,14 +359,7 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
                 timeframe=interval,
                 asset_class=self.asset_class,
             ))
-        # Base-source routing: this interval is the base for one or more
-        # derived rungs. Independent of the native check above — the same
-        # 1m kline can do both. `self._derived_by_base` was built at
-        # partition time; membership means "some derived rung sources here".
-        if interval in self._derived_by_base:
-            source_bars.append((interval, symbol, start_ms, o, h, l, c))
-        # A kline for an interval that's neither a native target nor a
-        # derived base is one we didn't configure — ignore.
+        # else: a kline for an interval we didn't configure — ignore.
         return native_bars, source_bars
 
     async def _read(self, conn):
@@ -363,46 +381,11 @@ class BinanceFuturesWSFeed(StreamingFeedBase):
         klines bypass it in _consume), so the native entries in that
         aggregator simply stay empty and inert."""
         self._partition_timeframes(list(timeframes))
-        # One aggregator per derived base, each configured with ONLY the rungs
-        # that source from it. Feeding a 1m bar to an aggregator that also held
-        # 5s would bucket it into a 5s window — hence the per-base split rather
-        # than one aggregator over all derived rungs. Native rungs never touch
-        # these (they emit directly in _handle_frame).
-        self._base_aggs = {
-            base: BarAggregator(
-                asset_class=self.asset_class,
-                timeframes=rungs,
-                fill_gaps=self._fill_gaps,
-            )
-            for base, rungs in self._derived_by_base.items()
-        }
         logger.info(
-            "[%s] native tfs=%s derived tfs=%s (bases: %s)",
+            "[%s] native tfs=%s derived tfs=%s",
             self.name, self._native_tfs, self._derived_tfs,
-            {b: r for b, r in self._derived_by_base.items()},
         )
         await super().start_live(symbols, timeframes, initial_cursors, callback)
-
-    async def _flush_loop(self, aggregator, callback) -> None:
-        """Trailing-edge flush across ALL per-base aggregators.
-
-        Overrides the base loop, which flushes the single aggregator it built.
-        This feed keeps its derived rungs in per-base aggregators (built in
-        start_live), so the base's aggregator is inert and we flush ours
-        instead. Without this, a quiet coarse window (e.g. a 10m bar with no
-        later source kline to trigger it) would never close on the trailing
-        edge. The passed `aggregator` is the base's inert one — ignored.
-        """
-        while True:
-            await asyncio.sleep(self.FLUSH_INTERVAL_S)
-            now_ms = self._now_ms()
-            emitted: List[OHLCPoint] = []
-            for agg in self._base_aggs.values():
-                emitted.extend(agg.flush_elapsed(now_ms))
-            if emitted:
-                emitted.sort(key=lambda p: (p.timestamp, p.timeframe))
-                self._advance_cursors(emitted)
-                await callback(emitted)
 
     @staticmethod
     def _unwrap(raw):
