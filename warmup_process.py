@@ -60,11 +60,41 @@ log = logging.getLogger("warmup_process")
 # on top of that. Raise via env if first warmup proves slow.
 MAX_CONCURRENT_FETCHES = int(os.environ.get("WARMUP_MAX_CONCURRENT", "8"))
 
+# How far back to pull raw trades for sub-minute warmup. We do NOT try to reach
+# WINDOW_SIZE (5000) from trades — that's ~7h at 5s and would mean paging a huge
+# trade volume for a liquid name. A shorter lookback that ends the cold-start
+# HOLE is enough; the buffer tops up the rest live. 8h covers a full RTH session
+# from an intraday boot without asking Polygon for multi-day trade volume.
+WARMUP_TRADES_LOOKBACK_H = float(os.environ.get("WARMUP_TRADES_LOOKBACK_H", "8"))
+
+
+def _trades_since_ms() -> int:
+    """Epoch-ms lower bound for the sub-minute trades warmup window.
+
+    Deliberately a simple wall-clock lookback, not a market-calendar open. An
+    overnight/weekend boot just means the early part of the window has no trades
+    (empty, harmless — the resampler emits no bars for trade-less windows). If
+    exact RTH alignment is ever needed (to avoid paging empty pre-market),
+    replace this with a calendar-aware open."""
+    import time
+    return int(time.time() * 1000) - int(WARMUP_TRADES_LOOKBACK_H * 3600 * 1000)
+
+
 def _is_sub_minute(timeframe: str) -> bool:
     """True for 5s/10s/15s/30s etc. — any timeframe expressed in seconds.
     A timeframe is sub-minute iff it ends in 's' (the wire uses '5s'/'30s' for
     seconds and '1m'/'2m'/'1h' for minute-and-coarser)."""
     return timeframe.endswith("s")
+
+
+def _timeframe_ms(timeframe: str) -> int:
+    """Window size in epoch-ms for a wire timeframe ('5s'->5000, '2m'->120000).
+    Same unit map the rest of the system uses (service2_utils, _parse_timeframe);
+    kept local so warmup pulls in no extra module just for one multiply."""
+    multiplier = int(timeframe[:-1])
+    unit = timeframe[-1].lower()
+    unit_to_ms = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return multiplier * unit_to_ms.get(unit, 60_000)
 
 async def _seed_one_stream(
     feed,
@@ -76,11 +106,49 @@ async def _seed_one_stream(
     cursor_out: Dict[str, Dict[str, int]],
 ) -> None:
     
-    # Sub-minute rungs are cold-start only (stale history). Skip the seed AND
-    # the cursor write so the live feed starts them from "now", not ~24h ago.
+    # Sub-minute rungs: the /v2/aggs SECOND aggregates are T+1 stale, so we don't
+    # seed them from fetch_history. Instead seed from today's raw TRADES (fresh —
+    # only trade-reporting latency), bucketed to the timeframe. These bars end
+    # ~now, so unlike the stale-aggregate path (the original cold-start bug) the
+    # cursor written from them is CORRECT and does not rewind the live poller.
     if _is_sub_minute(timeframe):
-        log.info("skip warmup for %s:%s %s — sub-minute is cold-start "
-                 "(stale history); it will fill live", asset_class, symbol, timeframe)
+        seed_fn = getattr(feed, "fetch_subminute_history", None)
+        if seed_fn is None:
+            # Feed has no sub-minute tick source (e.g. crypto/Binance — no
+            # sub-minute REST at all). Keep the pure cold-start: no seed, no
+            # cursor, fills live.
+            log.info("skip warmup for %s:%s %s — no sub-minute tick source; "
+                     "cold-start (fills live)", asset_class, symbol, timeframe)
+            return
+        async with sem:
+            if timeframe not in feed.supported_timeframes():
+                log.warning("skip %s:%s %s — not in feed.supported_timeframes()",
+                            asset_class, symbol, timeframe)
+                return
+            try:
+                points = await seed_fn(symbol, timeframe, _trades_since_ms())
+            except Exception:
+                log.exception("trades-seed failed for %s:%s %s",
+                              asset_class, symbol, timeframe)
+                return
+            if not points:
+                log.warning("0 trade-bars for %s:%s %s — cold-start (fills live)",
+                            asset_class, symbol, timeframe)
+                return
+            await persist_warmup_bars(symbol, asset_class, timeframe, points)
+            # Write the cursor ONE FULL WINDOW past the last seeded bar, not at
+            # it. points[-1].timestamp is a window_START; the live poller resumes
+            # by re-emitting any window whose window_start >= cursor, so writing
+            # the bare newest window_start would make it re-emit the last seeded
+            # bar live — and the position-based buffer can't dedupe (migration
+            # 005). Advancing by tf_ms lands the cursor at the NEXT window's start,
+            # so live ingestion begins strictly after warmup ended: no gap (the
+            # forming window was dropped in fetch_subminute_history, so the feed
+            # legitimately produces it), no overlap.
+            newest_ms = points[-1].timestamp + _timeframe_ms(timeframe)
+            cursor_out.setdefault(symbol, {})[timeframe] = newest_ms
+            log.info("trade-seeded %s:%s %s with %d bars (cursor=%d)",
+                     asset_class, symbol, timeframe, len(points), newest_ms)
         return
 
     """Fetch up to WINDOW_SIZE bars for one (symbol, timeframe) and upsert them

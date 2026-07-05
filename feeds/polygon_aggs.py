@@ -50,6 +50,37 @@ from producer.bar import RateLimiter
 logger = logging.getLogger(__name__)
 
 
+def _trades_to_ohlcpoints(
+    ticks: List[dict],
+    timeframe: str,
+    symbol: str,
+    asset_class: str,
+) -> List[OHLCPoint]:
+    """Bucket degenerate trade-ticks ({t,o,h,l,c} with o=h=l=c=price) into
+    uniform timeframe-aligned OHLC windows via the SAME _resample_to_timeframe
+    rule the aggregate path uses, then lift them into OHLCPoints — the exact
+    type fetch_history returns, so downstream persist/cursor code is identical.
+
+    Keeping the trade→bar bucketing on the shared resampler (rather than a
+    private copy here) preserves the one-canonical-definition rule: a trade is
+    just a bar whose open/high/low/close all equal its price, so no new
+    bucketing logic is introduced."""
+    windows = _resample_to_timeframe(ticks, timeframe)  # -> [{t,o,h,l,c}] asc
+    return [
+        OHLCPoint(
+            symbol=symbol,
+            timestamp=w["t"],
+            open=w["o"],
+            high=w["h"],
+            low=w["l"],
+            close=w["c"],
+            timeframe=timeframe,
+            asset_class=asset_class,
+        )
+        for w in windows
+    ]
+
+
 class _PolygonAggsFeedBase(AssetFeed):
     """Shared Polygon /v2/aggs feed. Subclasses set `asset_class`,
     `name`, `SUPPORTED_TIMEFRAMES`, and override `to_native_symbol`.
@@ -470,6 +501,194 @@ class _PolygonAggsFeedBase(AssetFeed):
             )
             for tick in resampled
         ]
+
+    # ---------------------------------------------------------------
+    # SUB-MINUTE WARMUP (from raw ticks: trades for equity, quotes for fx)
+    # ---------------------------------------------------------------
+    TRADES_MAX_PER_CALL = 50000  # Polygon /v3/{trades,quotes} per-page cap
+
+    # --- point-source hooks (overridden per asset class) ------------
+    # The pagination/retry/resample machinery is shared; only two things differ
+    # between a trades source (equity) and a quotes source (fx): the endpoint URL
+    # and how one raw record becomes a (t_ms, price) pair. Subclasses override
+    # these two hooks; the loop below stays single-sourced.
+
+    def _subminute_source_url(self, native: str) -> str:
+        """Endpoint for the raw tick source. Equity default: /v3/trades."""
+        return f"https://api.polygon.io/v3/trades/{native}"
+
+    def _tick_from_record(self, rec: dict):
+        """Map one raw record -> (t_ms, price), or None to skip.
+
+        Equity default: a TRADE. sip_timestamp (ns, SIP-consolidated) is the
+        canonical time; fall back to participant_timestamp. price is the trade
+        price. A trade is a degenerate bar (o=h=l=c=price)."""
+        t_ns = rec.get("sip_timestamp") or rec.get("participant_timestamp")
+        p = rec.get("price")
+        if t_ns is None or p is None:
+            return None
+        return t_ns // 1_000_000, p
+
+    async def fetch_subminute_history(
+        self,
+        symbol: str,
+        timeframe: str,
+        since_ms: int,
+    ) -> List[OHLCPoint]:
+        """Build sub-minute OHLC bars from raw ticks in [since_ms, now].
+
+        WHY THIS EXISTS (and why it's separate from fetch_history):
+        The /v2/aggs SECOND aggregates are T+1 stale — a second-bar isn't final
+        until an end-of-day reconciliation folds in late dark-pool prints, so
+        seeding sub-minute buffers from /v2/aggs injects a ~24h-old series AND
+        (worse) writes a ~24h-stale feed_cursors high-water mark that rewinds the
+        live poller. Raw ticks (trades for equity, quotes for fx), by contrast,
+        carry only reporting latency (seconds-to-minutes), so bars built from them
+        end at ~now. That freshness is the whole point: the cursor written from
+        these bars is CORRECT, so the live poller resumes at the true recent edge.
+
+        Intended for 5s/10s/30s warmup only. Returns ascending OHLCPoints; may be
+        FEWER than a full buffer — the rest fills live (the documented
+        partial-ladder case). The still-FORMING newest window is dropped (see the
+        tail). Failures return whatever was collected rather than raising,
+        mirroring fetch_history's partial-return posture.
+        """
+        if timeframe not in self.SUPPORTED_TIMEFRAMES:
+            logger.error(f"Unsupported {self.asset_class} timeframe: {timeframe}")
+            return []
+
+        native = self.to_native_symbol(symbol)
+        client = await self._get_client()
+
+        # Ticker-recycling guard: never pull ticks from before inception.
+        floor_ms = self._inception_ms.get(symbol)
+        if floor_ms is not None:
+            since_ms = max(since_ms, floor_ms)
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if since_ms >= now_ms:
+            return []
+
+        # Polygon /v3/{trades,quotes} use NANOSECOND timestamps in both the query
+        # params and the record timestamp fields. Convert at the boundary;
+        # everything internal (and OHLCPoint.timestamp) stays epoch-ms.
+        gte_ns = since_ms * 1_000_000
+        lt_ns = now_ms * 1_000_000
+
+        base_url = self._subminute_source_url(native)
+        params = {
+            "timestamp.gte": gte_ns,
+            "timestamp.lt":  lt_ns,
+            "order":         "asc",
+            "limit":         self.TRADES_MAX_PER_CALL,
+            "apiKey":        self.api_key,
+        }
+
+        ticks: List[dict] = []
+        next_url: str | None = None
+        pages = 0
+        # Hard page ceiling so a pathological symbol/window can't page forever.
+        # One RTH session of even a very liquid name is well under this at 50k/pg.
+        MAX_PAGES = 200
+
+        while pages < MAX_PAGES:
+            success = False
+            body: dict = {}
+            for attempt in range(3):
+                try:
+                    async with self.rate_limiter:
+                        if next_url:
+                            # next_url carries all query state EXCEPT apiKey
+                            # (Polygon strips it from the cursor link).
+                            resp = await client.get(
+                                next_url, params={"apiKey": self.api_key},
+                            )
+                        else:
+                            resp = await client.get(base_url, params=params)
+
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            backoff = float(retry_after) if retry_after else 2 ** attempt
+                        except (ValueError, TypeError):
+                            backoff = 2 ** attempt
+                        logger.warning(
+                            f"429 subminute-seeding {symbol} {timeframe}; backing "
+                            f"off {backoff:.1f}s (attempt {attempt + 1}/3)"
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+
+                    if resp.status_code in (401, 403):
+                        # Entitlement missing / auth failure — not transient.
+                        # Return what we have (likely nothing); the rung falls
+                        # back to cold-start.
+                        logger.error(
+                            f"{resp.status_code} from Polygon {base_url} for "
+                            f"{native}. Check the plan includes this tick source. "
+                            f"Falling back to cold-start for this rung."
+                        )
+                        return _trades_to_ohlcpoints(
+                            ticks, timeframe, symbol, self.asset_class,
+                        )
+
+                    resp.raise_for_status()
+                    body = resp.json()
+                    success = True
+                    break
+
+                except Exception as e:
+                    detail = f": {e}" if str(e) else ""
+                    logger.warning(
+                        f"{self.name} subminute fetch error {symbol} {timeframe} "
+                        f"({type(e).__name__}){detail} (attempt {attempt + 1}/3)"
+                    )
+                    backoff = (2 ** attempt) * random.uniform(0.5, 1.5)
+                    await asyncio.sleep(backoff)
+
+            if not success:
+                # Page exhausted retries. Keep what we have — a short fresh buffer
+                # beats none, and the rest fills live.
+                logger.error(
+                    f"subminute page failed for {symbol} {timeframe} after "
+                    f"collecting {len(ticks)} ticks; returning partial."
+                )
+                break
+
+            for rec in body.get("results", []):
+                mapped = self._tick_from_record(rec)
+                if mapped is None:
+                    continue
+                t_ms, price = mapped
+                # A tick is a degenerate bar: o=h=l=c=price.
+                ticks.append({"t": t_ms, "o": price, "h": price, "l": price, "c": price})
+
+            next_url = body.get("next_url")
+            pages += 1
+            if not next_url:
+                break
+        else:
+            logger.warning(
+                f"subminute-seed for {symbol} {timeframe} hit MAX_PAGES="
+                f"{MAX_PAGES}; returning {len(ticks)} ticks collected so far."
+            )
+
+        # Drop the still-FORMING window. _resample_to_timeframe buckets purely by
+        # window_start and — unlike the live poller — has NO closed-window check,
+        # so the newest window it emits is the one currently forming at boot time,
+        # containing only the ticks seen so far. Seeding that truncated bar as if
+        # final would (a) hand the buffer a half-built bar and (b) collide with
+        # the live poller, which will emit the SAME window properly closed on its
+        # first cycle. Drop any window whose close-time is in the future. Using
+        # the now_ms captured at fetch START is the conservative choice: wall-clock
+        # has only advanced since, so this can drop a window that was still forming
+        # then but never keep one that is still open now. Mirrors the live loop's
+        # `window_start + tf_ms > now_ms` hold-back, keeping the boundary clean.
+        mult, _, base_ms = _parse_timeframe(timeframe)
+        tf_ms = mult * base_ms
+        points = _trades_to_ohlcpoints(ticks, timeframe, symbol, self.asset_class)
+        points = [p for p in points if p.timestamp + tf_ms <= now_ms]
+        return points
 
     # ---------------------------------------------------------------
     # LIVE

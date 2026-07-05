@@ -59,3 +59,33 @@ class PolygonForexFeed(_PolygonAggsFeedBase):
         # Defensive: accept an already-prefixed ticker without
         # double-prefixing (mirrors the options feed's O: handling).
         return symbol if symbol.startswith("C:") else f"C:{symbol}"
+
+    # --- sub-minute warmup source: FX QUOTES, not trades ------------
+    # FX has no "trades" in the equity sense; the tick-level source is the quote
+    # stream (/v3/quotes). The base sub-minute machinery (pagination, retry,
+    # forming-window drop, resample) is shared — we only override where the ticks
+    # come from and how one quote becomes a (t_ms, price) pair.
+
+    def _subminute_source_url(self, native: str) -> str:
+        return f"https://api.polygon.io/v3/quotes/{native}"
+
+    def _tick_from_record(self, rec: dict):
+        """Map one FX QUOTE -> (t_ms, mid_price), or None to skip.
+
+        A quote carries bid/ask, not a single traded price. The bar price is the
+        MID = (bid + ask) / 2 — the standard mark for an fx series with no trade
+        prints. Skip a quote missing either side (a one-sided book gives no
+        meaningful mid).
+
+        Timestamp: Polygon's /v3/quotes/{fxTicker} record uses
+        `participant_timestamp` (nanosecond EXCHANGE timestamp). FX quotes are NOT
+        SIP-consolidated, so there is no `sip_timestamp` here — that's the stocks
+        schema. Field names per the Forex Quotes REST spec: bid_price, ask_price,
+        participant_timestamp."""
+        t_ns = rec.get("participant_timestamp")
+        bid = rec.get("bid_price")
+        ask = rec.get("ask_price")
+        if t_ns is None or bid is None or ask is None:
+            return None
+        mid = (bid + ask) / 2.0
+        return t_ns // 1_000_000, mid
