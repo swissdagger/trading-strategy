@@ -192,7 +192,7 @@ class StreamingFeedBase(AssetFeed, ABC):
         return hasattr(self._backfill_feed, "fetch_subminute_history")
 
     async def fetch_subminute_history(
-        self, symbol: str, timeframe: str, since_ms: int,
+        self, symbol: str, timeframe: str, target_bars: int,
     ) -> List[OHLCPoint]:
         """Delegated to the composed REST feed's trades/quotes-based seeder,
         the same way fetch_history delegates to the sibling. Only meaningful
@@ -200,7 +200,7 @@ class StreamingFeedBase(AssetFeed, ABC):
         REST sibling for a class with no sub-minute tick source, e.g. crypto,
         does not implement this method)."""
         return await self._backfill_feed.fetch_subminute_history(
-            symbol, timeframe, since_ms,
+            symbol, timeframe, target_bars,
         )
 
     # ---- Source-specific hooks (subclasses implement) ----

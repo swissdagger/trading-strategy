@@ -45,6 +45,7 @@ import asyncpg
 
 from config import ASSET_CONFIGS
 from feed_process import _build_feeds
+from feeds.base import timeframe_to_ms
 from producer.persistence import make_persist_warmup_bars
 from producer.service2_machine import WINDOW_SIZE
 
@@ -60,41 +61,12 @@ log = logging.getLogger("warmup_process")
 # on top of that. Raise via env if first warmup proves slow.
 MAX_CONCURRENT_FETCHES = int(os.environ.get("WARMUP_MAX_CONCURRENT", "8"))
 
-# How far back to pull raw trades for sub-minute warmup. We do NOT try to reach
-# WINDOW_SIZE (5000) from trades — that's ~7h at 5s and would mean paging a huge
-# trade volume for a liquid name. A shorter lookback that ends the cold-start
-# HOLE is enough; the buffer tops up the rest live. 8h covers a full RTH session
-# from an intraday boot without asking Polygon for multi-day trade volume.
-WARMUP_TRADES_LOOKBACK_H = float(os.environ.get("WARMUP_TRADES_LOOKBACK_H", "8"))
-
-
-def _trades_since_ms() -> int:
-    """Epoch-ms lower bound for the sub-minute trades warmup window.
-
-    Deliberately a simple wall-clock lookback, not a market-calendar open. An
-    overnight/weekend boot just means the early part of the window has no trades
-    (empty, harmless — the resampler emits no bars for trade-less windows). If
-    exact RTH alignment is ever needed (to avoid paging empty pre-market),
-    replace this with a calendar-aware open."""
-    import time
-    return int(time.time() * 1000) - int(WARMUP_TRADES_LOOKBACK_H * 3600 * 1000)
-
 
 def _is_sub_minute(timeframe: str) -> bool:
     """True for 5s/10s/15s/30s etc. — any timeframe expressed in seconds.
     A timeframe is sub-minute iff it ends in 's' (the wire uses '5s'/'30s' for
     seconds and '1m'/'2m'/'1h' for minute-and-coarser)."""
     return timeframe.endswith("s")
-
-
-def _timeframe_ms(timeframe: str) -> int:
-    """Window size in epoch-ms for a wire timeframe ('5s'->5000, '2m'->120000).
-    Same unit map the rest of the system uses (service2_utils, _parse_timeframe);
-    kept local so warmup pulls in no extra module just for one multiply."""
-    multiplier = int(timeframe[:-1])
-    unit = timeframe[-1].lower()
-    unit_to_ms = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
-    return multiplier * unit_to_ms.get(unit, 60_000)
 
 
 def _subminute_seed_fn(feed):
@@ -143,7 +115,7 @@ async def _seed_one_stream(
                             asset_class, symbol, timeframe)
                 return
             try:
-                points = await seed_fn(symbol, timeframe, _trades_since_ms())
+                points = await seed_fn(symbol, timeframe, WINDOW_SIZE)
             except Exception:
                 log.exception("trades-seed failed for %s:%s %s",
                               asset_class, symbol, timeframe)
@@ -162,7 +134,7 @@ async def _seed_one_stream(
             # so live ingestion begins strictly after warmup ended: no gap (the
             # forming window was dropped in fetch_subminute_history, so the feed
             # legitimately produces it), no overlap.
-            newest_ms = points[-1].timestamp + _timeframe_ms(timeframe)
+            newest_ms = points[-1].timestamp + timeframe_to_ms(timeframe)
             cursor_out.setdefault(symbol, {})[timeframe] = newest_ms
             log.info("trade-seeded %s:%s %s with %d bars (cursor=%d)",
                      asset_class, symbol, timeframe, len(points), newest_ms)
