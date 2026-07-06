@@ -62,6 +62,12 @@ MachineFactory = Callable[[str, str, List[str]], "ChainMachine"]
 # and so the same publish can go to Kafka (needs a dict) and the runtime.
 PublishRaw = Callable[[dict], Awaitable[None]]
 
+# Predicate: does at least one enabled strategy read (symbol, ladder)? Injected
+# so the router can skip computing chains no strategy consumes (see on_bar). A
+# None predicate means "compute every timeframe-matched ladder" — the original
+# behaviour, preserved for callers/tests that don't supply ownership.
+OwnsPredicate = Callable[[str, str], bool]
+
 
 # Ladder names that correspond to the two-ladder ChainSet enum, so we can keep
 # populating `set` for them (backward compatibility with the two-ladder view).
@@ -78,6 +84,7 @@ class MultiLadderRouter:
         make_machine: MachineFactory,
         publish: PublishRaw,
         locks: Optional[Dict[str, asyncio.Lock]] = None,
+        owns: Optional[OwnsPredicate] = None,
     ):
         self._registry = registry
         self._make_machine = make_machine
@@ -85,6 +92,10 @@ class MultiLadderRouter:
         self._locks: Dict[str, asyncio.Lock] = (
             locks if locks is not None else defaultdict(asyncio.Lock)
         )
+        # (symbol, ladder) ownership gate. None => allow all (original behaviour).
+        # When set, on_bar only builds/runs machines for pairs a strategy reads,
+        # so a symbol-scoped strategy doesn't drag in ladders no one consumes.
+        self._owns = owns
         # symbol -> ladder_name -> machine. Lazily created on first bar.
         self._machines: Dict[str, Dict[str, ChainMachine]] = defaultdict(dict)
         self._hydrated: set[tuple[str, str]] = set()
@@ -109,10 +120,17 @@ class MultiLadderRouter:
 
     async def on_bar(self, bar: OHLCPoint) -> None:
         """Route ONE closed bar to every ladder whose timeframes contain the
-        bar's timeframe. All under the symbol lock."""
+        bar's timeframe AND that at least one strategy reads for this symbol.
+        All under the symbol lock."""
         targets = self._registry.ladders_for_timeframe(bar.timeframe)
+        if self._owns is not None:
+            # Drop ladders no enabled strategy reads for this symbol — a
+            # symbol-scoped strategy must not make the router compute chains
+            # nobody consumes (wasted forecasts + junk chains). With no owner
+            # gate this is a no-op (original fan-to-all behaviour).
+            targets = [ln for ln in targets if self._owns(bar.symbol, ln)]
         if not targets:
-            log.debug("dropping bar %s %s: timeframe in no registered ladder",
+            log.debug("dropping bar %s %s: no owned ladder for this timeframe",
                       bar.symbol, bar.timeframe)
             return
 

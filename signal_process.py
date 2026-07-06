@@ -173,12 +173,20 @@ class SignalProcess:
         all_symbols = _all_configured_symbols()
         self.strategies.build_from_config(STRATEGIES, all_symbols=all_symbols)
 
-        # --- Multi-ladder router: one machine per (symbol, ladder) across the
-        # union of all enabled strategies' ladders (compute-once) ---
+        # --- Multi-ladder router: one machine per (symbol, ladder) that a
+        # strategy actually reads (compute-once, ownership-gated). The ownership
+        # set is the (symbol, ladder) pairs enabled strategies declare; the router
+        # intersects its timeframe-matched targets with it, so a symbol-scoped
+        # strategy (e.g. two_ladder on AAPL only, four_chain on BTCUSDT only)
+        # doesn't make the router compute A/B chains for BTCUSDT just because
+        # BTCUSDT emits a shared timeframe (1m). Snapshot the set once at startup
+        # (strategies are fixed for the process lifetime). ---
+        owned = self.strategies.owned_symbol_ladders()
         self.router = MultiLadderRouter(
             registry=self.ladders,
             make_machine=self._make_factory(client),
             publish=self._publish,
+            owns=lambda symbol, ladder: (symbol, ladder) in owned,
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(

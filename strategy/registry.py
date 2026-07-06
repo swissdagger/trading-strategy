@@ -250,3 +250,24 @@ class StrategyRegistry:
         after a chain event on a given ladder, know which strategies to notify —
         the 'which strategies monitor this ladder' half of compute-once."""
         return [s for s in self._strategies.values() if ladder_name in s.ladders]
+
+    def owned_symbol_ladders(self) -> set[tuple[str, str]]:
+        """The set of (symbol, ladder_name) pairs at least one enabled strategy
+        actually reads.
+
+        The router computes chains per (symbol, ladder), fanning a bar to EVERY
+        ladder whose timeframes contain the bar's timeframe. That over-computes
+        once a strategy is scoped to a SUBSET of symbols: e.g. two_ladder on AAPL
+        only and four_chain on BTCUSDT only still share the 1m timeframe, so a
+        BTCUSDT 1m bar would build A/B machines for BTCUSDT that NO strategy reads
+        (wasted Sumtyme forecasts + junk chains). This set is the ground truth of
+        which (symbol, ladder) pairs are actually wanted; the router intersects
+        its timeframe-derived targets with it so it computes exactly the chains a
+        strategy consumes — no more. A symbol×ladder the strategy doesn't declare
+        is simply absent."""
+        out: set[tuple[str, str]] = set()
+        for s in self._strategies.values():
+            for sym in s.symbols:
+                for ladder in s.ladders:
+                    out.add((sym, ladder))
+        return out
