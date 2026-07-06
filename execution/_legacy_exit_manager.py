@@ -1,4 +1,22 @@
 """
+execution/_legacy_exit_manager.py — RETIRED. Do not use in the live path.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ FROZEN / DEPRECATED. Exit management in the live system lives in        │
+    │ execution/signal_executor.py (the escalation-ladder driver + _issue_    │
+    │ exit / _escalate). This module is the OLD standalone exit component and │
+    │ is NO LONGER WIRED IN: nothing instantiates ExitManager. Kept only as a │
+    │ reference for the escalation-ladder mechanism.                          │
+    │                                                                         │
+    │ Its restart path does not restore rung/deadline (cf. live Fix #1) and   │
+    │ its fill handling predates the cv1 attribution fixes. DO NOT "fix" these│
+    │ here and DO NOT import this module into live code. It imports pricing    │
+    │ from _legacy_executor, which re-exports execution.pricing, so the        │
+    │ crossed-book guard still applies to this frozen file.                   │
+    └──────────────────────────────────────────────────────────────────────┘
+
+--- original module docstring follows ---
+
 execution/exit_manager.py — The exit component and its escalation ladder.
 
 Closes the trade lifecycle: it owns OPEN -> CLOSING -> CLOSED. It is the ONLY
@@ -46,7 +64,8 @@ from typing import Awaitable, Callable, Dict, List, Optional
 
 from execution import client_order_id as coid
 from execution.adapter import ExecutionAdapter
-from execution.executor import CapConfig, price_marketable_limit
+from execution._legacy_executor import CapConfig, price_marketable_limit
+from execution.pricing import validate_touch
 from execution.types import (
     ExitReason,
     Fill,
@@ -274,6 +293,14 @@ class ExitManager:
         # this rung (distinct per rung so a re-issue is a NEW venue order).
         client_id = coid.build(view.trade_id, OrderIntent.EXIT, rung)
         bid, ask = await self.hooks.read_touch(view.symbol)
+        bad = validate_touch(bid, ask)
+        if bad is not None:
+            # Crossed/garbage book: don't price a wrong-side close off it. The
+            # trade stays CLOSING; the periodic tick re-enters this rung on the
+            # next pass, so the protective exit is retried, not dropped.
+            log.warning("cannot price exit rung %s for %s (%s) — retry next tick",
+                        rung, view.trade_id, bad)
+            return
         limit, reference, cap_applied = price_marketable_limit(
             view.side, OrderIntent.EXIT, bid, ask, cap)
 

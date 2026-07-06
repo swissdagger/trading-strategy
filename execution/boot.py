@@ -40,9 +40,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Awaitable, Callable, Dict, List, Optional
 
+from execution import client_order_id as coid
 from execution.adapter import ExecutionAdapter
 from execution.types import (
     Fill,
+    OrderIntent,
     OrderStatus,
     ReconcileResult,
     TradeSide,
@@ -331,40 +333,56 @@ def _index_fills_by_order(
     venue_to_client = {o.venue_order_id: o.client_order_id for o in orders}
     out: Dict[str, List[Fill]] = {}
     for f in fills:
-        # Fill carries no client id directly in this minimal shape; adapters that
-        # can attach it should. Where they can't, this maps via venue order id
-        # if the adapter populates it on the Fill in a richer subclass. The
-        # minimal Fill here is matched at the executor by venue_exec_id; boot's
-        # per-order indexing is best-effort and conservative.
-        cid = getattr(f, "client_order_id", None)
+        # Prefer the client_order_id the adapter stamps on the fill; fall back to
+        # the venue_order_id -> client_order_id bridge from the open-orders
+        # snapshot. Either way the index key is OUR deterministic client id, which
+        # is what the attribution helpers below parse to reach the trade. A fill
+        # we can map to neither is left out of this per-order index (the executor
+        # still dedupes it by venue_exec_id).
+        cid = f.client_order_id
+        if cid is None and f.venue_order_id is not None:
+            cid = venue_to_client.get(f.venue_order_id)
         if cid:
             out.setdefault(cid, []).append(f)
     return out
 
 
+def _is_exit_order_of(client_order_id: Optional[str], t: DbTrade) -> bool:
+    """True iff `client_order_id` is one of ours (parses as cv1) AND belongs to
+    this exact trade's EXIT ladder. This is what makes attribution EXACT rather
+    than best-effort: the cv1 id encodes (trade_id, intent, rung), so we match on
+    trade_id — never on symbol alone, which would sweep in another trade's fills
+    on the same instrument. A foreign or unparseable id is not ours -> False."""
+    if not client_order_id or not coid.is_ours(client_order_id):
+        return False
+    parsed = coid.parse(client_order_id)
+    return parsed.trade_id == t.trade_id and parsed.intent == OrderIntent.EXIT
+
+
 def _explaining_exit_fills(
     t: DbTrade, fills_by_client_id: Dict[str, List[Fill]],
 ) -> List[Fill]:
-    """Exit fills (within the lookback window) that account for this trade's
-    position having closed while we were down. Conservative: only returns fills
-    we can positively attribute to this trade's exit orders."""
+    """Exit fills (within the lookback window) that account for THIS trade's
+    position having closed while we were down. Attributed strictly by parsing the
+    cv1 client_order_id back to this trade's exit orders — a fill under any other
+    trade's id (even on the same symbol) is NOT returned, so we never credit one
+    trade's close with another's fills."""
     out: List[Fill] = []
     for cid, fs in fills_by_client_id.items():
-        for f in fs:
-            if f.intent.value == "EXIT":
-                out.append(f)
+        if _is_exit_order_of(cid, t):
+            out.extend(fs)
     return out
 
 
 def _live_exit_order(
     t: DbTrade, orders_by_client_id: Dict[str, VenueOrder],
 ) -> Optional[VenueOrder]:
-    """Any still-working EXIT order belonging to this trade. Exit orders carry
-    deterministic client ids derived from the trade key; the executor's id
-    scheme lets us recognize them. Minimal version matches on symbol+side+open
-    status; the executor's real id scheme tightens this."""
-    for o in orders_by_client_id.values():
-        if (o.symbol == t.symbol
+    """This trade's still-working EXIT order, if any. Matched by parsing the
+    deterministic cv1 client id back to (trade_id, EXIT) — NOT by symbol+status,
+    which on a shared account would return a different trade's exit order on the
+    same instrument and mask a genuinely-vanished close."""
+    for cid, o in orders_by_client_id.items():
+        if (_is_exit_order_of(cid, t)
                 and o.status in (OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED)):
             return o
     return None

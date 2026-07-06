@@ -1,4 +1,25 @@
 """
+execution/_legacy_executor.py — RETIRED. Do not use in the live path.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ FROZEN / DEPRECATED. The live executor is execution/signal_executor.py.│
+    │ This module (the old Kafka chain-event executor) is NO LONGER WIRED     │
+    │ INTO THE RUNNING SYSTEM: run_executor.py launches SignalExecutor only,  │
+    │ and nothing instantiates this Executor. It is kept ONLY as a reference  │
+    │ for the entry/pricing mechanism.                                        │
+    │                                                                         │
+    │ Known-divergent from the live path (deliberately NOT fixed — fixing     │
+    │ dead code is wasted effort): fill attribution here matches by symbol,   │
+    │ not by parsed cv1 client_order_id (cf. signal_executor + boot Fix #4);  │
+    │ restart does not restore escalation rung/deadline (cf. Fix #1); the     │
+    │ filled-qty write-back and async-fill race fixes (#2/#6) are absent.     │
+    │ DO NOT "fix" these here and DO NOT import this module into live code.   │
+    │ Pricing is the one thing still shared — re-exported from execution.     │
+    │ pricing so the crossed-book guard applies even to this frozen file.     │
+    └──────────────────────────────────────────────────────────────────────┘
+
+--- original module docstring follows ---
+
 execution/executor.py — The live event-and-order path.
 
 This is the executor's steady-state loop, entered only AFTER boot
@@ -93,70 +114,19 @@ class NeverEnter(EntryPolicy):
 
 # ---------------------------------------------------------------------------
 # Pricing: marketable-limit price from a venue reference + the per-class,
-# per-side cap config. Pure function so it is testable and the policy lives in
-# one place. Reads a CapConfig (loaded hot from execution_caps).
+# per-side cap config. THE ONE implementation lives in execution.pricing; this
+# module (the legacy executor) re-exports it so both executors price identically
+# and the crossed/invalid-book guard (InvalidTouch) applies everywhere. Kept as
+# re-exports rather than a second copy — the previous duplicate here had silently
+# diverged from the shared version (it lacked the touch guard).
 # ---------------------------------------------------------------------------
-class CapConfig:
-    """One (asset_class, intent) row of execution_caps, as the executor sees it.
-    spread is the current venue spread used to scale the multiples.
-
-    Multiples are stored as Decimal so all pricing arithmetic stays in Decimal —
-    the float->Decimal boundary is crossed ONCE here at construction (values come
-    out of the DB as float/numeric), never in the hot pricing path. Mixing float
-    and Decimal raises TypeError, and silent float contamination of a price is
-    exactly the rounding hazard the schema's numeric(38,18) exists to avoid.
-    """
-    __slots__ = ("cross_spread_mult", "cap_spread_mult", "cap_abs_bps")
-
-    def __init__(self, cross_spread_mult, cap_spread_mult, cap_abs_bps):
-        self.cross_spread_mult = Decimal(str(cross_spread_mult))
-        self.cap_spread_mult = Decimal(str(cap_spread_mult))
-        self.cap_abs_bps = (None if cap_abs_bps is None
-                            else Decimal(str(cap_abs_bps)))
-
-
-def price_marketable_limit(
-    side: TradeSide,
-    intent: OrderIntent,
-    touch_bid: Decimal,
-    touch_ask: Decimal,
-    cap: CapConfig,
-) -> tuple[Decimal, Decimal, Decimal]:
-    """Return (limit_price, venue_reference, cap_applied) for a crossing limit.
-
-    We cross THROUGH the touch by cross_spread_mult * spread so the order fills
-    immediately like a market order, but cap how far beyond the touch we will
-    tolerate at cap_spread_mult * spread (and never worse than cap_abs_bps if
-    set). For a BUY (entering LONG or exiting SHORT) we cross UP from the ask;
-    for a SELL we cross DOWN from the bid. The reference is the touch we priced
-    against (stored for basis forensics).
-    """
-    spread = touch_ask - touch_bid
-    buying = _is_buy(side, intent)
-    if buying:
-        reference = touch_ask
-        crossed = touch_ask + cap.cross_spread_mult * spread
-        cap_edge = touch_ask + cap.cap_spread_mult * spread
-        if cap.cap_abs_bps is not None:
-            cap_edge = min(cap_edge, touch_ask * (Decimal(1) + cap.cap_abs_bps / 10000))
-        limit = min(crossed, cap_edge)
-    else:
-        reference = touch_bid
-        crossed = touch_bid - cap.cross_spread_mult * spread
-        cap_edge = touch_bid - cap.cap_spread_mult * spread
-        if cap.cap_abs_bps is not None:
-            cap_edge = max(cap_edge, touch_bid * (Decimal(1) - cap.cap_abs_bps / 10000))
-        limit = max(crossed, cap_edge)
-    cap_applied = abs(limit - reference)
-    return limit, reference, cap_applied
-
-
-def _is_buy(side: TradeSide, intent: OrderIntent) -> bool:
-    """A BUY order: opening a LONG, or closing a SHORT. A SELL: opening a SHORT,
-    or closing a LONG."""
-    if intent == OrderIntent.ENTRY:
-        return side == TradeSide.LONG
-    return side == TradeSide.SHORT  # EXIT: closing a SHORT means buying back
+from execution.pricing import (  # re-export: one canonical pricing impl
+    CapConfig,
+    InvalidTouch,
+    price_marketable_limit,
+    validate_touch,
+)
+from execution.pricing import is_buy as _is_buy  # legacy private name preserved
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +245,15 @@ class Executor:
 
         # 2. Price the marketable limit off the venue touch + caps.
         bid, ask = await self.hooks.read_touch(symbol)
+        bad = validate_touch(bid, ask)
+        if bad is not None:
+            # Crossed/garbage book: don't open off a wrong-side price. The PENDING
+            # trade is terminated REJECTED (no venue order was placed); a later
+            # event can open the position when the book is priceable again.
+            log.warning("invalid touch for %s (%s) — rejecting entry trade %s",
+                        symbol, bad, trade_id)
+            await self.hooks.set_trade_state(trade_id, "REJECTED", f"invalid_touch:{bad}")
+            return
         cap = await self.hooks.load_cap(asset_class, OrderIntent.ENTRY)
         limit, reference, cap_applied = price_marketable_limit(
             side, OrderIntent.ENTRY, bid, ask, cap)

@@ -66,6 +66,7 @@ from execution.types import (
     TradeSide,
     VenueOrder,
     VenuePosition,
+    validate_venue_positions,
 )
 
 log = logging.getLogger("executor.binance")
@@ -256,14 +257,22 @@ class BinanceAdapter(ExecutionAdapter):
         order (its venue orderId is in our submitted-order intent map) we know
         whether it was an ENTRY or EXIT. If we can't tell (a fill for an order we
         didn't place, or one placed before this process started), we leave intent
-        ENTRY as a neutral default — the executor attributes by venue_order_id and
-        will only advance a trade it actually owns, so a mislabelled foreign fill
-        can't corrupt our accounting."""
+        ENTRY as a neutral default — the executor attributes by client/venue order
+        id and will only advance a trade it actually owns, so a mislabelled
+        foreign fill can't corrupt our accounting.
+
+        We also recover our canonical cv1 client_order_id from the row's
+        clientOrderId (the compressed venue id) via the reverse map, and stamp it
+        on the Fill. This is what lets the executor attribute a fill that streams
+        in during the submit->ack window — before it has learned this order's
+        venue_order_id. None when the id isn't one of ours (foreign fill)."""
         order_id = str(t["orderId"])
         intent = self._order_intent.get(order_id, OrderIntent.ENTRY)
+        canonical = self._canonical_from_venue_id(t.get("clientOrderId", ""))
         return Fill(
             venue_exec_id=str(t["id"]),
             venue_order_id=order_id,
+            client_order_id=canonical,
             qty=_dec(t["qty"]),
             price=_dec(t["price"]),
             intent=intent,
@@ -287,7 +296,7 @@ class BinanceAdapter(ExecutionAdapter):
         rows = await self._signed_request("GET", "/fapi/v3/positionRisk", {})
         out: List[VenuePosition] = []
         for r in rows:
-            amt = _dec(r["positionAmt"])   # signed: + long, - short
+            amt = _dec(r["positionAmt"])   # signed: + long, - short (venue-native)
             if amt == 0:
                 continue
             out.append(VenuePosition(
@@ -295,7 +304,9 @@ class BinanceAdapter(ExecutionAdapter):
                 qty=amt,
                 avg_price=_dec(r["entryPrice"]) if r.get("entryPrice") else None,
             ))
-        return out
+        # Enforce the signed-qty contract reconcile depends on (positionAmt is
+        # natively signed; this guards against a NaN/format regression).
+        return validate_venue_positions(out, venue="binance")
 
     # ----------------------------------------------------------------------
     # Market data / account reads
@@ -539,6 +550,7 @@ class BinanceAdapter(ExecutionAdapter):
             fills.append(Fill(
                 venue_exec_id=str(f.get("tradeId", f.get("id", ""))),
                 venue_order_id=venue_order_id,
+                client_order_id=canonical_id,
                 qty=_dec(f["qty"]), price=_dec(f["price"]),
                 intent=intent, filled_at_ms=int(resp.get("updateTime", 0)),
                 fee=_dec(f.get("commission", 0)),

@@ -77,6 +77,7 @@ from execution.types import (
     TradeSide,
     VenueOrder,
     VenuePosition,
+    validate_venue_positions,
 )
 
 log = logging.getLogger("executor.ibkr")
@@ -266,9 +267,15 @@ class IBKRAdapter(ExecutionAdapter):
         # an async execDetails fill is attributable. permId is IB's stable order
         # id; fall back to orderId. Kept consistent with reconcile's VenueOrder.
         venue_order_id = str(ex.permId or ex.orderId) if (ex.permId or ex.orderId) else None
+        # Stamp our canonical client_order_id (the orderRef) when the order is
+        # ours, so the executor can attribute a fill that streams in during the
+        # submit->ack window — before it has learned this order's venue_order_id.
+        # None for a foreign order (its ref doesn't parse as cv1).
+        client_order_id = ref if coid.is_ours(ref) else None
         return Fill(
             venue_exec_id=ex.execId,
             venue_order_id=venue_order_id,
+            client_order_id=client_order_id,
             qty=_dec(ex.shares),
             price=_dec(ex.price),
             intent=intent,
@@ -306,12 +313,21 @@ class IBKRAdapter(ExecutionAdapter):
             symbol = self._canonical_from_contract(p.contract)
             if symbol is None:
                 continue
+            qty = _dec(p.position)                    # signed: + long, - short
+            if qty == 0:
+                # IB reports closed positions as 0-qty rows; drop them so a flat
+                # instrument doesn't reach reconcile as a "position" (and so it
+                # passes the no-zero contract below).
+                continue
             out.append(VenuePosition(
                 symbol=symbol,
-                qty=_dec(p.position),                 # already signed
+                qty=qty,
                 avg_price=_dec(p.avgCost) if p.avgCost else None,
             ))
-        return out
+        # Enforce the signed-qty contract reconcile depends on. IB floats reach us
+        # via _dec (Decimal(str(x))); a NaN would become Decimal('NaN') and defeat
+        # every reconcile comparison silently — this catches it at the boundary.
+        return validate_venue_positions(out, venue="ibkr")
 
     # ----------------------------------------------------------------------
     # Market data / account reads

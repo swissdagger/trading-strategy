@@ -66,7 +66,7 @@ from typing import Awaitable, Callable, Dict, Optional
 
 from execution.adapter import ExecutionAdapter
 from execution.observability import Metrics, build_health_document
-from execution.pricing import CapConfig, price_marketable_limit
+from execution.pricing import CapConfig, price_marketable_limit, validate_touch
 from execution import client_order_id as coid
 from execution.types import (
     Fill,
@@ -78,9 +78,16 @@ from execution.types import (
     Touch,
     TradeSide,
     ExitReason,
+    qty_match_epsilon,
 )
 
 log = logging.getLogger("executor.signal")
+
+# How long to wait before retrying an exit whose book couldn't be priced (no or
+# crossed/invalid touch). Short, because an unpriceable protective exit is urgent:
+# we want the driver to come back and try again within a couple of ticks, not sit
+# on a long window. Kept well under a typical rung fill window.
+_EXIT_RETRY_MS = 2_000
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +113,21 @@ class OpenTrade:
     exit_deadline_ms: Optional[int] = None   # when the current rung's window ends
     exit_reason: Optional[str] = None        # the reason the exit was issued for
     exit_filled_qty: Decimal = Decimal(0)    # how much of the position the exit closed
+    # True once the CURRENT rung's order has actually been submitted to the venue.
+    # False while a CLOSING trade is committed to exit but could not yet be priced
+    # (no/invalid touch). The escalation driver uses this to RETRY the same rung
+    # (order was never placed) vs. ESCALATE to the next rung (a placed order didn't
+    # fill in its window). In-memory only; a trade re-loaded on restart defaults to
+    # True (boot reconcile independently re-issues a vanished close order).
+    exit_order_submitted: bool = True
+
+    @property
+    def open_qty(self) -> Decimal:
+        """Signed position we believe we hold: + for LONG, - for SHORT. Net of the
+        exit fills so far. Used by reconcile to compare against the venue's signed
+        position (size AND sign), not just 'flat vs not'."""
+        net = self.filled_qty - self.exit_filled_qty
+        return net if self.side == TradeSide.LONG else -net
 
 
 @dataclass(frozen=True)
@@ -211,11 +233,19 @@ class SignalExecutor:
         # the multi-strategy signals carry, so two strategies' positions on one
         # chain stay distinct here too.
         self._open: Dict[tuple[str, str], OpenTrade] = {}
-        # venue_order_id -> (strategy, position_key), so an ASYNC fill (which
-        # carries its venue_order_id, not our client_order_id) can be attributed
-        # back to the trade whose order produced it. Populated at submit time
-        # from each OrderResult.venue_order_id.
-        self._order_to_key: Dict[str, tuple[str, str]] = {}
+        # Attribution maps for ASYNC fills arriving on the adapter's fill stream.
+        #
+        # PRIMARY: client_order_id -> (strategy, position_key). The client id is
+        # DETERMINISTIC and known BEFORE we submit, so we register it FIRST (in
+        # _register_order, called ahead of submit_order). This closes the race
+        # where a fill streams in during the submit->ack window: even before the
+        # venue tells us the order's venue_order_id, the fill's client_order_id
+        # (which the adapter stamps when it can) resolves to the right trade.
+        self._coid_to_key: Dict[str, tuple[str, str]] = {}
+        # BRIDGE: venue_order_id -> client_order_id, learned at ack. Lets a fill
+        # that carries ONLY a venue_order_id (an adapter that can't stamp the
+        # client id on the stream) still resolve through to the key.
+        self._venue_to_coid: Dict[str, str] = {}
         self._booted = False
         # Signals the escalation loop to exit and marks the executor stopping.
         # Shared by run_escalation_loop() and stop() so the host has one switch.
@@ -308,17 +338,29 @@ class SignalExecutor:
             self._open[(t.strategy, t.position_key)] = t
             pos = venue_pos.get(t.symbol)
             if t.state in ("OPEN", "CLOSING"):
-                if pos is None or pos.qty == 0:
+                eps = qty_match_epsilon(t.asset_class)
+                venue_qty = pos.qty if pos is not None else Decimal(0)
+                if abs(venue_qty) <= eps:
                     # DB says we hold it; venue says flat. Closed in the crash
                     # window (or never really opened). Cannot safely resolve the
                     # realized fills here -> HALT for review.
                     await self._halt(t, "reconcile: DB open but venue flat")
-                # else: venue confirms the position; keep managing it.
+                elif abs(venue_qty - t.open_qty) > eps:
+                    # Venue holds a DIFFERENT size/sign than we think — a partial
+                    # close (or extra fill) during downtime we can't explain here.
+                    # HALT rather than silently manage a position we can't reconcile
+                    # to our quantity (previously this branch went undetected: we
+                    # only checked flat-vs-not and adopted any nonzero position).
+                    await self._halt(
+                        t, f"reconcile: position mismatch db={t.open_qty} venue={venue_qty}")
+                # else: venue confirms size AND sign; keep managing it.
 
-        # Venue positions with no corresponding DB trade: flag, don't adopt.
+        # Venue positions with no corresponding DB trade: flag, don't adopt. Use
+        # the crypto epsilon as a permissive floor for the unknown-symbol dust test
+        # (we have no trade to key asset_class on; a real orphan is a whole unit).
         known_symbols = {t.symbol for t in db_trades}
         for sym, p in venue_pos.items():
-            if p.qty != 0 and sym not in known_symbols:
+            if abs(p.qty) > qty_match_epsilon("") and sym not in known_symbols:
                 log.error(
                     "reconcile: venue holds %s qty=%s with no DB trade — manual review",
                     sym, p.qty,
@@ -326,9 +368,18 @@ class SignalExecutor:
                 # No trade object to HALT; surfaced as a loud log for the operator.
                 # (A real deployment would also raise an alert / write an incident row.)
 
-        # Recent venue fills we may have missed: dedupe by venue_exec_id.
+        # Recent venue fills we may have missed during the crash window. Attribute
+        # each to its trade by parsing the cv1 client id (fills carry it, or it's
+        # reachable via the venue bridge); persist against that real trade_id so
+        # the FK is satisfied and the fill is recorded. Dedupe by venue_exec_id
+        # protects against re-read. A fill we can't attribute to one of our trades
+        # is foreign and skipped.
         for f in snapshot.recent_fills:
-            await self.hooks.persist_fill(_fill_row(f, trade_id=None))
+            trade_id = self._trade_id_for_fill(f)
+            if trade_id is None:
+                self._mincr("reconcile_fills_unattributable")
+                continue
+            await self.hooks.persist_fill(_fill_row(f, trade_id=trade_id))
 
     async def _halt(self, t: OpenTrade, reason: str) -> None:
         t.state = "HALTED"
@@ -394,6 +445,15 @@ class SignalExecutor:
         if touch is None:
             log.warning("no touch for %s — cannot price ENTER %s/%s", symbol, strategy, position_key)
             return
+        bad = validate_touch(touch.bid, touch.ask)
+        if bad is not None:
+            # Crossed/garbage book — don't build a wrong-side entry off it. An
+            # entry is discretionary, so skipping is safe: a later signal (or a
+            # re-fetched touch) can still open the position.
+            log.warning("invalid touch for %s (%s) — skipping ENTER %s/%s",
+                        symbol, bad, strategy, position_key)
+            self._mincr("entries_skipped_bad_touch")
+            return
         cap = await self.hooks.get_cap(asset_class, OrderIntent.ENTRY)
         limit, reference, cap_applied = price_marketable_limit(
             side, OrderIntent.ENTRY, touch.bid, touch.ask, cap,
@@ -421,11 +481,14 @@ class SignalExecutor:
             qty=qty, limit_price=limit, venue_reference=reference, cap_applied=cap_applied,
         )
         await self.hooks.persist_order(_order_row(order, OrderStatus.WORKING))
+        # Register attribution BEFORE submit: a fill can stream in before
+        # submit_order even returns, and it must resolve to this trade.
+        self._register_order(entry_coid, key)
         result = await self.adapter.submit_order(order)
         await self._apply_entry_result(trade, key, result)
 
     async def _apply_entry_result(self, trade: OpenTrade, key, result: OrderResult) -> None:
-        self._map_order(result, key)
+        self._learn_venue_order_id(result)
         await self.hooks.advance_order_fill(
             result.client_order_id, result.filled_qty, result.status.value,
         )
@@ -479,26 +542,51 @@ class SignalExecutor:
         """Price + submit an exit for the trade's REMAINING quantity at escalation
         `rung`, set the rung's fill window as the deadline, and persist the exit
         state. Shared by the initial EXIT and every escalation re-issue, so the
-        pricing/id/deadline logic lives in one place."""
+        pricing/id/deadline logic lives in one place.
+
+        The trade is committed to CLOSING and persisted BEFORE we try to price, so
+        the intent is durable even if pricing fails or we crash here. If the touch
+        is missing or invalid (crossed/garbage book) we do NOT silently drop the
+        protective exit: we leave the trade CLOSING at the SAME rung with a short
+        retry deadline and exit_order_submitted=False, so the escalation driver
+        retries this rung (rather than escalating past it) until the book is
+        priceable. A protective exit that can't price is a retry, never a no-op."""
         symbol = trade.symbol
         asset_class = trade.asset_class
-
-        touch = await self.hooks.get_touch(symbol, asset_class)
-        if touch is None:
-            log.warning("no touch for %s — cannot price EXIT %s rung=%d",
-                        symbol, trade.trade_id, rung)
-            return
-        exit_cap = await self.hooks.get_exit_cap(asset_class)
-        cap = exit_cap.cap_for_rung(rung)
-        limit, reference, cap_applied = price_marketable_limit(
-            trade.side, OrderIntent.EXIT, touch.bid, touch.ask, cap,
-        )
 
         remaining = trade.filled_qty - trade.exit_filled_qty
         if remaining <= 0:
             # Nothing left to close (position already flat). Finalize.
             await self._finalize_closed(trade, key)
             return
+
+        # Commit the CLOSING intent + this rung FIRST, so it is durable regardless
+        # of what happens during pricing/submit below.
+        exit_cap = await self.hooks.get_exit_cap(asset_class)
+        trade.state = "CLOSING"
+        trade.exit_rung = rung
+        window_s = exit_cap.window_seconds_for_rung(rung)
+
+        touch = await self.hooks.get_touch(symbol, asset_class)
+        bad = validate_touch(touch.bid, touch.ask) if touch is not None else "no touch"
+        if bad is not None:
+            # Can't price the exit right now. Keep the trade CLOSING at THIS rung
+            # with a short retry deadline; the driver will call _issue_exit again
+            # at the same rung. exit_order_submitted=False marks "no order placed",
+            # so the driver retries rather than escalating past an unplaced rung.
+            trade.exit_order_submitted = False
+            trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
+            await self.hooks.update_trade_state(trade.trade_id, "CLOSING", None)
+            await self.hooks.persist_exit_state(trade.trade_id, rung, trade.exit_deadline_ms)
+            log.warning("cannot price EXIT %s rung=%d (%s) — will retry",
+                        trade.trade_id, rung, bad)
+            self._mincr("exits_retry_bad_touch")
+            return
+
+        cap = exit_cap.cap_for_rung(rung)
+        limit, reference, cap_applied = price_marketable_limit(
+            trade.side, OrderIntent.EXIT, touch.bid, touch.ask, cap,
+        )
 
         # Exit order gets its own deterministic id at THIS escalation rung, so a
         # re-issue at a higher rung is a distinct, idempotent order.
@@ -512,22 +600,23 @@ class SignalExecutor:
         )
         await self.hooks.persist_order(_order_row(order, OrderStatus.WORKING))
 
-        trade.state = "CLOSING"
-        trade.exit_rung = rung
         # Deadline = now + this rung's fill window. If the window is None we are
         # at/over the top of the ladder — no deadline, the driver will HALT.
-        window_s = exit_cap.window_seconds_for_rung(rung)
         trade.exit_deadline_ms = (
             self.hooks.now_ms() + window_s * 1000 if window_s is not None else None
         )
+        trade.exit_order_submitted = True
         await self.hooks.update_trade_state(trade.trade_id, "CLOSING", None)
         await self.hooks.persist_exit_state(trade.trade_id, rung, trade.exit_deadline_ms)
 
+        # Register attribution BEFORE submit (see _on_enter): a fill on this exit
+        # order can arrive before submit_order returns its ack.
+        self._register_order(exit_coid, key)
         result = await self.adapter.submit_order(order)
         await self._apply_exit_result(trade, key, result)
 
     async def _apply_exit_result(self, trade: OpenTrade, key, result: OrderResult) -> None:
-        self._map_order(result, key)
+        self._learn_venue_order_id(result)
         await self.hooks.advance_order_fill(
             result.client_order_id, result.filled_qty, result.status.value,
         )
@@ -568,20 +657,32 @@ class SignalExecutor:
         self._mgauge("halted_trades",
                      sum(1 for t in self._open.values() if t.state == "HALTED"))
         # Snapshot to avoid mutating the dict mid-iteration (escalation may pop).
+        # The unlocked reads below are only a cheap pre-filter; every action
+        # re-validates the live trade UNDER THE SYMBOL LOCK, because a streamed
+        # fill (or an in-flight _issue_exit) running between this snapshot and the
+        # lock can close the position or move its deadline. Acting on the stale
+        # snapshot would HALT or escalate a trade that no longer needs it.
         for key, trade in list(self._open.items()):
             if trade.state != "CLOSING":
                 continue
-            if trade.exit_deadline_ms is None:
-                # No deadline set means we're at/over the ladder top with an
-                # unfilled exit — HALT (the ladder's terminal action).
-                async with self._lock(trade.symbol):
-                    await self._halt(trade, "escalation: exit unfilled at top of ladder")
-                    self._open.pop(key, None)
-                continue
-            if now < trade.exit_deadline_ms:
-                continue   # window not yet expired
+            if trade.exit_deadline_ms is not None and now < trade.exit_deadline_ms:
+                continue   # window not yet expired (re-checked under lock below)
             async with self._lock(trade.symbol):
-                await self._escalate(trade, key)
+                # Re-read the authoritative in-memory trade under the lock. It may
+                # have advanced (filled -> CLOSED and popped, or a fresh rung with
+                # a new deadline) since the unlocked pre-filter above.
+                fresh = self._open.get(key)
+                if fresh is None or fresh.state != "CLOSING":
+                    continue
+                if fresh.exit_deadline_ms is None:
+                    # No deadline while CLOSING means we're at/over the ladder top
+                    # with an unfilled exit — HALT (the ladder's terminal action).
+                    await self._halt(fresh, "escalation: exit unfilled at top of ladder")
+                    self._open.pop(key, None)
+                    continue
+                if self.hooks.now_ms() < fresh.exit_deadline_ms:
+                    continue   # deadline moved out from under us (rung re-issued)
+                await self._escalate(fresh, key)
 
     async def run_escalation_loop(self, tick_seconds: float = 1.0) -> None:
         """Periodic host driver for the escalation ladder: call
@@ -622,11 +723,21 @@ class SignalExecutor:
         self._stop.set()
 
     async def _escalate(self, trade: OpenTrade, key) -> None:
-        """Advance one rung (caller holds the symbol lock). If there's a rung
-        beyond the current one, re-issue there; else HALT."""
+        """Advance one rung, OR retry the current rung if its order never got
+        placed (caller holds the symbol lock). If there's a rung beyond the
+        current one, re-issue there; else HALT."""
         remaining = trade.filled_qty - trade.exit_filled_qty
         if remaining <= 0:
             await self._finalize_closed(trade, key)
+            return
+        if not trade.exit_order_submitted:
+            # The current rung was committed but never actually placed (couldn't
+            # price the book). Retry the SAME rung — do NOT burn a ladder step for
+            # a book we never got an order onto.
+            self._mincr("exits_retry_same_rung")
+            log.info("retrying exit for %s at same rung %d (order not yet placed)",
+                     trade.trade_id, trade.exit_rung)
+            await self._issue_exit(trade, key, rung=trade.exit_rung)
             return
         exit_cap = await self.hooks.get_exit_cap(trade.asset_class)
         if not exit_cap.has_rung_beyond(trade.exit_rung):
@@ -644,42 +755,96 @@ class SignalExecutor:
     # ----------------------------------------------------------------------
     # Fills (async, from the adapter's fill stream)
     # ----------------------------------------------------------------------
-    def _map_order(self, result: OrderResult, key: tuple[str, str]) -> None:
-        """Remember which trade an order belongs to, by its venue_order_id, so a
-        later async fill on that order can be attributed. No-op if the venue
-        didn't return an id yet (the brief submit->ack window; reconcile resolves
-        it by client_order_id)."""
-        if result.venue_order_id:
-            self._order_to_key[result.venue_order_id] = key
+    def _register_order(self, client_order_id: str, key: tuple[str, str]) -> None:
+        """Register the client_order_id -> trade mapping BEFORE submitting, so a
+        fill that streams in during the submit->ack window is attributable the
+        instant it arrives. The client id is deterministic and known up front;
+        this is the map that actually closes the async-fill race."""
+        self._coid_to_key[client_order_id] = key
+
+    def _learn_venue_order_id(self, result: OrderResult) -> None:
+        """At ack, bridge venue_order_id -> client_order_id so a fill that carries
+        only the venue's order id (an adapter that can't stamp our client id on
+        the stream) still resolves through to the key. No-op until the venue
+        returns an id (reconcile resolves that residual window by client id)."""
+        if result.venue_order_id and result.client_order_id:
+            self._venue_to_coid[result.venue_order_id] = result.client_order_id
+
+    def _resolve_fill(
+        self, fill: Fill,
+    ) -> tuple[Optional[str], Optional[tuple[str, str]]]:
+        """Resolve a streamed fill to (client_order_id, trade_key).
+
+        Client id first (deterministic, known before submit); fall back to the
+        venue_order_id bridge for adapters that stamp only the venue id. Returns
+        the resolved client_order_id even when the trade is no longer in memory,
+        so a late fill on a finalized trade can still be persisted against its
+        real trade_id (parsed from the id) rather than dropped. (None, None) =>
+        genuinely unattributable (foreign/manual, or arrived before the bridge)."""
+        cid = fill.client_order_id
+        if cid is None and fill.venue_order_id is not None:
+            cid = self._venue_to_coid.get(fill.venue_order_id)
+        if cid is None:
+            return None, None
+        return cid, self._coid_to_key.get(cid)
+
+    def _trade_id_for_fill(self, fill: Fill) -> Optional[str]:
+        """The real trade_id a fill should be persisted against, or None if it
+        can't be attributed to one of our trades. Recovers the cv1 client id (from
+        the fill or the venue bridge) and parses out the trade_id. Used wherever a
+        fill must satisfy the fills NOT NULL trade_id FK without a live in-memory
+        trade — the reconcile sweep and late fills on finalized trades."""
+        cid, _ = self._resolve_fill(fill)
+        if cid is None or not coid.is_ours(cid):
+            return None
+        return coid.parse(cid).trade_id
 
     async def _on_fill(self, fill: Fill) -> None:
         """Adapter fill-stream callback for ASYNC fills. Attributes the fill to
-        its trade by venue_order_id (which every venue stamps on a fill) via the
-        submit-time map, then advances that trade exactly as a sync fill would —
+        its trade (client_order_id first, venue_order_id bridge second) via the
+        submit-time maps, then advances that trade exactly as a sync fill would —
         same _record_fill path, so partials, dedup, and completion behave
         identically whether a fill arrived synchronously or on the stream.
 
-        A fill we can't attribute (no venue_order_id, or an order we don't know —
-        e.g. a foreign/manual trade, or a fill discovered before its order was
-        mapped) is still persisted and deduped by venue_exec_id, and surfaced for
-        the position reconcile to explain. We never drop a fill and never guess
-        which trade an unlabelled fill belongs to."""
-        key = None
-        if fill.venue_order_id is not None:
-            key = self._order_to_key.get(fill.venue_order_id)
+        A fill we can attribute but whose trade is no longer live in memory (e.g.
+        a straggler exit fill after the trade finalized to CLOSED) is still
+        persisted against its REAL trade_id — recovered by parsing the resolved
+        cv1 client id — so late fills are recorded for honest P&L, not dropped.
 
-        if key is None:
-            # Unattributable: persist+dedupe (idempotent), leave for reconcile.
-            await self.hooks.persist_fill(_fill_row(fill, trade_id=None))
-            log.info("async fill %s not attributable (order=%s) — persisted for reconcile",
-                     fill.venue_exec_id, fill.venue_order_id)
+        A genuinely unattributable fill (no matching id — a foreign/manual trade,
+        or one that arrived before we learned its order's bridge) cannot satisfy
+        the fills NOT NULL trade_id FK and so cannot be stored here. We do NOT
+        pretend to persist it: we log loudly and count it, so a persistent stream
+        of them is visible. The boot reconcile sweep — which re-reads recent venue
+        fills fresh — is the recovery path for any that later become attributable.
+        We never guess which trade an unlabelled fill belongs to."""
+        cid, key = self._resolve_fill(fill)
+        trade_id = self._trade_id_for_fill(fill)
+
+        if trade_id is None:
+            # Genuinely unattributable to one of our trades (foreign/manual id, or
+            # a fill that arrived before we learned its order's bridge). It cannot
+            # satisfy the fills NOT NULL trade_id FK, so it cannot be stored here.
+            # We do NOT pretend to persist it — we log loudly and count it so a
+            # persistent stream is visible; the boot reconcile sweep re-reads
+            # recent venue fills fresh and is the recovery path for any that later
+            # become attributable. We never guess which trade a fill belongs to.
+            self._mincr("fills_unattributable")
+            log.warning("async fill %s unattributable (order=%s, id=%s) — cannot "
+                        "persist; left for reconcile",
+                        fill.venue_exec_id, fill.venue_order_id, cid)
             return
 
-        trade = self._open.get(key)
+        trade = self._open.get(key) if key is not None else None
         if trade is None:
-            # We knew the order but the trade is no longer open in memory (e.g.
-            # already finalized). Persist for the record; dedupe protects totals.
-            await self.hooks.persist_fill(_fill_row(fill, trade_id=None))
+            # Attributable, but the trade isn't live in memory (already
+            # finalized/popped). Persist against the real trade_id so a straggler
+            # fill is still recorded for honest P&L; venue_exec_id dedupe protects
+            # totals against re-delivery. Nothing to advance in memory.
+            await self.hooks.persist_fill(_fill_row(fill, trade_id=trade_id))
+            self._mincr("fills_late_finalized")
+            log.info("async fill %s on non-live trade %s — persisted",
+                     fill.venue_exec_id, trade_id)
             return
 
         # Attribute under the symbol lock so a stream fill can't interleave with
@@ -704,7 +869,16 @@ class SignalExecutor:
         the right counter. Dedupes on venue_exec_id. ENTRY fills grow the held
         position (filled_qty); EXIT fills grow exit_filled_qty (how much of the
         position we've closed) — kept separate so the escalation driver knows the
-        remaining unclosed quantity (filled_qty - exit_filled_qty)."""
+        remaining unclosed quantity (filled_qty - exit_filled_qty).
+
+        After advancing, the new quantities are persisted to the trades row so a
+        restart re-adopts the REAL filled position. Without this, only the initial
+        (zero) quantities are durable and load_open_trades reads back open_qty=0 —
+        which false-triggers the 'DB open but venue flat' HALT on reconcile and
+        mis-sizes the escalation remainder. persist_trade's UPSERT updates exactly
+        state + entry/exit filled qty, so this is a targeted write despite reusing
+        the full-row helper. Persist is gated by the dedup below, so a re-delivered
+        fill neither double-counts nor rewrites."""
         newly = await self.hooks.persist_fill(_fill_row(fill, trade_id=trade.trade_id))
         if not newly:
             self._mincr("fills_duplicate")
@@ -715,6 +889,8 @@ class SignalExecutor:
         else:
             trade.exit_filled_qty += fill.qty
             self._mincr("fills_exit")
+        # Durably record the advanced quantities so restart recovery is faithful.
+        await self.hooks.persist_trade(trade)
 
 
 # ---------------------------------------------------------------------------

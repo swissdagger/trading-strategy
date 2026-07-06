@@ -117,6 +117,15 @@ class Fill:
     # know our orders) may lack it; such fills are persisted and left for the
     # position reconcile to explain.
     venue_order_id: Optional[str] = None
+    # Our canonical cv1 client_order_id for the order this fill belongs to, when
+    # the adapter can recover it (Binance userTrades carries clientOrderId, which
+    # reverses through the adapter's compression map; IB stamps orderRef on the
+    # execution). This is the PRIMARY attribution key: it is DETERMINISTIC and
+    # known BEFORE submit, so a fill streamed in the brief submit->ack window —
+    # before we've learned this order's venue_order_id — is still attributable.
+    # Optional because reconcile may surface a foreign/older fill without it; such
+    # fills fall back to venue_order_id, then to the position reconcile.
+    client_order_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -222,3 +231,70 @@ class AccountEquity:
     total: Decimal
     currency: str
     available: Optional[Decimal] = None
+
+
+# ---------------------------------------------------------------------------
+# Quantity-match tolerances. Venues report position sizes with their own
+# rounding, so reconcile compares |db - venue| against an epsilon rather than
+# demanding exact equality. The tolerance MUST scale with the instrument's
+# precision — 1e-9 is right for 8-dp crypto but absurdly tight for whole-share
+# equities, where a venue's fractional-share rounding would spuriously HALT.
+# Single source of truth so boot reconcile and the live-executor reconcile agree.
+# ---------------------------------------------------------------------------
+_DEFAULT_QTY_EPSILON = Decimal("1e-9")
+_QTY_EPSILON_BY_CLASS = {
+    "crypto": Decimal("1e-8"),   # 8-dp coins; below a satoshi is dust
+    "equity": Decimal("0.5"),    # whole-share venues; < half a share = flat
+    "fx":     Decimal("1"),      # FX units are large; < 1 unit is noise
+}
+
+
+def qty_match_epsilon(asset_class: str) -> Decimal:
+    """The qty-match tolerance for an asset class, falling back to a tiny default
+    for unknown classes. Used by both reconcile paths so 'position matches' means
+    the same thing everywhere."""
+    return _QTY_EPSILON_BY_CLASS.get(asset_class, _DEFAULT_QTY_EPSILON)
+
+
+# ---------------------------------------------------------------------------
+# VenuePosition sign/validity contract.
+#
+# THE CONTRACT (relied on by reconcile): VenuePosition.qty is SIGNED — positive
+# for long, negative for short. Reconcile compares the venue's signed qty against
+# our signed open_qty in BOTH size and sign (see boot._position_matches and the
+# live executor's reconcile). An adapter that returned an unsigned magnitude for a
+# short would make every short look like a mismatch and spuriously HALT it.
+#
+# The sign IS the side — neither Binance positionRisk nor IB reqPositions returns
+# a separate side field — so we cannot cross-check sign against an independent
+# side per position. What we CAN enforce at the adapter boundary: qty is a real,
+# finite Decimal, and a flat (zero) position never leaks into the list (both are
+# detectable corruption, e.g. IB's NaN, which Decimal(str(nan)) turns into a
+# Decimal('NaN') that silently defeats every downstream comparison).
+#
+# Every adapter's get_positions runs its result through validate_venue_positions,
+# so the contract is enforced identically and any future adapter is forced past
+# the same gate — failing loudly at the source rather than as a confusing HALT
+# three layers away in reconcile.
+# ---------------------------------------------------------------------------
+def validate_venue_positions(
+    positions: List["VenuePosition"], *, venue: str = "",
+) -> List["VenuePosition"]:
+    """Validate an adapter's position list against the signed-qty contract and
+    return it unchanged. Raises ValueError naming the venue + symbol on the first
+    violation (a non-Decimal, NaN/non-finite, or zero qty) — a programmer/adapter
+    error that must fail loudly, not be silently reconciled."""
+    for p in positions:
+        if not isinstance(p.qty, Decimal):
+            raise ValueError(
+                f"{venue} position {p.symbol}: qty must be Decimal, got "
+                f"{type(p.qty).__name__} — adapters cross the float boundary via str()")
+        if not p.qty.is_finite():
+            raise ValueError(
+                f"{venue} position {p.symbol}: qty is non-finite ({p.qty}) — a NaN/Inf "
+                f"venue value would silently defeat every reconcile comparison")
+        if p.qty == 0:
+            raise ValueError(
+                f"{venue} position {p.symbol}: qty is 0 — flat positions must be "
+                f"filtered out, not emitted (reconcile treats 0 as 'no position')")
+    return positions

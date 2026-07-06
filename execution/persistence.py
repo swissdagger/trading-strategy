@@ -259,21 +259,35 @@ def make_load_open_trades(pool: asyncpg.Pool):
     position_key is reconstructed from (chain_id, side); strategy is read from
     the trades.strategy column (migration 014). Before 014, this fell back to a
     default — see the module-level STRATEGY/POSITION_KEY CAVEAT history.
+
+    Escalation-ladder state (escalation_rung, escalation_deadline) is LEFT JOINed
+    from exit_state so a CLOSING trade re-adopted on restart resumes at the rung
+    and deadline it was already working, NOT from a blank slate. Without this the
+    escalation driver sees exit_deadline_ms=None on a healthy working exit and
+    HALTs it (and would re-escalate from rung 0). A trade with no exit_state row
+    (never reached OPEN) yields NULLs, leaving the OpenTrade defaults untouched.
+    escalation_deadline is timestamptz; we convert it back to epoch ms to match
+    the in-memory exit_deadline_ms the escalation driver compares against now_ms().
     """
     async def load_open_trades() -> list[OpenTrade]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT trade_id, chain_id, symbol, asset_class, side, state,
-                       entry_client_order_id, entry_target_qty,
-                       entry_filled_qty, exit_filled_qty, strategy
-                  FROM trades
-                 WHERE state NOT IN ('CLOSED', 'REJECTED')
+                SELECT t.trade_id, t.chain_id, t.symbol, t.asset_class, t.side,
+                       t.state, t.entry_client_order_id, t.entry_target_qty,
+                       t.entry_filled_qty, t.exit_filled_qty, t.strategy,
+                       es.escalation_rung,
+                       (EXTRACT(EPOCH FROM es.escalation_deadline) * 1000)::bigint
+                           AS escalation_deadline_ms
+                  FROM trades t
+                  LEFT JOIN exit_state es ON es.trade_id = t.trade_id
+                 WHERE t.state NOT IN ('CLOSED', 'REJECTED')
                 """
             )
         out: list[OpenTrade] = []
         for r in rows:
             side = TradeSide(r["side"])
+            deadline_ms = r["escalation_deadline_ms"]
             out.append(OpenTrade(
                 trade_id=str(r["trade_id"]),
                 strategy=r["strategy"],
@@ -286,6 +300,9 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 state=r["state"],
                 entry_client_order_id=r["entry_client_order_id"],
                 exit_filled_qty=r["exit_filled_qty"],
+                # NULL when no exit_state row exists yet; keep the field default (0).
+                exit_rung=r["escalation_rung"] if r["escalation_rung"] is not None else 0,
+                exit_deadline_ms=int(deadline_ms) if deadline_ms is not None else None,
             ))
         return out
     return load_open_trades
@@ -435,18 +452,83 @@ def make_persist_exit_state(pool: asyncpg.Pool):
 def make_kill_switch_blocks(pool: asyncpg.Pool):
     """True if the global kill switch forbids opening new positions. Reads the
     singleton kill_switch row on EVERY call (no cache) — the switch must take
-    effect faster than a redeploy, which means faster than any cache TTL. Either
-    engaged mode ('halt_new' or 'flatten') blocks new entries; the distinction
-    only matters to the flatten path, not to "may I open"."""
+    effect faster than a redeploy, which means faster than any cache TTL.
+
+    Engaged in EITHER mode blocks new entries. The policy is HALT-NEW-ONLY: when
+    engaged we stop opening but leave open positions to their normal protective
+    exits (the exit path never consults this). The 'flatten' mode (auto-close
+    everything) is NOT implemented; if it is ever set in the DB we still block new
+    entries (correct) but log a warning, so no operator relies on an auto-flatten
+    that doesn't exist."""
     async def kill_switch_blocks() -> bool:
         async with pool.acquire() as conn:
-            engaged = await conn.fetchval(
-                "SELECT engaged FROM kill_switch WHERE id = true"
+            row = await conn.fetchrow(
+                "SELECT engaged, mode FROM kill_switch WHERE id = true"
             )
         # Missing row => treat as blocked (fail safe): if we can't confirm the
         # switch is off, don't open new risk.
-        return True if engaged is None else bool(engaged)
+        if row is None:
+            log.warning("kill_switch row missing — failing safe (blocking new entries)")
+            return True
+        engaged = bool(row["engaged"])
+        if engaged and row["mode"] == "flatten":
+            log.warning("kill_switch mode='flatten' is NOT implemented — behaving as "
+                        "'halt_new' (blocking new entries; open positions run their "
+                        "normal exits). Do not rely on auto-flatten.")
+        return engaged
     return kill_switch_blocks
+
+
+def make_set_kill_switch(pool: asyncpg.Pool):
+    """Engage or disengage the global kill switch, with an audit trail.
+
+    This is the operator-facing control (wire it to an admin endpoint / CLI). It
+    is the sanctioned alternative to hand-editing the row in SQL: it records who
+    engaged it, why, and when, which matters for a post-incident review of an
+    emergency halt. Idempotent — setting the same state twice just refreshes the
+    audit fields.
+
+    mode is accepted for forward-compatibility but only 'halt_new' is honored by
+    the executor; passing 'flatten' is rejected here rather than silently stored,
+    so the DB can't hold a mode the system won't act on."""
+    async def set_kill_switch(engaged: bool, *, reason: Optional[str] = None,
+                              engaged_by: Optional[str] = None,
+                              mode: str = "halt_new") -> None:
+        if mode != "halt_new":
+            raise ValueError(
+                f"unsupported kill_switch mode {mode!r}: only 'halt_new' is "
+                f"implemented (flatten/auto-exit is deliberately not built)")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE kill_switch
+                   SET engaged     = $1,
+                       mode        = $2,
+                       reason      = $3,
+                       engaged_by  = $4,
+                       engaged_at  = CASE WHEN $1 THEN now() ELSE NULL END,
+                       updated_at  = now()
+                 WHERE id = true
+                """,
+                engaged, mode, reason, engaged_by,
+            )
+        log.warning("kill_switch %s by %s (reason=%s)",
+                    "ENGAGED" if engaged else "DISENGAGED",
+                    engaged_by or "unknown", reason or "-")
+    return set_kill_switch
+
+
+def make_kill_switch_status(pool: asyncpg.Pool):
+    """Read the full kill-switch row for operators/health (engaged, mode, reason,
+    who, when). Returns None only if the singleton row is missing."""
+    async def kill_switch_status() -> Optional[dict]:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT engaged, mode, reason, engaged_by, engaged_at, updated_at "
+                "FROM kill_switch WHERE id = true"
+            )
+        return dict(row) if row is not None else None
+    return kill_switch_status
 
 
 # ---------------------------------------------------------------------------

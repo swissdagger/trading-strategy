@@ -9,6 +9,7 @@ float->Decimal boundary is crossed once, at CapConfig construction).
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Optional
 
 from execution.types import OrderIntent, TradeSide
 
@@ -35,6 +36,30 @@ def is_buy(side: TradeSide, intent: OrderIntent) -> bool:
     return side == TradeSide.SHORT
 
 
+class InvalidTouch(ValueError):
+    """Raised when a touch is unfit to price against (non-positive price, or a
+    crossed book where ask < bid). A distinct type so callers can catch pricing-
+    input errors specifically and skip/re-fetch rather than sending a garbage
+    limit built from a stale or inverted snapshot."""
+
+
+def validate_touch(touch_bid: Decimal, touch_ask: Decimal) -> Optional[str]:
+    """Return a human-readable reason the touch is unfit to price against, or None
+    if it is valid. Callers should check this and skip (or re-fetch) rather than
+    price against a bad book — a crossed or non-positive touch yields a limit on
+    the wrong side or at a nonsensical level.
+
+    A LOCKED book (ask == bid, zero spread) is VALID: it is a real, tight market
+    state; the crossing multiples simply collapse to limit == touch, which fills
+    or doesn't like any marketable limit. Only ask < bid (truly inverted) and
+    non-positive prices are rejected."""
+    if touch_bid <= 0 or touch_ask <= 0:
+        return f"non-positive touch bid={touch_bid} ask={touch_ask}"
+    if touch_ask < touch_bid:
+        return f"crossed book: ask {touch_ask} < bid {touch_bid}"
+    return None
+
+
 def price_marketable_limit(
     side: TradeSide,
     intent: OrderIntent,
@@ -48,7 +73,15 @@ def price_marketable_limit(
     immediately like a market order, but cap how far beyond the touch we tolerate
     at cap_spread_mult * spread (and never worse than cap_abs_bps if set). BUY
     crosses UP from the ask; SELL crosses DOWN from the bid.
-    """
+
+    Raises InvalidTouch on a non-positive or crossed book. The math below assumes
+    a non-negative spread and positive prices; without this guard a crossed book
+    (spread < 0) inverts the cross/cap min-max logic and produces a wrong-side
+    limit. This is a HARD backstop — callers should also call validate_touch and
+    skip gracefully, but no caller can bypass the guard and send a garbage limit."""
+    reason = validate_touch(touch_bid, touch_ask)
+    if reason is not None:
+        raise InvalidTouch(reason)
     spread = touch_ask - touch_bid
     buying = is_buy(side, intent)
     if buying:
