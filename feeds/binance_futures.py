@@ -1,18 +1,24 @@
 """
-feeds/binance_futures.py — Binance USDⓈ-M Futures with 1s aggregation and Websockets.
+feeds/binance_futures.py — Binance USDⓈ-M Futures via REST klines polling.
+
+Live data is polled from the /fapi/v1/klines REST endpoint (start_live runs one
+poll loop per timeframe), NOT the futures websocket: Binance silences fstream to
+cloud/datacenter egress IPs, so a ws live path receives no frames from such
+hosts, whereas the REST endpoint is reachable. fetch_history uses the same REST
+endpoint for warmup/backfill. Native rungs (1m+) are served directly; sub-minute
+rungs would require the (blocked) ws and are not used on crypto from such a host.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
 import httpx
-import websockets
 
-from feeds.base import AssetFeed, LiveDataCallback
+from feeds.base import AssetFeed, LiveDataCallback, is_market_open
 from producer.bar import OHLCPoint
 from producer.bar import RateLimiter
 from feeds.polygon_options import _parse_timeframe, _resample_to_timeframe
@@ -36,69 +42,18 @@ _BINANCE_INTERVALS: Set[str] = {
 
 # Sub-minute rungs we can DERIVE from the 1s kline. Mirrors
 # feeds/binance_ws._DERIVED_INTERVALS.
-#
-# NOTE: this set is ONLY the sub-minute (1s-sourced) derivations. Coarse
-# derivations like 2m and 10m — which Binance also lacks natively but which
-# resample cleanly from a coarser native base (1m, 5m) — are NOT listed here;
-# they are resolved by _get_base_tf's general "largest native divisor" rule
-# below and reported by supported_timeframes(). Keeping this set 1s-only
-# preserves the sub-minute vs coarse distinction that matters for backfill:
-# 1s-derived rungs can't be REST-backfilled (Binance REST bottoms out at 1m),
-# whereas coarse derived rungs CAN (their base kline is REST-available).
 _DERIVED_INTERVALS: Set[str] = {"1s", "5s", "10s", "15s", "30s"}
 
-
-def _tf_ms(tf: str) -> int:
-    """Milliseconds in one bar of `tf`. Local, dependency-free (mirrors
-    _parse_timeframe's arithmetic) so the base-resolver can run at import
-    time without constructing anything."""
-    multiplier, _, base_ms = _parse_timeframe(tf)
-    return multiplier * base_ms
+# The full set this feed can serve = native ∪ derived.
+_SUPPORTED: Set[str] = _BINANCE_INTERVALS | _DERIVED_INTERVALS
 
 
-def _largest_native_divisor(tf: str) -> str | None:
-    """The coarsest NATIVE interval that divides `tf` evenly and is strictly
-    finer than it — the ideal resample base (fewest source bars, exact
-    windows). Returns None if no native interval divides `tf` (then `tf`
-    can't be derived and isn't supported).
-
-    Example: 10m → 5m (10m / 5m = 2, exact) beats 1m (also exact) because it
-    means 2 source bars per window instead of 10. 2m → 1m. 7m → None (no
-    native interval divides 7 minutes evenly).
-    """
-    tf_ms = _tf_ms(tf)
-    best: str | None = None
-    best_ms = 0
-    for native in _BINANCE_INTERVALS:
-        n_ms = _tf_ms(native)
-        if n_ms < tf_ms and tf_ms % n_ms == 0 and n_ms > best_ms:
-            best, best_ms = native, n_ms
-    return best
-
-
-# Base timeframe a target rung is built from. Three cases:
-#   - native rung  → itself (fetched directly, no resample)
-#   - sub-minute   → "1s" (Binance's finest kline)
-#   - coarse derived (e.g. 2m, 10m) → largest native interval that divides it
-def _get_base_tf(tf: str) -> str | None:
-    if tf in _BINANCE_INTERVALS:
-        return tf
-    if tf in _DERIVED_INTERVALS:  # sub-minute (incl. the 1s passthrough)
+# Base timeframe a target rung is built from. A native rung is its OWN base
+# (fetched directly, no resample); a sub-minute rung is derived from 1s.
+def _get_base_tf(tf: str) -> str:
+    if tf in _DERIVED_INTERVALS and tf != "1s":
         return "1s"
-    # Coarse non-native rung: derive from the best native base, if one exists.
-    return _largest_native_divisor(tf)
-
-
-# The coarse (non-native, non-sub-minute) rungs this feed derives. Kept
-# EXPLICIT rather than enumerated: the ladder uses exactly 2m and 10m, and
-# listing them is clearer than generating every native multiple and inviting
-# exotic rungs no strategy asks for. Add a rung here when a strategy needs it;
-# _get_base_tf already knows how to resolve any native-divisible label, so
-# this list is the only edit a new coarse rung requires.
-_COARSE_DERIVED_INTERVALS: Set[str] = {"2m", "10m"}
-
-# The full set this feed can serve = native ∪ sub-minute-derived ∪ coarse-derived.
-_SUPPORTED: Set[str] = _BINANCE_INTERVALS | _DERIVED_INTERVALS | _COARSE_DERIVED_INTERVALS
+    return tf
 
 
 _KLINES_LIMIT = 1500
@@ -228,84 +183,85 @@ class BinanceFuturesFeed(AssetFeed):
         self, symbols: List[str], timeframes: List[str],
         initial_cursors: Dict[str, Dict[str, int]], callback: LiveDataCallback
     ) -> None:
+        """One REST poll loop per timeframe — NOT a websocket.
+
+        WHY REST, NOT WS: Binance silences its futures WEBSOCKET (fstream) to
+        cloud/datacenter egress IPs, so a ws live path connects but receives zero
+        frames from such hosts (see the crypto transport note in config). The REST
+        klines endpoint (fapi) IS reachable, so the live path polls it. This
+        mirrors the Polygon REST feed's start_live: per-timeframe poll tasks, a
+        tf/2 cadence (8s floor, 600s ceiling), closed-window-only emission, and a
+        per-(symbol, tf) high-water cursor seeded from warmup's feed_cursors.
+
+        Only NATIVE rungs (1m+) are servable by REST klines; sub-minute rungs
+        would need the ws (blocked) and must not be configured on crypto for a
+        host in this position — the config scopes them off. fetch_history already
+        rejects unsupported tfs, so a stray sub-minute rung fails loudly rather
+        than silently polling nothing.
+        """
         self._running = True
 
-        base_tfs = set(_get_base_tf(tf) for tf in timeframes)
-        streams = [f"{sym.lower()}@kline_{btf}" for sym in symbols for btf in base_tfs]
-        url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+        async def poll_one_tf(tf: str) -> None:
+            multiplier, _, candle_ms = _parse_timeframe(tf)
+            tf_ms = multiplier * candle_ms
+            tf_s = tf_ms // 1000
 
-        # Buffer to keep the recent raw bars for resampling
-        raw_buffers = {sym: {btf: [] for btf in base_tfs} for sym in symbols}
+            # Half-candle cadence, 8s floor, 600s ceiling — same as Polygon REST.
+            interval = min(max(tf_s // 2, 8), 600)
 
-        cursors: Dict[str, Dict[str, int]] = {}
-        for sym in symbols:
-            cursors[sym] = {}
-            for tf in timeframes:
-                multiplier, _, base_ms = _parse_timeframe(tf)
-                default_cursor = int(time.time() * 1000) - (multiplier * base_ms)
-                cursors[sym][tf] = initial_cursors.get(sym, {}).get(tf) or default_cursor
+            # Per-(symbol) high-water cursor for this tf. Seed from warmup's
+            # feed_cursors so live resumes exactly where warmup ended; fall back
+            # to "one candle ago" for a cold rung.
+            cursors: Dict[str, int] = {}
+            for sym in symbols:
+                cursors[sym] = (
+                    initial_cursors.get(sym, {}).get(tf)
+                    or (int(time.time() * 1000) - tf_ms)
+                )
 
-        while self._running:
-            try:
-                async for websocket in websockets.connect(url):
-                    if not self._running:
-                        break
-                    logger.info(f"Binance WS connected for {len(symbols)} symbols")
+            logger.info(f"[{self.name}:{tf}] REST polling every {interval}s")
 
-                    async for msg in websocket:
-                        if not self._running:
-                            break
+            while self._running:
+                try:
+                    now = datetime.now(timezone.utc)
+                    # Crypto is 24/7 (is_market_open returns True), but keep the
+                    # gate so this loop is correct if ever reused for a class with
+                    # sessions.
+                    if not is_market_open(self.asset_class, now):
+                        await asyncio.sleep(interval)
+                        continue
 
-                        data = json.loads(msg)
-                        if 'data' not in data:
-                            continue
+                    now_ms = int(now.timestamp() * 1000)
+                    batch: List[OHLCPoint] = []
 
-                        k = data['data']['k']
-                        if not k['x']:  # Only process finalized base bars
-                            continue
-
-                        sym = data['data']['s']
-                        base_tf = k['i']
-
-                        tick = {"t": k['t'], "o": float(k['o']), "h": float(k['h']), "l": float(k['l']), "c": float(k['c'])}
-                        raw_buffers[sym][base_tf].append(tick)
-
-                        # Prevent memory leak, keep only what's needed for the largest aggregate
-                        raw_buffers[sym][base_tf] = raw_buffers[sym][base_tf][-2000:]
-
-                        batch = []
-                        now_ms = int(time.time() * 1000)
-
-                        for tf in timeframes:
-                            if _get_base_tf(tf) != base_tf:
+                    for sym in symbols:
+                        # Enough bars to cover the poll gap plus slack. A handful
+                        # of candles per interval is plenty; fetch_history returns
+                        # ascending closed bars already resampled to tf.
+                        points = await self.fetch_history(sym, tf, points_needed=5)
+                        for p in points:
+                            # Closed-window-only: fetch_history returns closed
+                            # klines, but guard the still-forming window defensively.
+                            if p.timestamp + tf_ms > now_ms:
                                 continue
+                            if p.timestamp >= cursors[sym]:
+                                batch.append(p)
+                                cursors[sym] = p.timestamp + tf_ms
 
-                            if _get_base_tf(tf) == tf:
-                                # Native rung: the closed base kline IS the bar.
-                                resampled = [tick]
-                            else:
-                                resampled = _resample_to_timeframe(raw_buffers[sym][base_tf], tf)
+                    if batch:
+                        await callback(batch)
 
-                            multiplier, _, base_ms = _parse_timeframe(tf)
-                            tf_ms_local = multiplier * base_ms
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[{self.name}:{tf}] REST poll error: {e}")
 
-                            for r in resampled:
-                                window_start = r["t"]
-                                if window_start + tf_ms_local > now_ms:
-                                    continue  # Window still open
+                await asyncio.sleep(interval)
 
-                                if window_start >= cursors[sym][tf]:
-                                    batch.append(OHLCPoint(
-                                        symbol=sym, timestamp=window_start, open=r["o"],
-                                        high=r["h"], low=r["l"], close=r["c"],
-                                        timeframe=tf, asset_class=self.asset_class
-                                    ))
-                                    cursors[sym][tf] = window_start + tf_ms_local
-
-                        if batch:
-                            await callback(batch)
-
-            except Exception as e:
-                logger.error(f"Binance WS error: {e}.")
-                if self._running:
-                    await asyncio.sleep(5)
+        tasks = [asyncio.create_task(poll_one_tf(tf)) for tf in timeframes]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
