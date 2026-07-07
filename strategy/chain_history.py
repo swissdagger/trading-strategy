@@ -19,15 +19,20 @@ two-ladder ChainView. It is DELIBERATELY SEPARATE: this is a distinct strategy
 on its own ladder [1m,3m,5m,15m,1h], not part of the A/B two-ladder design, and
 coupling them would entangle two unrelated strategies.
 
-## Retention: a rolling window, not all history
+## Retention: count cap only, no time-based eviction
 
-The pattern is a RECENT causal sequence — the confirming chain's 3m must fall
-before an initiator's 1h, so the whole pattern spans at most ~an hour or two of
-chains. Retaining every terminated chain forever would be unbounded memory for a
-24/7 process over years, with zero benefit (a chain from last week cannot
-participate in a pattern gated by "before Chain 2's 1h"). We bound retention by
-TIME (a window comfortably longer than the longest span the pattern references)
-with a COUNT cap as a safety net. Chains older than the window are evicted.
+The four-chain pattern has NO specified span bound: chain_prime and chain_conf
+can in principle be arbitrarily far apart, so a chain far in the past may still
+participate. We therefore do NOT age chains out by time — doing so would silently
+cap the pattern span at the retention window and drop valid signals. Memory is
+bounded only by a per-symbol COUNT cap (max_chains_per_symbol), which drops the
+oldest chains by first_seen if a symbol ever exceeds it.
+
+In normal operation chain volume is far below the cap (order tens of chains per
+symbol per month), so the cap is a backstop against pathological growth, not a
+routine trim. If it ever bites in practice, raise the cap; if match cost ever
+becomes noticeable at high chain counts, the initiator search in the strategy is
+the place to optimize (see four_chain_strategy._match_pattern).
 
 ## FUTURE — chain-monitoring encapsulation (deferred, YAGNI)
 
@@ -51,7 +56,7 @@ strategy forces the question.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from strategy.ladder_registry import Ladder
@@ -68,7 +73,7 @@ def _parse_ts(ts: str) -> datetime:
 
 @dataclass
 class ChainLifecycle:
-    """One chain's life within the retention window. reached_at maps a level ->
+    """One chain's life as tracked by the history view. reached_at maps a level ->
     the timestamp it FIRST reached that level; peak_level is the deepest reached;
     terminated marks whether it has ended (failed or completed)."""
     chain_id: str
@@ -103,14 +108,12 @@ class ChainHistoryView:
         self,
         ladder: Ladder,
         *,
-        retention: timedelta = timedelta(hours=3),
         max_chains_per_symbol: int = 2000,
     ):
         self._ladder = ladder
-        self._retention = retention
         self._max = max_chains_per_symbol
         # symbol -> {chain_id -> ChainLifecycle}, insertion-ordered so eviction
-        # of the oldest is cheap.
+        # of the oldest (by first_seen) under the count cap is cheap.
         self._chains: Dict[str, "dict[str, ChainLifecycle]"] = {}
 
     def apply(self, *, symbol: str, chain_id: str, event_type: str,
@@ -118,10 +121,9 @@ class ChainHistoryView:
         """Fold one raw chain event into the history.
 
         initiate/propagate upsert the chain and record the reached-at timestamp
-        for the new level; terminate marks it terminated (but KEEPS it in the
-        window — the strategy needs failed chains). Eviction of stale chains runs
-        opportunistically on each apply, keyed off this event's timestamp as
-        'now' (event time, not wall clock, so replay is deterministic).
+        for the new level; terminate marks it terminated (but KEEPS it — the
+        strategy needs failed chains, and the pattern span is unbounded so we do
+        not age chains out by time; only a per-symbol COUNT cap bounds memory).
         """
         ts = _parse_ts(timestamp)
         bucket = self._chains.setdefault(symbol, {})
@@ -148,22 +150,22 @@ class ChainHistoryView:
                 # initiate at level 1): record it.
                 rec.reached_at[propagation_level] = ts
 
-        self._evict_stale(symbol, now=ts)
+        self._enforce_cap(symbol)
 
-    def _evict_stale(self, symbol: str, now: datetime) -> None:
+    def _enforce_cap(self, symbol: str) -> None:
+        """Bound memory by a per-symbol COUNT cap only (no time-based eviction).
+        The four-chain pattern span is unbounded, so a chain arbitrarily far in
+        the past can still participate; we never age chains out by time. If a
+        symbol exceeds the cap, drop the oldest by first_seen as a safety net.
+        Expected chain volume is far below the cap in normal operation; this is
+        a backstop against pathological growth, not a routine trim.
+        """
         bucket = self._chains.get(symbol)
-        if not bucket:
+        if not bucket or len(bucket) <= self._max:
             return
-        cutoff = now - self._retention
-        # Evict by age: drop chains whose last update is older than the window.
-        stale = [cid for cid, r in bucket.items() if r.last_update < cutoff]
-        for cid in stale:
-            del bucket[cid]
-        # Count cap safety net: if still over, drop oldest by first_seen.
-        if len(bucket) > self._max:
-            ordered = sorted(bucket.values(), key=lambda r: r.first_seen)
-            for r in ordered[: len(bucket) - self._max]:
-                bucket.pop(r.chain_id, None)
+        ordered = sorted(bucket.values(), key=lambda r: r.first_seen)
+        for r in ordered[: len(bucket) - self._max]:
+            bucket.pop(r.chain_id, None)
 
     # ---- queries the confirmation strategy asks -------------------------
 
@@ -171,6 +173,10 @@ class ChainHistoryView:
         """All retained chains for a symbol, oldest-first by first_seen."""
         bucket = self._chains.get(symbol, {})
         return sorted(bucket.values(), key=lambda r: r.first_seen)
+
+    def chain(self, symbol: str, chain_id: str) -> Optional[ChainLifecycle]:
+        """The lifecycle record for one chain, or None if not retained."""
+        return self._chains.get(symbol, {}).get(chain_id)
 
     def active_chains(self, symbol: str, direction: Optional[int] = None) -> List[ChainLifecycle]:
         """Currently-open (non-terminated) chains, optionally one direction.
@@ -186,9 +192,17 @@ class ChainHistoryView:
         after: datetime, before: datetime,
     ) -> List[ChainLifecycle]:
         """Opposing chains (direction = -`direction`) that FAILED — terminated
-        before reaching 3m (level 2) — with activity in (after, before). This is
-        the direct live-detection of the prose's 'an opposing chain must fail to
-        propagate' between the two initiators, rather than the research script's
+        before reaching 3m (level 2) — whose START falls within [after, before].
+
+        A failure is a chain that began at 1m and terminated before propagating
+        to 3m; on this ladder that is necessarily a chain stuck at level 1. The
+        window is bounded by chain-START time (first_seen), which on this ladder
+        equals the 1m-initiate time: chains always start at 1m and propagation
+        never skips levels, so the first event folded for a chain is its start.
+        Bounds are INCLUSIVE — simultaneous starts are permitted.
+
+        This is the live-detection of the prose's 'an opposing chain must fail to
+        propagate' between two ordered chains, replacing the research script's
         id-gap approximation.
         """
         opposing = -direction
@@ -201,9 +215,35 @@ class ChainHistoryView:
                 continue
             if r.peak_level >= three_m:
                 continue   # it DID reach 3m — not a failure
-            # Its life overlaps the window between the initiators.
-            if after <= r.first_seen <= before or after <= r.last_update <= before:
+            # Ordered by chain start: the failure must have STARTED within the
+            # window between the two neighbouring chains' starts.
+            if after <= r.first_seen <= before:
                 out.append(r)
+        return out
+
+    def initiators_by_start(
+        self, symbol: str, direction: int, exclude_chain_id: str,
+        before_start: datetime,
+    ) -> List[ChainLifecycle]:
+        """Same-direction chains (excluding `exclude_chain_id`) that reached 15m
+        and started at or before `before_start`, ordered by START time
+        (first_seen), oldest-first.
+
+        The four-chain pattern orders chain_prime and chain_init by chain start,
+        not by when they reached 15m, so ordering keys on first_seen. On this
+        ladder first_seen is the true 1m-start (chains always start at 1m and
+        propagation never skips). The caller picks the pair whose starts bracket
+        a failure and whose 15m timestamps gate the confirmer.
+        """
+        fifteen_m = self._ladder.level_of("15m")
+        out = [
+            r for r in self.chains(symbol)
+            if r.chain_id != exclude_chain_id
+            and r.direction == direction
+            and r.reached_level(fifteen_m)
+            and r.first_seen <= before_start
+        ]
+        out.sort(key=lambda r: r.first_seen)
         return out
 
     def parse_ts(self, ts: str) -> datetime:

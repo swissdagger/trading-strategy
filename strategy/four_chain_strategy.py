@@ -93,7 +93,8 @@ class FourChainEntry:
         Trigger: this event is a chain reaching 3m (peak advanced to >= 3m) in
         some direction d. That chain is the candidate 'fourth' confirming chain.
         """
-        # Self-filter: only a chain reaching 3m is a candidate trigger.
+        # Self-filter: only a chain reaching 3m is a candidate trigger. This is
+        # the candidate chain_conf.
         if propagation_level < self._L_3M:
             return None
         # Terminations aren't triggers.
@@ -101,45 +102,30 @@ class FourChainEntry:
             return None
 
         d = direction
-        trigger_ts = self.view.parse_ts(timestamp)
+        conf = self.view.chain(symbol, chain_id)
+        if conf is None:
+            return None   # trigger not yet folded; nothing to reason over
+        conf_start = conf.first_seen
 
-        # --- Initiation: two same-direction chains that reached 15m, with a
-        #     failed opposing chain between them. ---
-        initiators = self._find_initiators(symbol, d, before_ts=trigger_ts, trigger_chain_id=chain_id)
-        if initiators is None:
+        # --- Find prime + init and the two failures that satisfy the full
+        #     start-ordered pattern:
+        #       prime.start <= fail_1.start <= init.start
+        #                    <= fail_2.start <= conf.start
+        #     with conf.start >= both initiators' 15m-reach timestamps.
+        match = self._match_pattern(symbol, d, conf_start=conf_start,
+                                    conf_chain_id=chain_id)
+        if match is None:
             return None
-        chain1, chain2 = initiators
-        c1_15m = chain1.reached_at_ts(self._L_15M)
-        c2_15m = chain2.reached_at_ts(self._L_15M)
-        # Ordering: Chain 2's 15m at or after Chain 1's 15m (prose + script).
-        if c1_15m is None or c2_15m is None or c2_15m < c1_15m:
-            return None
+        prime, init = match
 
-        # A failed opposing chain must sit between the two initiators.
-        failed = self.view.failed_between(
-            symbol, direction=d, after=c1_15m, before=c2_15m,
-        )
-        if not failed:
-            return None
-
-        # --- Confirmation ---
-        # This 3m trigger's timestamp must be AFTER the last (Chain 2's) 15m.
-        if trigger_ts <= c2_15m:
-            return None
-        # A new opposing chain must have failed (1m, terminated before 3m)
-        # between the end of initiation (Chain 2's 15m) and this trigger — the
-        # confirmation-phase second fail. Hard gate: the trade is only taken
-        # when the noisy backdrop confirms the opposing side is being rejected
-        # right up to the entry, not merely earlier in initiation.
-        confirm_fail = self.view.failed_between(
-            symbol, direction=d, after=c2_15m, before=trigger_ts,
-        )
-        if not confirm_fail:
-            return None
-        # At least one chain currently OPEN in the same direction (the Chain
-        # Overview Table 'evolving directional move' confirmation). The trigger
-        # chain itself counts as open (it's active, just reached 3m).
-        open_same = self.view.active_chains(symbol, direction=d)
+        # --- Confirmation: at least one chain OTHER THAN chain_conf is currently
+        #     open in direction d (the 'evolving directional move' check). The
+        #     confirmer is excluded so this is genuine corroboration, not the
+        #     trigger satisfying its own gate.
+        open_same = [
+            r for r in self.view.active_chains(symbol, direction=d)
+            if r.chain_id != chain_id
+        ]
         if not open_same:
             return None
 
@@ -155,41 +141,85 @@ class FourChainEntry:
             trigger_level=propagation_level,
         )
         log.info(
-            "four_chain ENTER %s dir=%d chain=%s (initiators=%s,%s failed=%d)",
-            symbol, d, chain_id, chain1.chain_id, chain2.chain_id, len(failed),
+            "four_chain ENTER %s dir=%d conf=%s (prime=%s init=%s)",
+            symbol, d, chain_id, prime.chain_id, init.chain_id,
         )
         return pkey
 
-    def _find_initiators(
-        self, symbol: str, direction: int, before_ts, trigger_chain_id: str,
+    def _match_pattern(
+        self, symbol: str, direction: int, conf_start, conf_chain_id: str,
     ) -> Optional[tuple[ChainLifecycle, ChainLifecycle]]:
-        """Find the two most-recent same-direction chains (other than the trigger)
-        that reached 15m, before the trigger, ordered by their 15m timestamp.
+        """Find a (prime, init) pair, both same-direction 15m chains distinct
+        from the confirmer, such that the full start-ordered pattern holds:
 
-        Returns (chain1, chain2) with chain1's 15m <= chain2's 15m, or None if
-        two such chains don't exist. 'Two separate chains' — distinct ids, and
-        distinct from the trigger chain.
+            prime.start <= fail_1.start <= init.start <= fail_2.start <= conf.start
+
+        where fail_1 and fail_2 are DISTINCT opposing failures (1m, terminated
+        before 3m), and conf.start >= max(prime.15m, init.15m).
+
+        Returns the (earlier-start, later-start) initiator pair, or None. All
+        bounds inclusive (ties allowed). The confirmer's start bounds candidacy:
+        both initiators must have started at or before it.
         """
-        candidates = []
-        for r in self.view.chains(symbol):
-            if r.chain_id == trigger_chain_id:
-                continue
-            if r.direction != direction:
-                continue
-            if not r.reached_level(self._L_15M):
-                continue
-            ts15 = r.reached_at_ts(self._L_15M)
-            if ts15 is None or ts15 > before_ts:
-                continue
-            candidates.append((ts15, r))
-        if len(candidates) < 2:
+        # Candidate initiators: same-direction 15m chains started <= conf.start,
+        # ordered by start. prime is the earlier-started, init the later.
+        cands = self.view.initiators_by_start(
+            symbol, direction=direction, exclude_chain_id=conf_chain_id,
+            before_start=conf_start,
+        )
+        if len(cands) < 2:
             return None
-        # The two most recent by 15m timestamp; return oldest-first so chain1 is
-        # the earlier initiator.
-        candidates.sort(key=lambda x: x[0])
-        chain1 = candidates[-2][1]
-        chain2 = candidates[-1][1]
-        return chain1, chain2
+
+        # Search ordered pairs (prime before init by start). We want ANY pair
+        # that satisfies both failure windows and the 15m gate; iterate newest
+        # init first so the tightest, most-recent pattern wins.
+        for j in range(len(cands) - 1, 0, -1):
+            init = cands[j]
+            init_15m = init.reached_at_ts(self._L_15M)
+            if init_15m is None or init_15m > conf_start:
+                continue   # conf must start at/after init's 15m
+            # Second failure: opposing fail started between init.start and
+            # conf.start.
+            fails_2 = self.view.failed_between(
+                symbol, direction=direction,
+                after=init.first_seen, before=conf_start,
+            )
+            if not fails_2:
+                continue
+            for i in range(j - 1, -1, -1):
+                prime = cands[i]
+                prime_15m = prime.reached_at_ts(self._L_15M)
+                if prime_15m is None or prime_15m > conf_start:
+                    continue   # conf must start at/after prime's 15m too
+                # First failure: opposing fail started between prime.start and
+                # init.start, and DISTINCT from any second-window failure.
+                fails_1 = self.view.failed_between(
+                    symbol, direction=direction,
+                    after=prime.first_seen, before=init.first_seen,
+                )
+                if self._distinct_failures(fails_1, fails_2):
+                    return prime, init
+        return None
+
+    @staticmethod
+    def _distinct_failures(
+        fails_1: list[ChainLifecycle], fails_2: list[ChainLifecycle],
+    ) -> bool:
+        """True if there is a way to pick one failure from each window such that
+        the two are distinct chains. With overlapping windows a single failure
+        could appear in both lists; the pattern requires TWO separate rejections,
+        so we need at least one pair of distinct ids across the windows."""
+        if not fails_1 or not fails_2:
+            return False
+        ids_1 = {r.chain_id for r in fails_1}
+        ids_2 = {r.chain_id for r in fails_2}
+        # Distinct pair exists unless both windows contain exactly the same
+        # single failure and nothing else.
+        if ids_1 - ids_2:
+            return True   # a window-1 failure not in window-2
+        if ids_2 - ids_1:
+            return True   # a window-2 failure not in window-1
+        return len(ids_1) >= 2   # identical id-sets: need 2+ to form a pair
 
 
 class FourChainExit:

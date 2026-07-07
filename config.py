@@ -41,6 +41,15 @@ ASSET_CONFIGS = {
     "crypto": {
         "symbols": [
             "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "WLDUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "HYPEUSDT",
+            "DOGEUSDT",
+            "ADAUSDT",
+            "LINKUSDT",
         ],
         # four_chain's ladder [1m,3m,5m,15m,1h] — all >= 1m, all Binance-native.
         # Served by CONTINUOUS REST polling (BinanceFuturesFeed.start_live runs a
@@ -116,6 +125,20 @@ def non_crypto_symbols() -> list[str]:
             continue
         out.extend(cfg.get("symbols", []))
     return out
+
+
+def crypto_symbols() -> list[str]:
+    """Every tracked CRYPTO symbol.
+
+    four_chain runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
+    Binance REST polling; see the crypto ASSET_CONFIGS note). Deriving the
+    strategy's universe from ASSET_CONFIGS here — rather than a second hardcoded
+    list in STRATEGIES — keeps the traded set in lockstep with the FETCHED set:
+    a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in four_chain, and a
+    symbol can never be traded without also being fed. Mirrors non_crypto_symbols
+    for two_ladder.
+    """
+    return list(ASSET_CONFIGS.get("crypto", {}).get("symbols", []))
 
 
 # Valid live-data transports. "rest" = the polling feeds; "ws" = the
@@ -213,9 +236,15 @@ STRATEGIES = {
     },
     "four_chain": {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
-        "symbols": ["BTCUSDT"],
+        # Crypto-only: resolved just below the dict to the current crypto
+        # universe so new crypto symbols auto-join (mirrors two_ladder).
+        "symbols": [],                # set to crypto_symbols() below
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
-        "params": {"retention_hours": 24},
+        # No time-based retention (four_chain's pattern span is unbounded); the
+        # ChainHistoryView is bounded only by a per-symbol count cap. Override it
+        # here with 'max_chains_per_symbol' if a symbol ever approaches the
+        # default; omitted => the view's default cap.
+        "params": {},
     },
     # Example of a future strategy on different ladders (disabled):
     # "mean_revert": {
@@ -232,6 +261,7 @@ STRATEGIES = {
 # cleanly; this keeps the crypto-exclusion knowledge in config.py rather than
 # leaking a marker string into the strategy registry.
 STRATEGIES["two_ladder"]["symbols"] = non_crypto_symbols()
+STRATEGIES["four_chain"]["symbols"] = crypto_symbols()
 
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.

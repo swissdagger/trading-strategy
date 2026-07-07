@@ -99,9 +99,9 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
     view_registry: the LadderRegistry, to resolve the ladder by name.
     writer_factory: callable(strategy_name) -> SignalWriter, so each strategy
                     gets a writer tagged with its own name.
-    params may carry 'retention_hours' to tune history retention.
+    params may carry 'max_chains_per_symbol' to tune the per-symbol history cap
+    (memory backstop; there is no time-based retention — see ChainHistoryView).
     """
-    from datetime import timedelta
     from strategy.registry import Strategy
 
     if len(ladders) != 1:
@@ -109,8 +109,12 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
             f"four_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
         )
     ladder = view_registry.get(ladders[0])
-    retention = timedelta(hours=params.get("retention_hours", 3))
-    history = ChainHistoryView(ladder, retention=retention)
+    cap = params.get("max_chains_per_symbol")
+    history = (
+        ChainHistoryView(ladder, max_chains_per_symbol=cap)
+        if cap is not None
+        else ChainHistoryView(ladder)
+    )
     writer = writer_factory(name)
 
     entry = FourChainEntry(history, ladder, writer)
