@@ -9,9 +9,9 @@ ENTRY (evaluated on every Set A 'reached 2m' event):
   Step 1  A Set B chain (chain_prime) must exist for the symbol.
   Step 2  A Set A chain has just reached 2m (this is the triggering event). Call
           its direction the TRADE DIRECTION.
-  Step 2b If ANY opposing-direction Set A chain exists at all (any level), ABORT
-          this attempt (re-evaluate later; chain_prime is not permanently
-          disqualified).
+  Step 2b If ANY opposing-direction chain exists at all — in EITHER Set A or
+          Set B, any level — ABORT this attempt (re-evaluate later; chain_prime
+          is not permanently disqualified).
   Step 3  chain_prime must be in the SAME direction as the Set A 2m trigger. If a
           same-direction chain_prime exists -> emit ENTER.
 
@@ -78,14 +78,23 @@ class TwoLadderEntry:
         if not self.view.prime_chains(symbol):
             return None
 
-        # Step 2b: veto if there is ANY opposing-direction Set A chain at all
-        # (active, any level — not just 30s+). Broader veto: any live opposing
-        # structural activity in Set A disqualifies this attempt. Terminated
-        # chains don't count (the view holds only active chains).
-        opposing = self.view.chains_reaching(
-            symbol, ChainSet.A, level=1, direction=-trade_direction)
-        if opposing:
-            log.debug("entry abort %s: opposing Set A chain present (any level)", symbol)
+        # Step 2b: veto if there is ANY opposing-direction chain — in EITHER
+        # Set A or Set B — at any level. The spec's veto spans both ladders: any
+        # live opposing structural activity, in either set, disqualifies this
+        # attempt. level=1 means "any level" (a live chain is always at level >=
+        # 1). Terminated chains don't count (the view holds only active chains).
+        # Note this is intentionally STRICTER than the exit's opposing test,
+        # which fires only on an opposing Set B chain at 2m+: we refuse to ENTER
+        # with any whiff of opposing structure, but once in we tolerate opposing
+        # Set B chains until they reach 2m.
+        opposing_a = self.view.has_opposing_at(
+            symbol, ChainSet.A, level=1, trade_direction=trade_direction)
+        opposing_b = self.view.has_opposing_at(
+            symbol, ChainSet.B, level=1, trade_direction=trade_direction)
+        if opposing_a or opposing_b:
+            log.debug(
+                "entry abort %s: opposing chain present (A=%s B=%s)",
+                symbol, opposing_a, opposing_b)
             return None   # abort this attempt; re-evaluate on later events
 
         # Step 3: chain_prime in the SAME direction as the Set A trigger?
