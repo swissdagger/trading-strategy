@@ -12,7 +12,6 @@ is passed in; these are thin async functions over it.
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from typing import Optional
 from collections import deque
@@ -40,47 +39,88 @@ def make_persist_signal(pool):
 
 
 def make_persist_chain_init(pool):
-    """chains INSERT at initiation. Mirrors service_2's chains INSERT, against the
-    002 schema (chain_id PK, history JSONB, origin_price)."""
+    """chains INSERT at initiation + the initiation step (step_index = 0) into
+    chain_steps.
+
+    Per migration 008, chain_steps is the authoritative per-step record and
+    chains.history is no longer written per-step (it defaults to '[]' and is
+    kept only so nothing reading the column breaks). The initiation step is
+    step_index = 0 (level 1); subsequent propagations are written by
+    persist_chain_propagate at step_index = level - 1. The chains row and its
+    step-0 row are written in ONE transaction so a chain never exists without
+    its initiation step (hydrate reconstructs current_level from the step
+    count, so a missing step-0 would under-report the level by one).
+    """
     async def persist_chain_init(chain: dict) -> None:
         first = chain["history"][0]
         origin_time = datetime.fromisoformat(first["timestamp"])
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO chains
-                    (chain_id, symbol, asset_class, direction, origin_time,
-                     origin_price, propagation_levels, active_timeframes,
-                     history, active, last_updated)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, true, $5)
-                ON CONFLICT (chain_id) DO NOTHING
-                """,
-                chain["chain_id"], chain["symbol"], chain["asset_class"],
-                chain["direction"], origin_time, first.get("price"),
-                1, chain["active_timeframes"], json.dumps(chain["history"]),
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO chains
+                        (chain_id, symbol, asset_class, direction, origin_time,
+                         origin_price, propagation_levels, active_timeframes,
+                         history, active, last_updated)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '[]'::jsonb, true, $5)
+                    ON CONFLICT (chain_id) DO NOTHING
+                    """,
+                    chain["chain_id"], chain["symbol"], chain["asset_class"],
+                    chain["direction"], origin_time, first.get("price"),
+                    1, chain["active_timeframes"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO chain_steps
+                        (chain_id, step_index, level, timeframe, step_time, price)
+                    VALUES ($1, 0, $2, $3, $4, $5)
+                    ON CONFLICT (chain_id, step_index) DO NOTHING
+                    """,
+                    chain["chain_id"], first["level"], first["timeframe"],
+                    origin_time, first.get("price"),
+                )
     return persist_chain_init
 
 
 def make_persist_chain_propagate(pool):
-    """chains UPDATE on propagation: advance level, append the step to history
-    JSONB. Mirrors service_2's UPDATE ... history || $::jsonb."""
+    """chains metadata UPDATE on propagation + an append-only chain_steps INSERT.
+
+    Per migration 008 this replaces the old `history = history || $::jsonb`
+    growing-JSONB append (which rewrote the whole column on every step — write
+    amplification worsening with chain depth). The chains row now takes a
+    FIXED-SIZE UPDATE (level/timeframes/timestamp only), and the per-step record
+    is a plain append-only INSERT into chain_steps at step_index = level - 1
+    (the initiation step at index 0 is written by persist_chain_init). Both in
+    one transaction so the metadata and its step land together. ON CONFLICT DO
+    NOTHING on the step makes a replayed propagation idempotent, mirroring the
+    idempotency the old upsert had.
+    """
     async def persist_chain_propagate(chain_id: str, new_level: int,
                                       active_timeframes: list, ts: datetime,
                                       new_step: dict) -> None:
+        step_time = datetime.fromisoformat(new_step["timestamp"])
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE chains
-                SET propagation_levels = $1,
-                    active_timeframes  = $2,
-                    last_updated       = $3,
-                    history            = history || $4::jsonb
-                WHERE chain_id = $5
-                """,
-                new_level, active_timeframes, ts,
-                f"[{json.dumps(new_step)}]", chain_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE chains
+                    SET propagation_levels = $1,
+                        active_timeframes  = $2,
+                        last_updated       = $3
+                    WHERE chain_id = $4
+                    """,
+                    new_level, active_timeframes, ts, chain_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO chain_steps
+                        (chain_id, step_index, level, timeframe, step_time, price)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (chain_id, step_index) DO NOTHING
+                    """,
+                    chain_id, new_step["level"] - 1, new_step["level"],
+                    new_step["timeframe"], step_time, new_step.get("price"),
+                )
     return persist_chain_propagate
 
 
@@ -101,21 +141,53 @@ def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
     asset_class AND by the chain's timeframes being within this set's ladder, so a
     Set A machine doesn't adopt a Set B chain (they share the chains table but
     belong to different ladders). The ladder membership of the chain's baseline
-    timeframe is the discriminator."""
+    timeframe is the discriminator.
+
+    Per migration 008 the per-step history is reconstructed from chain_steps
+    (authoritative, append-only) rather than the chains.history column. One
+    indexed SELECT per chain ordered by step_index yields the same ordered list
+    of {level, timeframe, timestamp, price} dicts the machine expects, so
+    current_level (= len - 1), next_expected_level (= len), and last_timestamp
+    derive exactly as before. Ordering is by step_index, NOT step_time: distinct
+    timeframes can share a bar timestamp, so the explicit index is the only
+    stable order (matching how the old JSONB array was appended)."""
     async def load_active_chains() -> list:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT chain_id, symbol, asset_class, direction, origin_time,
-                       origin_price, propagation_levels, active_timeframes, history
+                       origin_price, propagation_levels, active_timeframes
                 FROM chains
                 WHERE active = true AND symbol = $1 AND asset_class = $2
                 """,
                 symbol, asset_class,
             )
+            # Reconstruct each chain's ordered step history from chain_steps.
+            step_rows = await conn.fetch(
+                """
+                SELECT cs.chain_id, cs.step_index, cs.level, cs.timeframe,
+                       cs.step_time, cs.price
+                FROM chain_steps cs
+                JOIN chains c ON c.chain_id = cs.chain_id
+                WHERE c.active = true AND c.symbol = $1 AND c.asset_class = $2
+                ORDER BY cs.chain_id, cs.step_index
+                """,
+                symbol, asset_class,
+            )
+        # Group steps by chain_id, preserving step_index order (query is ORDER BY).
+        history_by_chain: dict = {}
+        for s in step_rows:
+            history_by_chain.setdefault(s["chain_id"], []).append({
+                "level": s["level"],
+                "timeframe": s["timeframe"],
+                # step_time is timestamptz; the machine compares/parses ISO
+                # strings, so emit isoformat exactly as the live path stored it.
+                "timestamp": s["step_time"].isoformat(),
+                "price": s["price"],
+            })
         out = []
         for r in rows:
-            history = r["history"] if isinstance(r["history"], list) else json.loads(r["history"])
+            history = history_by_chain.get(r["chain_id"], [])
             # Only adopt chains whose baseline timeframe is this set's baseline —
             # i.e. chains that belong to THIS ladder.
             if not history:

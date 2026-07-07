@@ -2,6 +2,33 @@
 producer/async_writer.py — Batched, off-critical-path writer for the
 research/audit tables (signals + chains propagation/termination).
 
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ STATUS: DORMANT / NOT WIRED (as of the migration-008 completion).     │
+  │                                                                       │
+  │ The live runtime (signal_process.py) injects the SYNCHRONOUS persist  │
+  │ hooks from persistence.py, which — since 008 was completed — write    │
+  │ chain_steps directly (fixed-size chains UPDATE + append-only          │
+  │ chain_steps INSERT, NO growing-JSONB append). That already captures   │
+  │ 008's core win: the write-amplification fix. This BatchedAuditWriter  │
+  │ is retained but NOT instantiated anywhere; it is the further,         │
+  │ orthogonal optimisation of moving those writes OFF the hot path and   │
+  │ amortising round-trips via executemany, plus a bounded-loss queue     │
+  │ that keeps signal processing full-speed during a DB outage.           │
+  │                                                                       │
+  │ WIRE THIS when write volume or DB-outage resilience on the audit path │
+  │ starts to matter (many strategies × many symbols × dense chains). To  │
+  │ adopt: instantiate + start() it in SignalProcess, inject its          │
+  │ persist_chain_propagate / persist_chain_terminate in place of the     │
+  │ persistence.py ones, stop() it on shutdown. Note it has NO            │
+  │ persist_chain_init — initiation stays synchronous (durability anchor  │
+  │ + writes chain_steps step 0), so a hybrid: sync init, batched         │
+  │ propagate/terminate. Its _flush_propagates already writes chain_steps │
+  │ identically to the sync path, so no schema change is needed to adopt. │
+  └─────────────────────────────────────────────────────────────────────┘
+
+Batched, off-critical-path writer for the research/audit tables (signals +
+chains propagation/termination).
+
 WHY THIS EXISTS
 The signal process's consume loop processes one bar at a time, and (after the
 concurrency revert) the next Kafka bar is not pulled until the current bar's
