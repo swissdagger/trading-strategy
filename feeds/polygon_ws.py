@@ -16,8 +16,10 @@ subclasses below carry only the handful of per-cluster differences.
 Polygon's per-second aggregate stream differs between clusters in exactly
 three ways, so those three things are the class attributes / overrides:
 
-  1. CLUSTER URL      stocks -> wss://socket.polygon.io/stocks
-                      forex  -> wss://socket.polygon.io/forex
+  1. CLUSTER URL      stocks -> wss://business.polygon.io/stocks
+                      forex  -> wss://business.polygon.io/forex
+                      (this account's real-time entitlement host for both
+                       clusters; see WS_HOST)
   2. EVENT CODE       stocks per-second aggregates arrive as ev="A"
                       forex  per-second aggregates arrive as ev="CA"
   3. WIRE SYMBOL      stocks: bare ticker "AAPL" (== canonical)
@@ -70,6 +72,15 @@ class _PolygonWSBase(StreamingFeedBase):
     EVENT_CODE: str = ""             # 'A' (stocks) | 'CA' (forex)
     SUPPORTED_TIMEFRAMES: Set[str] = set()
 
+    # Cluster hostname. This account's real-time entitlement (both stocks and
+    # forex) is served from Polygon/Massive's Business cluster host, confirmed
+    # directly with a Massive employee. Hitting the generic socket.polygon.io
+    # host returns real-time-access-denied despite the plan including real-time,
+    # because the entitlement is bound to this host. Kept as a class attribute
+    # (not a hardcoded constant) so a per-cluster override remains possible if
+    # one cluster ever moves.
+    WS_HOST: str = "business.polygon.io"
+
     # websockets recv timeout is driven by the supervisor's staleness window
     # (per-message wait_for in _consume). The connection-level open timeout
     # below is just for the initial handshake.
@@ -83,7 +94,7 @@ class _PolygonWSBase(StreamingFeedBase):
         return self.SUPPORTED_TIMEFRAMES
 
     def _ws_url(self) -> str:
-        return f"wss://socket.polygon.io/{self.CLUSTER}"
+        return f"wss://{self.WS_HOST}/{self.CLUSTER}"
 
     def to_wire_symbol(self, canonical: str) -> str:
         """Canonical symbol -> the form Polygon's ws subscribe expects.
