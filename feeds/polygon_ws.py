@@ -96,6 +96,23 @@ class _PolygonWSBase(StreamingFeedBase):
     def _ws_url(self) -> str:
         return f"wss://{self.WS_HOST}/{self.CLUSTER}"
 
+    def _can_backfill_tf(self, tf: str) -> bool:
+        """Polygon REST cannot usefully backfill SUB-MINUTE rungs (5s/10s/15s/
+        30s): its sub-minute aggregates lag badly and are effectively unusable
+        in real time — the very reason these rungs are served by the websocket
+        stream instead. So on a reconnect we must NOT REST-backfill them: the
+        fetch returns stale-or-empty data and, worse, risks the 400/latency
+        storm the base docstring warns of, delaying live resumption. Sub-minute
+        rungs simply resume live from the ws stream after reconnect (they refill
+        from fresh per-second aggregates). Minute-and-up rungs remain
+        REST-backfillable and return True.
+
+        A timeframe is sub-minute iff it is denominated in seconds ('...s' but
+        not minutes/hours). This is why REST calls for e.g. 10-second bars must
+        never be issued by the outage-backfill path.
+        """
+        return not tf.endswith("s")
+
     def to_wire_symbol(self, canonical: str) -> str:
         """Canonical symbol -> the form Polygon's ws subscribe expects.
         Default is identity (stocks). Forex overrides (EURUSD -> EUR/USD)."""
