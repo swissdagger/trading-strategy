@@ -113,6 +113,12 @@ class TwoLadderEntry:
             symbol=symbol,
             asset_class=ev.asset_class,
             decided_at=ev.timestamp,
+            # The price at the moment of the DECISION — i.e. the Set A 2m trigger
+            # event that fired this entry (not chain_prime's price: the trigger is
+            # what we acted on, and its timestamp is what we record as decided_at,
+            # so the price must come from the same event for the two to be
+            # consistent). Was silently NULL on every row until now.
+            decision_price=ev.decision_price,
             trigger_level=ev.propagation_level,
         )
         log.info("ENTER %s %s: prime=%s trigger(setA 2m)=%s",
@@ -167,10 +173,17 @@ class TwoLadderExit:
         chain_prime_id: str,
         trade_direction: int,
         decided_at: str,
+        decision_price: Optional[float] = None,
     ) -> Optional[str]:
         """Evaluate and, if exiting, emit the EXIT signal referencing the
         position's key. Returns the position_key if an exit was emitted, else
-        None."""
+        None.
+
+        decision_price is the price on the event driving this evaluation (supplied
+        by the runtime's exit sweep) and is written to trade_signals. Defaults to
+        None so a caller/test that doesn't supply one still works — matching
+        FourChainExit's signature, which is the ExitComponent protocol both
+        strategies implement."""
         reason = await self.evaluate(
             symbol=symbol, asset_class=asset_class, chain_prime_id=chain_prime_id,
             trade_direction=trade_direction, decided_at=decided_at,
@@ -185,6 +198,7 @@ class TwoLadderExit:
             asset_class=asset_class,
             reason=reason,
             decided_at=decided_at,
+            decision_price=decision_price,
         )
         log.info("EXIT %s %s reason=%s prime=%s",
                  symbol, side.value, reason.value, chain_prime_id)

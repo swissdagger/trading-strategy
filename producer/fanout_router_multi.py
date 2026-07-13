@@ -144,7 +144,22 @@ class MultiLadderRouter:
                                   bar.symbol, ladder_name, bar.timeframe)
                     continue
                 for ce in events:
-                    await self._publish(self._tag(ce, ladder_name))
+                    # The publish sink runs the WHOLE consumer side (Kafka send +
+                    # the strategy runtime + trade_signals writes). It was outside
+                    # the guard above, so anything raising downstream unwound out
+                    # of on_bar and killed the consume loop. The runtime now
+                    # isolates per-strategy internally; this is the outer backstop
+                    # for everything else on the path (Kafka, event shaping, a
+                    # consumer we add later). One bad event drops that event, not
+                    # the pipeline.
+                    try:
+                        await self._publish(self._tag(ce, ladder_name))
+                    except Exception:
+                        log.exception(
+                            "publish FAILED: symbol=%s ladder=%s event=%s chain=%s "
+                            "— dropping this event (pipeline continues)",
+                            bar.symbol, ladder_name, ce.event_type, ce.chain_id,
+                        )
 
     def _tag(self, ce: ChainEvent, ladder_name: str) -> dict:
         """Build the raw tagged-event dict. Carries `ladder` (the general name)
@@ -165,6 +180,15 @@ class MultiLadderRouter:
             "propagation_level": ce.propagation_level,
             "metadata": {"propagation_level": ce.propagation_level},
             "timestamp": ce.timestamp,
+            # The price the strategy SAW when this event fired. ChainEvent has
+            # carried it all along ("so the signal's decision_price is available
+            # downstream" — chain_machine.py), but it was dropped HERE, so
+            # trade_signals.decision_price was NULL on every row ever written.
+            # Migration 004 defines that column as what the consuming team measures
+            # their slippage/basis against, so dropping it silently broke the
+            # cross-team contract. Named decision_price (not price) because that is
+            # the field name both strategies' entry/exit components already read.
+            "decision_price": ce.price,
         }
 
     def machine_count(self) -> int:

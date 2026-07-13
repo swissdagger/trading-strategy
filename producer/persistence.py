@@ -13,8 +13,33 @@ is passed in; these are thin async functions over it.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 from collections import deque
+
+def _as_timestamptz(value: Union[str, datetime]) -> datetime:
+    """Coerce a decision timestamp to a datetime for a timestamptz bind.
+
+    The chain machine carries decision times as ISO-8601 STRINGS end-to-end
+    (service2_machine._epoch_ms_to_iso -> ChainEvent.timestamp -> the raw event
+    dict -> SignalWriter's `decided_at`), because the state machine compares them
+    lexically. asyncpg does NOT coerce str -> timestamptz: binding the raw string
+    raises DataError on EVERY emit, and — being uncaught on the emit path — that
+    exception unwound all the way out to the Kafka consume loop and killed the
+    pipeline. It is why no trade signal was ever written.
+
+    Every other writer in this module already converts at the bind boundary (see
+    persist_chain_init / persist_chain_propagate below, both of which call
+    datetime.fromisoformat before binding). This is that same conversion, applied
+    at the one boundary that was missing it — the type contract belongs here, at
+    the DB edge, so a future caller of insert_signal cannot reintroduce the crash.
+
+    Accepts a datetime unchanged, so a caller already holding one (or a future
+    non-string producer) needs no special-casing.
+    """
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value)
+
 
 # ---- chain-machine persistence (signals + chains tables, migration 002) ----
 
@@ -280,6 +305,10 @@ def make_insert_signal(pool):
     Returns True if newly inserted, False if it already existed (a replay) — which
     is what SignalWriter uses to log emit vs idempotent-skip."""
     async def insert_signal(row: dict) -> bool:
+        # decided_at arrives as an ISO STRING from the chain machine. asyncpg will
+        # not coerce it to the timestamptz column — binding it raw raises DataError
+        # on every emit. Do not remove this. See _as_timestamptz.
+        decided_at = _as_timestamptz(row["decided_at"])
         async with pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -295,7 +324,7 @@ def make_insert_signal(pool):
                 row["asset_class"], row.get("strategy", "two_ladder"),
                 row.get("trigger_level"),
                 row.get("decision_price"), row.get("exit_reason"),
-                row["decided_at"],
+                decided_at,
             )
         # asyncpg returns 'INSERT 0 1' on insert, 'INSERT 0 0' on conflict-skip.
         return result.endswith(" 1")

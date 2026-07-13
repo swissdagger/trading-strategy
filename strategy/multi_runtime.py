@@ -216,10 +216,41 @@ class MultiStrategyRuntime:
         # a TaggedChainEvent when we built one (A/B), else the raw dict.
         event_for_strategies = tagged if tagged is not None else _RawEventView(raw)
         for strategy in self.registry.strategies_for(symbol):
-            await self._try_entry(strategy, event_for_strategies, raw)
+            # Isolate per strategy. An exception raised inside one strategy's
+            # entry path (a bad event field, a DB write that fails, a bug in the
+            # rule) previously unwound all the way out through _publish ->
+            # router.on_bar -> the consume loop, KILLING the pipeline silently —
+            # the process stops draining Kafka and the DB just stops advancing.
+            # That is the failure this system has already been bitten by twice
+            # (the forecast hang, and the trade_signals decided_at bind). One
+            # strategy failing on one event must degrade to "this strategy
+            # skipped this event", never "the process stops".
+            #
+            # Scoped per-strategy, not around the whole loop, so a failure in
+            # strategy #1 does not skip strategy #2's entry evaluation.
+            try:
+                await self._try_entry(strategy, event_for_strategies, raw)
+            except Exception:
+                log.exception(
+                    "entry evaluation FAILED for strategy=%s symbol=%s "
+                    "chain=%s event=%s — skipping this strategy for this event "
+                    "(pipeline continues)",
+                    strategy.name, symbol, raw.get("chain_id"),
+                    raw.get("event_type"),
+                )
 
         # 3. Exit sweep: every open position on this symbol, routed to its owner.
-        await self._sweep_exits(symbol, raw["timestamp"])
+        # Deliberately OUTSIDE the entry try/except above: a failed entry must
+        # never prevent an open position's exit from being evaluated. Exits are
+        # risk-reducing; skipping one is strictly worse than skipping an entry.
+        # (_sweep_exits does its own per-position isolation for the same reason.)
+        #
+        # The event's price is the EXIT's decision price: this event is what the
+        # exit rule is being evaluated against, and its timestamp is already what
+        # becomes decided_at — so price and time must come from the SAME event or
+        # the consuming team's slippage reference is internally inconsistent.
+        await self._sweep_exits(
+            symbol, raw["timestamp"], raw.get("decision_price"))
 
     async def _try_entry(self, strategy: Strategy, ev, raw: dict) -> None:
         base_pkey = await strategy.entry.on_event(ev)
@@ -247,10 +278,17 @@ class MultiStrategyRuntime:
         log.info("tracking open position %s (strategy=%s) for exit",
                  tracking_key, strategy.name)
 
-    async def _sweep_exits(self, symbol: str, decided_at: str) -> None:
+    async def _sweep_exits(self, symbol: str, decided_at: str,
+                           decision_price: Optional[float] = None) -> None:
         """Evaluate exit for every open position on this symbol, each routed to
-        the strategy that owns it. Emitting an EXIT stops tracking that
-        position."""
+        the strategy that owns it. Emitting an EXIT stops tracking that position.
+
+        decision_price is the price carried by the event driving this sweep, and
+        is written to trade_signals.decision_price on any EXIT emitted. The exit
+        components already accepted this parameter (see FourChainExit) — the
+        runtime simply never passed it, so it silently defaulted to None on every
+        EXIT ever written. Optional, so a caller/test driving the runtime without
+        a price keeps working."""
         positions = list(self._open_by_symbol.get(symbol, {}).values())
         by_name = {s.name: s for s in self.registry.active()}
         for pos in positions:
@@ -265,13 +303,38 @@ class MultiStrategyRuntime:
                     pos.tracking_key, pos.strategy_name,
                 )
                 continue
-            exited = await strategy.exit.maybe_emit_exit(
-                symbol=pos.symbol,
-                asset_class=pos.asset_class,
-                chain_prime_id=pos.chain_prime_id,
-                trade_direction=pos.trade_direction,
-                decided_at=decided_at,
-            )
+            # Isolate per position, for the same reason as the entry fan-out: a
+            # failure evaluating ONE position's exit must not abort the sweep for
+            # the others, and must not kill the consume loop.
+            #
+            # CRITICAL: on failure we CONTINUE, leaving the position TRACKED. The
+            # untrack below happens only when maybe_emit_exit RETURNED a key —
+            # i.e. the EXIT row was durably written. If the emit raised (say the
+            # trade_signals insert failed), the exit condition is still true and
+            # will be re-evaluated on this symbol's next event, so the EXIT is
+            # retried rather than lost. Untracking on a failed emit would abandon
+            # an open position with no EXIT row — precisely the reconciliation gap
+            # migration 004 exists to make detectable, and the worst outcome
+            # available here (the consumer keeps a position we've stopped
+            # watching).
+            try:
+                exited = await strategy.exit.maybe_emit_exit(
+                    symbol=pos.symbol,
+                    asset_class=pos.asset_class,
+                    chain_prime_id=pos.chain_prime_id,
+                    trade_direction=pos.trade_direction,
+                    decided_at=decided_at,
+                    decision_price=decision_price,
+                )
+            except Exception:
+                log.exception(
+                    "exit evaluation FAILED for position=%s (strategy=%s) — "
+                    "position REMAINS TRACKED and its exit will be retried on the "
+                    "next event for %s",
+                    pos.tracking_key, pos.strategy_name, symbol,
+                )
+                continue
+
             if exited is not None:
                 self._open_by_symbol[symbol].pop(pos.tracking_key, None)
                 await self.hooks.remove_open_position(pos.tracking_key)

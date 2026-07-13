@@ -55,7 +55,19 @@ def level_of(set_: ChainSet, timeframe: str) -> int:
 
 # Pre-computed level constants the policy uses, so the four-step logic reads in
 # timeframe terms while comparing the integer levels the events carry.
-A_LEVEL_30S = level_of(ChainSet.A, "30s")   # entry veto level (opposing)
+# NOTE on the entry veto. There is deliberately NO opposing-veto LEVEL constant.
+# The spec is "if there are ANY chains in the opposite direction at all (Set A or
+# Set B), ignore chain_prime and go back to step 1" — any direction-opposing chain
+# vetoes, at ANY depth. So TwoLadderEntry passes level=1 (a live chain is always at
+# level >= 1), which means "any". A previous A_LEVEL_30S constant existed here,
+# described as the veto level, but was never used by any code path; it implied a
+# depth-gated veto the spec does not call for. Removed rather than left dangling,
+# because a defined-but-unused constant that contradicts the live code reads as a
+# bug and invites someone to "fix" the entry rule into something stricter than
+# intended. The veto is intentionally STRICTER than the exit's opposing test
+# (which fires only on an opposing SET B chain at 2m+): we refuse to open with any
+# whiff of opposing structure, but once open we tolerate opposing chains until one
+# reaches 2m in Set B.
 A_LEVEL_2M = level_of(ChainSet.A, "2m")     # entry trigger level (Set A 2m)
 B_LEVEL_2M = level_of(ChainSet.B, "2m")     # exit: opposing Set B chain at 2m+
 B_LEVEL_10M = level_of(ChainSet.B, "10m")   # exit: chain_prime reaches top of Set B
@@ -76,6 +88,12 @@ class TaggedChainEvent:
     direction: int             # -1 | +1
     propagation_level: int     # 1-based within the set's ladder
     timestamp: str             # ISO; the decision time carried into signals
+    # The price the strategy SAW when this event fired — carried into
+    # trade_signals.decision_price, which migration 004 defines as the reference
+    # the consuming team measures its slippage/basis against. Optional because a
+    # chain event is not required to carry a price (and older raw events on the
+    # Kafka topic predate the field), but in the live path it is always populated.
+    decision_price: Optional[float] = None
 
     @classmethod
     def from_raw(cls, ev: dict) -> "TaggedChainEvent":
@@ -95,6 +113,11 @@ class TaggedChainEvent:
             direction=int(ev["direction"]),
             propagation_level=int(md.get("propagation_level", ev.get("propagation_level", 1))),
             timestamp=ev["timestamp"],
+            # .get, not [...]: events already on the chain-events topic (and any
+            # replayed from before this field existed) carry no decision_price.
+            # Absent -> None, which is exactly what the column already holds for
+            # every historical row. Never raise on a missing price.
+            decision_price=ev.get("decision_price"),
         )
 
 
