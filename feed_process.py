@@ -234,7 +234,32 @@ class FeedProcess:
                 return
             for p in points:
                 try:
-                    await self.producer.send(self.cfg.bars_topic, _bar_to_wire(p))
+                    # KEY BY SYMBOL. Kafka partitions by key, so every bar for a
+                    # symbol lands on the same partition and is therefore consumed
+                    # by exactly ONE consumer instance, in order.
+                    #
+                    # This is a no-op today (trading-bars has one partition, so
+                    # everything lands on partition 0 regardless) and costs nothing.
+                    # It is here to make horizontal scale-out SAFE BY CONSTRUCTION
+                    # later. Without a key, adding partitions or a second signal
+                    # process would round-robin one symbol's bars across instances
+                    # — each with its own lock map, ChainView, and machines — so two
+                    # bars for the same symbol could be processed concurrently on
+                    # different hosts. The chain machine's timestamp-ordered
+                    # propagation (next_sig["timestamp"] >= chain["last_timestamp"])
+                    # would then see bars out of order and MIS-PROPAGATE SILENTLY,
+                    # with no exception raised. That is the same class of corruption
+                    # signal_process.run() warns about for in-process concurrency,
+                    # just distributed and harder to spot.
+                    #
+                    # NOTE: if you DO add partitions, signal_process._commit_offsets
+                    # currently hardcodes partition 0 — it must commit per
+                    # TopicPartition from msg.partition instead.
+                    await self.producer.send(
+                        self.cfg.bars_topic,
+                        _bar_to_wire(p),
+                        key=p.symbol.encode(),
+                    )
                 except Exception:
                     # A publish failure for one bar must not drop the whole batch
                     # or kill the feed. Log and continue; the feed keeps streaming.

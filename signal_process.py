@@ -37,21 +37,26 @@ import asyncio
 import logging
 import os
 import signal as os_signal
+import time
 from typing import Optional
 
 import asyncpg
+from aiokafka import TopicPartition
 
 from execution.signal_writer import SignalWriter, SignalWriterHooks
+from producer.async_writer import BatchedAuditWriter
 from producer.fanout_router_multi import MultiLadderRouter
+from producer.offset_tracker import OffsetTracker
+from producer.symbol_workers import SymbolWorkerPool
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
     make_load_chain_view_seed,
     make_load_open_positions,
+    # NOTE: only chain_init remains synchronous. persist_signal / chain_propagate
+    # / chain_terminate are now served by BatchedAuditWriter (off the hot path);
+    # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
-    make_persist_chain_propagate,
-    make_persist_chain_terminate,
-    make_persist_signal,
     make_load_buffers,
 )
 from producer.service2_machine import ServiceTwoChainMachine
@@ -79,6 +84,25 @@ class Config:
         self.events_topic = os.environ.get("CHAIN_EVENTS_TOPIC", "chain-events")
         self.consumer_group = os.environ.get(
             "SIGNAL_CONSUMER_GROUP", "signal-process-group")
+        # --- throughput / durability tunables (see run()) ---
+        # Per-symbol queue depth. Bounded: a full queue backpressures the bar
+        # consumer rather than shedding bars (a dropped bar is a HOLE in the chain
+        # machine's input, unlike a shed audit row).
+        self.symbol_queue_max = int(
+            os.environ.get("SYMBOL_QUEUE_MAX", "1000"))
+        # How often the consume loop commits the contiguous low-water offset.
+        self.commit_interval_s = float(
+            os.environ.get("COMMIT_INTERVAL_S", "5.0"))
+        # Wall-clock age (bar timestamp -> now) above which we warn. This is the
+        # gauge that would have caught the multi-day stall on day one.
+        self.lag_warn_s = float(os.environ.get("LAG_WARN_S", "300"))
+        # Client-side request timeout for the blocking Sumtyme SDK call. The
+        # machine's asyncio.wait_for cancels the AWAIT but NOT the underlying
+        # thread — without a timeout in the SDK itself, a hung call leaks a
+        # blocked worker thread permanently. With per-symbol concurrency there
+        # are now many such calls in flight, so this matters more, not less.
+        self.sumtyme_timeout_s = float(
+            os.environ.get("SUMTYME_TIMEOUT_S", "20"))
 
 
 def _require(name: str) -> str:
@@ -102,6 +126,9 @@ class SignalProcess:
         self.ladders = None            # LadderRegistry, built in start()
         self.strategies = None         # StrategyRegistry, built in start()
         self.resolver = None   # ClassResolver, built in start() from ASSET_CONFIGS
+        self.audit_writer: Optional[BatchedAuditWriter] = None
+        self.workers: Optional[SymbolWorkerPool] = None
+        self.offsets = OffsetTracker()
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
@@ -115,7 +142,34 @@ class SignalProcess:
 
         # --- Sumtyme client (blocking SDK; the machine wraps calls in to_thread) ---
         import sumtyme  # imported here so the module loads without the SDK present
-        client = sumtyme.client(apikey=self.cfg.sumtyme_key)
+        # A CLIENT-SIDE request timeout is load-bearing, not belt-and-braces. The
+        # machine bounds the forecast with asyncio.wait_for, but wait_for cancels
+        # the AWAIT, not the thread: the to_thread worker stays blocked inside the
+        # SDK's socket read until the OS returns. Repeated hangs therefore LEAK
+        # worker threads (the machine's own NOTE says exactly this). Under the new
+        # per-symbol concurrency there can be one forecast in flight per symbol, so
+        # a degraded Sumtyme could leak a thread per symbol per bar. The SDK's
+        # kwarg name is not guaranteed across versions — try the common ones and
+        # fail LOUD if none is accepted, rather than silently running unbounded.
+        client = None
+        for kwarg in ("timeout", "request_timeout"):
+            try:
+                client = sumtyme.client(
+                    apikey=self.cfg.sumtyme_key,
+                    **{kwarg: self.cfg.sumtyme_timeout_s},
+                )
+                log.info("sumtyme client: %s=%ss", kwarg, self.cfg.sumtyme_timeout_s)
+                break
+            except TypeError:
+                continue
+        if client is None:
+            client = sumtyme.client(apikey=self.cfg.sumtyme_key)
+            log.warning(
+                "sumtyme client accepts no timeout kwarg — forecasts are NOT "
+                "bounded at the socket. asyncio.wait_for still skips the bar, but "
+                "a hung call LEAKS its worker thread. Set the timeout on the SDK "
+                "(session/transport) if it exposes one; otherwise watch thread count."
+            )
 
         # --- Kafka consumer (bars in) + producer (tagged events out) ---
         from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -125,7 +179,13 @@ class SignalProcess:
             bootstrap_servers=self.cfg.kafka_bootstrap,
             group_id=self.cfg.consumer_group,
             value_deserializer=lambda b: _json.loads(b.decode()),
-            enable_auto_commit=True,
+            # MANUAL COMMIT — mandatory now, not a preference. Bars are handed to
+            # per-symbol workers and are still IN FLIGHT when the consume loop
+            # moves on. Auto-commit would acknowledge offsets for bars sitting in
+            # a queue; a crash would drop them with no replay, leaving permanent
+            # holes in the chain machine's input. We commit only the contiguous
+            # low-water mark of FINISHED bars (see run() / OffsetTracker).
+            enable_auto_commit=False,
             auto_offset_reset="latest",
         )
         self.producer = AIOKafkaProducer(
@@ -134,6 +194,24 @@ class SignalProcess:
         )
         await self.consumer.start()
         await self.producer.start()
+
+        # --- Batched audit writer: research/audit writes OFF the hot path ---
+        # Adopting the writer exactly as its docstring prescribes (it was built,
+        # documented, and left dormant for this moment). It takes the signals /
+        # chain-propagate / chain-terminate round-trips off the per-bar path and
+        # amortises them via executemany.
+        #
+        # HYBRID, deliberately: chain INIT stays SYNCHRONOUS (migration 002's
+        # write-before-emit ordering — trades.chain_id foreign-keys to chains, so
+        # the chain row must be durable before the event is consumed), and
+        # trade_signals stays SYNCHRONOUS in SignalWriter (it is the PRODUCT; it
+        # must never be inside a bounded-loss window).
+        #
+        # ACCEPTED TRADE: research/audit rows enqueued but unflushed are LOST on a
+        # hard crash (bounded by queue depth), and land up to flush_interval_s
+        # late. Both are explicitly sanctioned in the writer's DURABILITY CONTRACT.
+        self.audit_writer = BatchedAuditWriter(self.pool)
+        self.audit_writer.start()
 
         # --- Signal writer factory (per-strategy, tagged with the name) ---
         insert_signal = make_insert_signal(self.pool)
@@ -230,10 +308,17 @@ class SignalProcess:
                 prepare_df_fn=prepare_dataframe_for_sumtyme,
                 to_interval_fn=to_sumtyme_interval,
                 build_df_fn=build_sumtyme_df,
-                persist_signal=make_persist_signal(self.pool),
+                # DEFERRED (batched, off the hot path) — research/audit only.
+                persist_signal=self.audit_writer.persist_signal,
+                # SYNCHRONOUS — durability anchor. A chain row must be durable
+                # before its chain_initiated event is acted on (trades.chain_id
+                # FKs to chains). One write per chain, so this costs ~nothing.
                 persist_chain_init=make_persist_chain_init(self.pool),
-                persist_chain_propagate=make_persist_chain_propagate(self.pool),
-                persist_chain_terminate=make_persist_chain_terminate(self.pool),
+                # DEFERRED — audit. Signatures match the sync hooks exactly, so
+                # this is a pure swap; the chain machine is unchanged and stays
+                # oblivious to whether its writes are sync or deferred.
+                persist_chain_propagate=self.audit_writer.persist_chain_propagate,
+                persist_chain_terminate=self.audit_writer.persist_chain_terminate,
                 load_active_chains=make_load_active_chains(
                     self.pool, symbol, asset_class, timeframes),
                 load_buffers=make_load_buffers(self.pool, symbol, timeframes),
@@ -305,27 +390,54 @@ class SignalProcess:
         await self.runtime._process_raw_locked(raw)
 
     async def run(self) -> None:
-        """Consume bars and pump them through the router until stopped.
+        """Consume bars and dispatch them to PER-SYMBOL ORDERED WORKERS.
 
-        Bars are awaited SEQUENTIALLY (not spawned as concurrent tasks). This is
-        load-bearing, not an oversight: MultiLadderRouter.on_bar takes the
-        per-symbol lock, and MultiStrategyRuntime shares that same lock map — the
-        publish sink (_publish, below) calls runtime._process_raw_locked() on the
-        assumption that the caller (the router, mid on_bar) already holds the
-        symbol's lock. If bars were dispatched concurrently, two bars for the
-        SAME symbol could run at once: their on_bar calls would contend for the
-        lock while a third could read/mutate the ChainView out of order, and the
-        timestamp-ordered propagation logic in the chain machine
-        (next_sig["timestamp"] >= chain["last_timestamp"]) would no longer see
-        bars in the order Kafka delivered them. That combination silently breaks
-        chain propagation and the entry/exit decision logic without raising — the
-        chains table still fills (it's lock-independent), but trade_signals does
-        not. If cross-symbol throughput is needed, the correct shape is
-        per-symbol ordered workers (one queue/task per symbol), not a blanket
-        create_task per bar — ask before reintroducing concurrency here.
+        THE CONCURRENCY SHAPE (read this before changing it). Bars used to be
+        awaited strictly sequentially here, which was load-bearing: the router
+        takes the per-symbol lock, the runtime SHARES that lock map, and _publish
+        calls runtime._process_raw_locked() assuming the router already holds the
+        symbol's lock. The old docstring warned that a blanket create_task per bar
+        would let two bars for the SAME symbol run at once — contending for the
+        lock, reaching the ChainView out of order, and silently breaking the
+        chain machine's timestamp-ordered propagation WITHOUT RAISING. That
+        warning still stands, and it prescribed the fix:
+
+            "the correct shape is per-symbol ordered workers (one queue/task per
+             symbol), not a blanket create_task per bar"
+
+        That is what this now is. Each symbol has ONE queue and ONE worker
+        processing its bars strictly in order, so the per-symbol invariant is
+        preserved exactly as before (the lock remains correct and load-bearing —
+        the workers make contention on it rare, they do not remove the need for
+        it). Different symbols proceed CONCURRENTLY, which is the entire point:
+        the per-bar cost is dominated by ONE BLOCKING SUMTYME CALL, and those
+        have no reason to serialise across symbols. With N symbols this is an
+        ~N-fold throughput increase, which is what closes the lag.
+
+        WHY THE LAG HAPPENED (for the next person): per-bar cost (one forecast +
+        its DB round-trips, in series) exceeded the bar arrival rate across the
+        universe, so consumer lag grew monotonically — 38k messages and ~39h
+        behind, with signals rows landing at a created_at ~39h after their bar
+        timestamp. It was never DB write throughput; the DB was always committing
+        in milliseconds. It was this loop.
+
+        OFFSETS. Because bars are IN FLIGHT when this loop moves on, offsets are
+        committed MANUALLY, and only at the CONTIGUOUS LOW-WATER MARK of finished
+        bars (OffsetTracker). Committing the highest finished offset would skip a
+        slower in-flight bar below it and lose it permanently on a crash.
+        Semantics are at-least-once: a crash replays bars above the commit point,
+        which is safe because every write on this path is idempotent (signals
+        UPSERT, chain_steps ON CONFLICT DO NOTHING, trade_signals ON CONFLICT on
+        the deterministic signal_id).
         """
         from producer.bar import OHLCPoint
         assert self.consumer is not None and self.router is not None
+
+        self.workers = SymbolWorkerPool(
+            self.router.on_bar,
+            max_queue_per_symbol=self.cfg.symbol_queue_max,
+        )
+        last_commit = time.monotonic()
 
         try:
             async for msg in self.consumer:
@@ -333,29 +445,108 @@ class SignalProcess:
                     break
                 raw = msg.value
                 if isinstance(raw, dict) and raw.get("type") == "status":
+                    # Not a bar: nothing to process, but its offset must still be
+                    # retired or it would wedge the contiguous commit point.
+                    self.offsets.complete(msg.offset)
                     continue
                 try:
                     bar = OHLCPoint(**raw)
                 except Exception:
                     log.exception("bad bar payload, skipping: %r", raw)
+                    self.offsets.complete(msg.offset)   # poison bar: don't wedge
                     continue
 
                 if not self.resolver.known(bar.symbol):
                     log.debug("bar for unknown symbol %s, skipping", bar.symbol)
+                    self.offsets.complete(msg.offset)
                     continue
 
-                await self.router.on_bar(bar)
+                self._observe_lag(bar)
+                # Hand off. This AWAITS only if the symbol's queue is full
+                # (backpressure); otherwise it returns immediately and the loop
+                # goes straight back to Kafka. That is the whole speedup.
+                await self.workers.submit(bar.symbol, bar, msg.offset)
+
+                # Retire whatever finished while we were fetching, and commit the
+                # contiguous frontier on a timer (not per bar — that would put a
+                # network round-trip back on the hot path we just cleared).
+                for done in self.workers.take_done_offsets():
+                    self.offsets.complete(done)
+                now = time.monotonic()
+                if now - last_commit >= self.cfg.commit_interval_s:
+                    await self._commit_offsets()
+                    last_commit = now
         finally:
             await self.stop()
 
+    def _observe_lag(self, bar) -> None:
+        """Gauge: how far behind wall clock is the bar we are only now processing?
+
+        This is the number that would have made a 39-hour stall obvious on day
+        one instead of after a day of watching. Export it (Prometheus/statsd) —
+        alert if it exceeds a few bar intervals. Sudden growth here, or growth in
+        SymbolWorkerPool.queue_depths(), is this bug recurring."""
+        age_s = time.time() - (bar.timestamp / 1000.0)
+        if age_s > self.cfg.lag_warn_s:
+            log.warning(
+                "PROCESSING LAG: bar %s/%s is %.0fs (%.1fh) old — the pipeline is "
+                "behind. queue depths=%s",
+                bar.symbol, bar.timeframe, age_s, age_s / 3600.0,
+                self.workers.queue_depths() if self.workers else {},
+            )
+
+    async def _commit_offsets(self) -> None:
+        """Commit the contiguous low-water mark, if it advanced. Single-partition
+        topic (bars are produced unkeyed to trading-bars), so one commit point."""
+        offset = self.offsets.take_committable()
+        if offset is None:
+            return
+        try:
+            # Kafka commits the NEXT offset to read, i.e. last_processed + 1.
+            await self.consumer.commit({
+                TopicPartition(self.cfg.bars_topic, 0): offset + 1
+            })
+            log.debug("committed offset %d (pending out-of-order=%d)",
+                      offset + 1, self.offsets.pending())
+        except Exception:
+            # A failed commit is survivable: the offset stays uncommitted and the
+            # next commit (or a restart's replay) covers it. Never fatal.
+            log.exception("offset commit failed (will retry next interval)")
+
     async def stop(self) -> None:
+        """Graceful shutdown. ORDER IS LOAD-BEARING — each step depends on the
+        previous one still having its resources:
+
+          1. Drain the workers   — finish bars already accepted, so a clean stop
+                                   does not replay work it actually completed.
+          2. Commit offsets      — record what step 1 finished. MUST precede the
+                                   consumer close (a closed consumer cannot commit).
+          3. Flush audit writer  — its stop() drains the queue to the DB, so a
+                                   GRACEFUL stop incurs NO bounded-loss window
+                                   (only a crash does). MUST precede pool close.
+          4. Close Kafka + pool  — everything above needs them alive.
+        """
         self._stop.set()
+
+        if self.workers is not None:
+            await self.workers.drain()
+            for done in self.workers.take_done_offsets():
+                self.offsets.complete(done)
+            await self.workers.stop()
+
         if self.consumer is not None:
+            await self._commit_offsets()      # before the consumer closes
             await self.consumer.stop()
+
         if self.producer is not None:
             await self.producer.stop()
+
+        if self.audit_writer is not None:
+            await self.audit_writer.stop()    # flushes; needs the pool alive
+
         if self.pool is not None:
             await self.pool.close()
+
         log.info("signal process stopped cleanly")
 
 
