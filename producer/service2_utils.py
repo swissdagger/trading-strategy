@@ -64,8 +64,43 @@ def prepare_dataframe_for_sumtyme(df: pd.DataFrame, timeframe: str):
     datetime back.
     """
     api_df = df.copy()
-    if "timestamp" in api_df.columns:
-        api_df = api_df.drop(columns=["timestamp"])
+
+    # Send ONLY the columns Sumtyme's step-mode contract calls for.
+    #
+    # This used to drop `timestamp` alone, leaving `symbol`, `timeframe` AND
+    # `asset_class` in the payload — as full strings, repeated on all 5001 rows.
+    # Three problems, all of which showed up as a SLOW API rather than an error:
+    #
+    #  1. asset_class is not part of the contract at all. It is in _tick_dict
+    #     because the DB schema denormalises it onto every bar; it was never meant
+    #     to reach Sumtyme. (This module's own docstring lists the needed columns
+    #     as "timestamp, symbol, OHLC, timeframe" — asset_class is not among them.
+    #     It arrived when the buffer shape changed and the marshalling was not
+    #     re-checked. CausaView's service_2 never sent it, which is why CausaView
+    #     runs 30 assets on 1m with no trouble and this did not.)
+    #
+    #  2. Worse: the placeholder row below was built WITHOUT asset_class, so
+    #     pd.concat introduced a NaN in that column on row 5001 — the placeholder,
+    #     i.e. THE ROW BEING FORECAST. We were handing the API a null cell in an
+    #     undocumented column on the one row that matters. It did not reject this;
+    #     it ingested it and got slow (observed: p50 = 10.3s per call, zero errors).
+    #
+    #  3. symbol/timeframe are constant across every row and redundant in step
+    #     mode (the series is an ordered sequence of morphisms — Sumtyme is told
+    #     which instrument and interval via the interval/interval_unit args). 5001
+    #     repeated copies of "BTCUSDT"/"1m"/"crypto" nearly DOUBLED the payload:
+    #     664KB -> 369KB per call once removed.
+    #
+    # Keep OHLC (the actual data) and nothing else. The step column is added below.
+    _CONTRACT_COLUMNS = ["open", "high", "low", "close"]
+    missing = [c for c in _CONTRACT_COLUMNS if c not in api_df.columns]
+    if missing:
+        # Loud, not silent: a missing OHLC column would otherwise be forecast as
+        # garbage.
+        raise KeyError(
+            f"buffer is missing required OHLC column(s) {missing}; "
+            f"got {list(api_df.columns)}"
+        )
 
     # Placeholder's wall-clock datetime (not sent to Sumtyme in step mode; needed
     # locally to persist the signal against the right timestamp).
@@ -79,13 +114,27 @@ def prepare_dataframe_for_sumtyme(df: pd.DataFrame, timeframe: str):
         pd.to_datetime(next_ts_ms, unit="ms").to_pydatetime().replace(tzinfo=timezone.utc)
     )
 
+    # The placeholder row: the step Sumtyme is being asked to forecast. It must be
+    # STRUCTURALLY IDENTICAL to the real rows — same columns, no NaN. Previously it
+    # was built with a different column set from the real rows, so pd.concat
+    # silently introduced a NaN (in asset_class) on precisely this row. Building
+    # both from the same _CONTRACT_COLUMNS list makes that class of bug impossible.
     placeholder_row = pd.DataFrame([{
-        "symbol": api_df["symbol"].iloc[0],
         "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0,
-        "timeframe": timeframe,
     }])
 
+    api_df = api_df[_CONTRACT_COLUMNS]
     api_df = pd.concat([api_df, placeholder_row], ignore_index=True)
+
+    # Fail loudly if anything is still null — a NaN in the payload is what made the
+    # API pathologically slow, and it must never silently recur.
+    if api_df.isna().any().any():
+        bad = api_df.columns[api_df.isna().any()].tolist()
+        raise ValueError(
+            f"NaN in Sumtyme payload columns {bad} — refusing to send. "
+            f"(A null in the placeholder row previously caused ~10s API latency.)"
+        )
+
     # 1-indexed step column per Sumtyme's docs (rows 1..5000 real, 5001 placeholder).
     api_df["step"] = range(1, len(api_df) + 1)
     return api_df, placeholder_dt
