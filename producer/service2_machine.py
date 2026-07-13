@@ -53,6 +53,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 
+from producer.forecast_gate import ForecastGate
+
 log = logging.getLogger("producer.service2_machine")
 
 WINDOW_SIZE = 5000   # same gate as service_2: no forecast until the buffer fills
@@ -120,6 +122,7 @@ class ServiceTwoChainMachine(ChainMachine):
         load_active_chains: Optional[Callable[[], Awaitable[List[dict]]]] = None,
         load_buffers: Optional[Callable[[], Awaitable[Dict[str, deque]]]] = None,
         forecast_timeout_s: float = 30.0,
+        forecast_gate: Optional["ForecastGate"] = None,
     ):
         self.symbol = symbol
         self.asset_class = asset_class
@@ -137,6 +140,14 @@ class ServiceTwoChainMachine(ChainMachine):
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
         self._forecast_timeout_s = forecast_timeout_s
+        # SHARED across every machine in the process — see ForecastGate. Sumtyme
+        # serialises concurrent calls server-side, so we hold a single global
+        # permit and queue HERE (cheap, cancellable) instead of in their queue
+        # (which burns their compute on results we then time out and discard).
+        # If None, forecasts run ungated — correct for a standalone/test machine,
+        # WRONG in the live multi-symbol process, where every machine must share
+        # one gate instance. signal_process constructs exactly one and injects it.
+        self._forecast_gate = forecast_gate
 
         # --- per-(symbol,set) state (was module-level, keyed by (ac,symbol)) ---
         self._lock = asyncio.Lock()
@@ -210,20 +221,32 @@ class ServiceTwoChainMachine(ChainMachine):
         interval, interval_unit = self._to_interval(bar.timeframe)
 
         # Blocking Sumtyme call off the event loop — never await it directly, and
-        # BOUND it. Without a timeout, a hung forecast call wedges the single
-        # consume loop indefinitely: the to_thread worker blocks, the committed
-        # offset freezes, and the DB silently stops advancing (observed: a multi-day
-        # stall). wait_for converts a hang into a TimeoutError that flows into the
-        # existing "treat as no forecast" path below (return []), so one slow/stuck
-        # forecast skips its bar instead of halting the pipeline.
+        # BOUND it. Without a timeout, a hung forecast call wedges the consume loop
+        # indefinitely: the to_thread worker blocks, the committed offset freezes,
+        # and the DB silently stops advancing (observed: a multi-day stall).
         #
-        # NOTE: wait_for cancels the AWAIT, not the underlying thread — the worker
-        # keeps running the blocked SDK call until the OS call returns. Set a request
-        # timeout on the Sumtyme client too (so the thread actually unblocks rather
-        # than leaking a stuck worker on repeated timeouts).
+        # GATED. Sumtyme processes concurrent requests SEQUENTIALLY server-side, so
+        # firing N forecasts at once does not parallelise — it queues them in
+        # Sumtyme, and the last one waits ~N x the single-call latency, blows the
+        # timeout, and gets discarded AFTER Sumtyme already spent the compute. That
+        # is strictly worse than serial (observed: 1145 timeouts, ZERO errors — the
+        # signature of queueing, not failure). The gate holds ONE global permit, so
+        # the queue lives here, where waiting is free and cancellable.
+        #
+        # The gate also measures single-call latency L and logs the resulting
+        # CAPACITY (1/L forecasts/sec). If demand exceeds that, no client-side
+        # change can help — it is a product decision (fewer symbols/rungs, or more
+        # parallelism from Sumtyme).
+        #
+        # NOTE: wait_for cancels the AWAIT, not the underlying thread. The SDK
+        # exposes no request-timeout kwarg (signal_process logs a warning at
+        # startup), so a genuinely hung socket still occupies a thread-pool worker
+        # until the OS returns. Serialising via the gate bounds the damage: at most
+        # `concurrency` such calls can ever be stuck at once, instead of one per
+        # symbol.
         try:
-            forecast = await asyncio.wait_for(
-                asyncio.to_thread(
+            if self._forecast_gate is not None:
+                forecast = await self._forecast_gate.run(
                     self._forecast_fn,
                     time_series_type="ohlc",
                     data_input=api_ready_df,
@@ -231,9 +254,23 @@ class ServiceTwoChainMachine(ChainMachine):
                     interval_unit=interval_unit,
                     reasoning_mode="reactive",
                     timeframe_dependent=False,
-                ),
-                timeout=self._forecast_timeout_s,
-            )
+                    timeout_s=self._forecast_timeout_s,
+                )
+            else:
+                # Ungated path: standalone/test use only. In the live process every
+                # machine is given the shared gate.
+                forecast = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._forecast_fn,
+                        time_series_type="ohlc",
+                        data_input=api_ready_df,
+                        interval=interval,
+                        interval_unit=interval_unit,
+                        reasoning_mode="reactive",
+                        timeframe_dependent=False,
+                    ),
+                    timeout=self._forecast_timeout_s,
+                )
         except asyncio.TimeoutError:
             # The hang path. LOUD on purpose: this is the failure that silently
             # froze the pipeline for days. One per stuck bar; a burst of these

@@ -46,6 +46,7 @@ from aiokafka import TopicPartition
 from execution.signal_writer import SignalWriter, SignalWriterHooks
 from producer.async_writer import BatchedAuditWriter
 from producer.fanout_router_multi import MultiLadderRouter
+from producer.forecast_gate import ForecastGate
 from producer.offset_tracker import OffsetTracker
 from producer.symbol_workers import SymbolWorkerPool
 from producer.persistence import (
@@ -96,13 +97,26 @@ class Config:
         # Wall-clock age (bar timestamp -> now) above which we warn. This is the
         # gauge that would have caught the multi-day stall on day one.
         self.lag_warn_s = float(os.environ.get("LAG_WARN_S", "300"))
-        # Client-side request timeout for the blocking Sumtyme SDK call. The
-        # machine's asyncio.wait_for cancels the AWAIT but NOT the underlying
-        # thread — without a timeout in the SDK itself, a hung call leaks a
-        # blocked worker thread permanently. With per-symbol concurrency there
-        # are now many such calls in flight, so this matters more, not less.
+        # Client-side request timeout for the blocking Sumtyme SDK call.
+        #
+        # With the ForecastGate holding a single permit, this now measures what it
+        # was always meant to: SUMTYME'S ACTUAL COMPUTE TIME. Before the gate, a
+        # call could sit behind 9 others in Sumtyme's server-side queue, so the
+        # timeout was mostly measuring OUR OWN pile-up and killed calls that had
+        # barely started (1145 timeouts, zero errors). Now a call that starts is a
+        # call that runs, so this can be a tight, meaningful bound.
         self.sumtyme_timeout_s = float(
             os.environ.get("SUMTYME_TIMEOUT_S", "20"))
+        # How many Sumtyme calls may be in flight at once.
+        #
+        # KEEP THIS AT 1. Sumtyme processes concurrent requests SEQUENTIALLY
+        # server-side: sending 10 at once does not parallelise, it just queues them
+        # in Sumtyme, inflates the tail latency ~10x, blows our timeout, and wastes
+        # their compute on results we discard. Raising this does NOT increase
+        # throughput — it recreates exactly the failure this gate exists to fix.
+        # Only raise it if Sumtyme confirms genuine server-side parallelism.
+        self.forecast_concurrency = int(
+            os.environ.get("FORECAST_CONCURRENCY", "1"))
 
 
 def _require(name: str) -> str:
@@ -127,6 +141,7 @@ class SignalProcess:
         self.strategies = None         # StrategyRegistry, built in start()
         self.resolver = None   # ClassResolver, built in start() from ASSET_CONFIGS
         self.audit_writer: Optional[BatchedAuditWriter] = None
+        self.forecast_gate: Optional[ForecastGate] = None
         self.workers: Optional[SymbolWorkerPool] = None
         self.offsets = OffsetTracker()
         self._stop = asyncio.Event()
@@ -194,6 +209,20 @@ class SignalProcess:
         )
         await self.consumer.start()
         await self.producer.start()
+
+        # --- The ONE forecast gate, shared by every chain machine ---
+        # Exactly one instance per process. Constructing one per machine would give
+        # each its own permit and let all 10 fire at once — precisely the bug this
+        # fixes. Sumtyme serialises concurrent calls, so we serialise them here,
+        # where waiting is free instead of burning their compute on results we time
+        # out and throw away.
+        self.forecast_gate = ForecastGate(
+            concurrency=self.cfg.forecast_concurrency)
+        log.info(
+            "forecast gate: concurrency=%d, timeout=%ss (Sumtyme serialises "
+            "concurrent calls server-side, so concurrency>1 does NOT parallelise)",
+            self.cfg.forecast_concurrency, self.cfg.sumtyme_timeout_s,
+        )
 
         # --- Batched audit writer: research/audit writes OFF the hot path ---
         # Adopting the writer exactly as its docstring prescribes (it was built,
@@ -322,6 +351,15 @@ class SignalProcess:
                 load_active_chains=make_load_active_chains(
                     self.pool, symbol, asset_class, timeframes),
                 load_buffers=make_load_buffers(self.pool, symbol, timeframes),
+                # Was omitted, so the machine silently used its 30s DEFAULT and
+                # SUMTYME_TIMEOUT_S had no effect on anything (the client
+                # constructor rejected the kwarg, so it was applied nowhere at
+                # all). Now it actually binds.
+                forecast_timeout_s=self.cfg.sumtyme_timeout_s,
+                # The SHARED gate — the SAME object for every machine, by design.
+                # One permit total across the process, because Sumtyme serialises
+                # concurrent calls anyway.
+                forecast_gate=self.forecast_gate,
             )
         return factory
 
@@ -527,6 +565,11 @@ class SignalProcess:
           4. Close Kafka + pool  — everything above needs them alive.
         """
         self._stop.set()
+
+        # Final capacity report: the numbers that decide whether the system is
+        # viable (single-call latency L, and the resulting 1/L ceiling).
+        if self.forecast_gate is not None:
+            self.forecast_gate.log_stats()
 
         if self.workers is not None:
             await self.workers.drain()
