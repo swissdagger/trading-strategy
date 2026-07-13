@@ -34,6 +34,7 @@ see the NOTE in _make_factory about supplying them.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import signal as os_signal
@@ -109,14 +110,33 @@ class Config:
             os.environ.get("SUMTYME_TIMEOUT_S", "20"))
         # How many Sumtyme calls may be in flight at once.
         #
-        # KEEP THIS AT 1. Sumtyme processes concurrent requests SEQUENTIALLY
-        # server-side: sending 10 at once does not parallelise, it just queues them
-        # in Sumtyme, inflates the tail latency ~10x, blows our timeout, and wastes
-        # their compute on results we discard. Raising this does NOT increase
-        # throughput — it recreates exactly the failure this gate exists to fix.
-        # Only raise it if Sumtyme confirms genuine server-side parallelism.
+        # MEASURED, not guessed (benchmark on the live VM, 5000-row window):
+        #
+        #     N=1 ->  8.13s/call | 0.12 calls/sec
+        #     N=4 ->  3.73s/call | 0.27 calls/sec
+        #     N=6 ->  2.75s/call | 0.36 calls/sec   <-- PEAK
+        #     N=8 ->  4.23s/call | 0.24 calls/sec   <-- collapses
+        #
+        # Sumtyme DOES parallelise (4 concurrent calls take 15s, not 32s), but not
+        # linearly, and throughput peaks around 6. The N=8 collapse was an artifact
+        # of the default thread pool (min(32, cpu_count+4) = 6 on 2 vCPUs), which
+        # is why thread_pool_size below is now raised — re-benchmark past 6 with a
+        # bigger pool before assuming 6 is the true ceiling.
+        #
+        # Demand is ~0.25 forecast-eligible bars/sec (10 symbols x 5 rungs; the 1m
+        # rung alone is ~62% of it). At 0.36 calls/sec there is ~44% headroom.
+        # Set this too LOW and the backlog grows; too HIGH and calls queue, blow
+        # SUMTYME_TIMEOUT_S, and get discarded AFTER Sumtyme already spent the
+        # compute — strictly worse than not sending them.
         self.forecast_concurrency = int(
-            os.environ.get("FORECAST_CONCURRENCY", "1"))
+            os.environ.get("FORECAST_CONCURRENCY", "6"))
+        # Worker threads for asyncio.to_thread (i.e. for the blocking Sumtyme SDK
+        # call). MUST exceed forecast_concurrency, or the pool — not the gate —
+        # silently becomes the real concurrency limit. These threads are blocked on
+        # a socket, not burning CPU, so this is sized to the desired in-flight
+        # count rather than to vCPUs.
+        self.thread_pool_size = int(
+            os.environ.get("THREAD_POOL_SIZE", "16"))
 
 
 def _require(name: str) -> str:
@@ -619,20 +639,61 @@ def _tagged_to_wire(tev: TaggedChainEvent) -> dict:
 
 async def amain() -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        # Configurable so DEBUG (the `forecast OK` heartbeat, and the audit
+        # writer's flush lines) can be turned on without a code change. Without
+        # this you cannot distinguish "forecasting fine, conditions never met"
+        # from "not forecasting at all" — two very different problems.
+        level=getattr(
+            logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     cfg = Config()
     proc = SignalProcess(cfg)
 
+    loop = asyncio.get_running_loop()
+
+    # --- Size the thread pool for I/O-bound work ---
+    # asyncio.to_thread() uses the loop's DEFAULT executor, which Python sizes
+    # min(32, cpu_count + 4) — that is 6 on a 2-vCPU box. Every Sumtyme forecast
+    # runs in one of those threads, so the default silently caps forecast
+    # concurrency at 6 REGARDLESS of FORECAST_CONCURRENCY. Measured directly:
+    #
+    #     N=1 -> 0.12 calls/s   N=4 -> 0.27 calls/s
+    #     N=6 -> 0.36 calls/s   N=8 -> 0.24 calls/s   <-- COLLAPSES past the cap
+    #
+    # The N=8 collapse is not Sumtyme saturating; it is two calls queueing for a
+    # thread while six run. The cpu_count+4 heuristic is tuned for CPU-BOUND work
+    # and is simply the wrong model here: these threads spend their whole life
+    # BLOCKED ON A SOCKET waiting for Sumtyme, burning no CPU. Sizing them against
+    # vCPUs makes no sense — size them against how many calls we want in flight.
+    #
+    # Kept comfortably above FORECAST_CONCURRENCY so the ForecastGate (not the
+    # executor) is what actually bounds concurrency. The gate is the intentional
+    # limit; the pool should never be the thing silently deciding it.
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=cfg.thread_pool_size,
+        thread_name_prefix="forecast",
+    )
+    loop.set_default_executor(executor)
+    log.info(
+        "thread pool: %d workers (default would be %d = min(32, cpu_count+4); "
+        "forecasts are I/O-bound, so this is sized to the desired in-flight "
+        "count, not to vCPUs)",
+        cfg.thread_pool_size, min(32, (os.cpu_count() or 1) + 4),
+    )
+
     # Graceful shutdown on SIGTERM/SIGINT so in-flight bars finish and Kafka
     # offsets/pool close cleanly.
-    loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGTERM, os_signal.SIGINT):
         loop.add_signal_handler(sig, lambda: proc._stop.set())
 
-    await proc.start()
-    await proc.run()
+    try:
+        await proc.start()
+        await proc.run()
+    finally:
+        # Don't wait on threads stuck in a hung SDK call — the SDK exposes no
+        # request timeout, so a wedged socket would hang shutdown forever.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

@@ -1,44 +1,46 @@
 """
 producer/forecast_gate.py — global concurrency gate for the Sumtyme API.
 
-WHY THIS EXISTS. Sumtyme processes concurrent requests SEQUENTIALLY server-side:
-send it 10 calls at once and it runs them one after another, returning each as it
-finishes. So client-side parallelism buys NOTHING — it just moves the queue from
-our process into theirs.
+WHY THIS EXISTS. The Sumtyme forecast call is the throughput bottleneck of the
+entire pipeline, and its behaviour under concurrency is NON-OBVIOUS. Measured on
+the live VM with a 5000-row window:
 
-Worse, it actively harms us. Once per-symbol workers were introduced, up to 10
-forecasts were in flight at once. Each waits behind the others in Sumtyme's
-internal queue, so the LAST one's latency is ~10x the single-call latency. Our
-asyncio.wait_for then killed it at the timeout — after Sumtyme had ALREADY SPENT
-the compute. We paid for work, discarded the result, and skipped the bar
-(observed: 1145 forecast TIMEOUTs, zero errors — the signature of queueing, not
-failure). Throughput was therefore WORSE than serial.
+    N=1  ->  8.13s/call | 0.12 calls/sec
+    N=4  ->  3.73s/call | 0.27 calls/sec
+    N=6  ->  2.75s/call | 0.36 calls/sec   <-- PEAK
+    N=8  ->  4.23s/call | 0.24 calls/sec   <-- COLLAPSES
 
-THE FIX. Hold a single global permit. Only one forecast is in flight at a time, so
-the wait happens HERE, in our process, where it is cheap and cancellable, rather
-than in Sumtyme's queue, where it burns capacity on results we will throw away.
-A call that starts is a call that completes.
+Two things follow, and both matter:
 
-WHAT THIS IS NOT. It does not make forecasting faster — nothing client-side can,
-because the upstream is serial. It stops us making it SLOWER, and it restores the
-meaning of the timeout: with the gate, forecast_timeout_s measures Sumtyme's
-actual compute time, not time spent queued behind our own other requests.
+1. It DOES parallelise — but SUBLINEARLY. Four concurrent calls take ~15s, not
+   ~32s (serial) and not ~8s (perfect). So concurrency helps, up to a point.
 
-THE CEILING. Throughput is now exactly:
+2. Past the peak, throughput COLLAPSES. Too many in-flight calls queue up, blow
+   the client timeout, and get discarded AFTER the server already spent the
+   compute — we pay for work and throw the result away. That is strictly worse
+   than never sending them. (Historically: 10 uncapped in-flight calls produced
+   1145 timeouts and ZERO errors — the signature of queueing, not failure.)
 
-    max forecasts/sec = 1 / L        (L = single-call latency)
+The gate holds the in-flight count at the measured sweet spot. Waiting HERE is
+free and cancellable; waiting in the API's queue is not.
 
-That is a property of the UPSTREAM, not of this code. If demand (forecast-eligible
-bars/sec across all symbols and rungs) exceeds 1/L, the backlog grows without
-bound no matter what we do here — see Little's Law, and see the capacity numbers
-this module logs. The levers at that point are product ones: fewer symbols, fewer
-forecasting rungs, or more parallelism from Sumtyme (higher tier / batch endpoint /
-multiple keys). This module MEASURES that ceiling so the decision is data-driven.
+CAVEAT ON THE N=8 COLLAPSE. It was partly an artifact of the default asyncio
+thread pool: to_thread uses an executor sized min(32, cpu_count + 4) = 6 on a
+2-vCPU box, so N=8 could never actually have 8 calls in flight. signal_process now
+raises that pool (THREAD_POOL_SIZE) so the GATE, not the executor, is the binding
+constraint. RE-BENCHMARK past 6 with the larger pool before assuming 6 is the true
+ceiling — the real limit may be higher.
 
-WHY THE PER-SYMBOL WORKERS STILL EARN THEIR KEEP. The gate serialises only the
-Sumtyme call. Everything else — buffer appends, dataframe construction, the chain
-state machine, DB writes, Kafka publishing — still runs concurrently across
-symbols. Only the genuinely serial resource is serialised.
+CAPACITY. Throughput is `concurrency / latency`, and this module measures both so
+the number is never guessed. If demand (forecast-eligible bars/sec across all
+symbols and rungs) exceeds capacity, the backlog grows WITHOUT BOUND — no
+client-side change fixes that, and the levers become product ones: fewer symbols,
+fewer forecasting rungs, more vCPUs, or a faster API tier.
+
+WHY THE PER-SYMBOL WORKERS STILL EARN THEIR KEEP. The gate bounds only the Sumtyme
+call. Everything else — buffer appends, dataframe construction, the chain state
+machine, DB writes, Kafka publishing — still runs concurrently across symbols. Only
+the genuinely contended resource is bounded.
 """
 from __future__ import annotations
 
@@ -134,7 +136,11 @@ class ForecastGate:
         p50 = lat[n // 2]
         p95 = lat[min(n - 1, int(n * 0.95))]
         mean_wait = sum(self._waits) / len(self._waits) if self._waits else 0.0
-        capacity = (1.0 / p50) if p50 > 0 else float("inf")
+        # Capacity = concurrency / latency, NOT 1 / latency. With N calls in
+        # flight, N complete every ~p50 seconds. (This was 1/p50 when the gate was
+        # built on the mistaken belief that Sumtyme serialised everything — that
+        # formula understates true throughput by a factor of `concurrency`.)
+        capacity = (self.concurrency / p50) if p50 > 0 else float("inf")
         log.info(
             "forecast gate: calls=%d timeouts=%d errors=%d | latency p50=%.2fs "
             "p95=%.2fs | mean permit wait=%.2fs | CAPACITY≈%.2f forecasts/sec "
@@ -142,6 +148,15 @@ class ForecastGate:
             self._calls, self._timeouts, self._errors, p50, p95, mean_wait,
             capacity, self.concurrency,
         )
+        if mean_wait > 5 * p50 and p50 > 0:
+            log.warning(
+                "forecast gate: mean permit wait (%.1fs) is >5x call latency "
+                "(%.1fs) — bars are queueing far longer than they take to "
+                "process. DEMAND EXCEEDS CAPACITY: the backlog will grow without "
+                "bound. Raise FORECAST_CONCURRENCY (re-benchmark first), or cut "
+                "demand (fewer symbols / fewer forecasting rungs).",
+                mean_wait, p50,
+            )
         if self._timeouts > 0 and self._timeouts / max(1, self._calls) > 0.10:
             log.warning(
                 "forecast gate: %.0f%% of calls TIMED OUT. With the gate held at "
@@ -160,7 +175,8 @@ class ForecastGate:
             "timeouts": self._timeouts,
             "errors": self._errors,
             "latency_p50_s": round(p50, 3),
-            "capacity_per_s": round(1.0 / p50, 3) if p50 > 0 else None,
+            "capacity_per_s": round(
+                self.concurrency / p50, 3) if p50 > 0 else None,
             "mean_permit_wait_s": round(
                 sum(self._waits) / len(self._waits), 3) if self._waits else 0.0,
             "concurrency": self.concurrency,
