@@ -68,7 +68,7 @@ ASSET_CONFIGS = {
     },
     "equity": {
         "symbols": [
-            "AAPL"
+            # "AAPL"
         ],
         "timeframes": list(TWO_LADDER_TIMEFRAMES),
         "points": 5000,
@@ -225,7 +225,7 @@ VENUE_ENDPOINTS = {
 # ---------------------------------------------------------------------------
 STRATEGIES = {
     "two_ladder": {
-        "enabled": True,
+        "enabled": False,
         # Non-crypto only: two_ladder's sub-minute rungs (5s/10s/30s) can't be
         # sourced for crypto from this host (Binance futures ws is IP-blocked;
         # REST klines don't go sub-minute). Resolved just below the dict to the
