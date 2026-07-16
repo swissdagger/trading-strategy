@@ -54,6 +54,7 @@ TRADE MANAGEMENT
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Optional
 
 from execution.signal_writer import SignalWriter
@@ -62,6 +63,12 @@ from strategy.chain_history import ChainHistoryView, ChainLifecycle
 from strategy.ladder_registry import Ladder
 
 log = logging.getLogger("strategy.four_chain")
+
+# How often (in trigger evaluations per symbol) to emit the INFO funnel summary.
+# The per-gate reject reasons are logged at DEBUG (too chatty for INFO), but this
+# periodic summary surfaces the shape of the funnel at INFO so you can see WHERE
+# entries are being lost without turning on DEBUG. Set to 1 to log every trigger.
+_FUNNEL_SUMMARY_EVERY = 25
 
 
 def _side(direction: int) -> TradeSide:
@@ -80,6 +87,11 @@ class FourChainEntry:
         self.writer = writer
         self._L_3M = ladder.level_of("3m")
         self._L_15M = ladder.level_of("15m")
+        # Funnel visibility: counts, per symbol, how many triggers reached each
+        # stage and where they were vetoed. Keyed by a short stage label. This is
+        # in-memory only (resets on restart) — it exists to answer "the pipeline
+        # is healthy but no signals appear: WHERE is the entry logic stopping?".
+        self._funnel: Counter[str] = Counter()
 
     async def on_event(
         self, *, symbol: str, asset_class: str, chain_id: str, event_type: str,
@@ -94,17 +106,26 @@ class FourChainEntry:
         some direction d. That chain is the candidate 'fourth' confirming chain.
         """
         # Self-filter: only a chain reaching 3m is a candidate trigger. This is
-        # the candidate chain_conf.
+        # the candidate chain_conf. (Not counted in the funnel — the vast
+        # majority of events are sub-3m and would drown the signal.)
         if propagation_level < self._L_3M:
             return None
         # Terminations aren't triggers.
         if event_type == "chain_terminated":
             return None
 
+        # A genuine 3m+ trigger — the entry to the funnel. Everything from here is
+        # a candidate ENTER; the gates below decide whether it becomes one.
+        self._funnel["trigger"] += 1
+        log.debug(
+            "four_chain TRIGGER %s dir=%d conf=%s level=%d ts=%s",
+            symbol, direction, chain_id, propagation_level, timestamp,
+        )
+
         d = direction
         conf = self.view.chain(symbol, chain_id)
         if conf is None:
-            return None   # trigger not yet folded; nothing to reason over
+            return self._veto(symbol, "conf_not_folded")   # trigger not yet folded
         conf_start = conf.first_seen
 
         # --- Find prime + init and the two failures that satisfy the full
@@ -115,8 +136,12 @@ class FourChainEntry:
         match = self._match_pattern(symbol, d, conf_start=conf_start,
                                     conf_chain_id=chain_id)
         if match is None:
-            return None
+            # The initiation pattern (2 same-dir 15m chains + 2 distinct opposing
+            # failures, correctly start-ordered) did not form. This is the gate
+            # that vetoes most often in a quiet market.
+            return self._veto(symbol, "no_init_pattern")
         prime, init = match
+        self._funnel["init_pattern_ok"] += 1
 
         # --- Confirmation: at least one chain OTHER THAN chain_conf is currently
         #     open in direction d (the 'evolving directional move' check). The
@@ -127,8 +152,10 @@ class FourChainEntry:
             if r.chain_id != chain_id
         ]
         if not open_same:
-            return None
+            return self._veto(symbol, "no_open_same_dir")
 
+        # All gates passed.
+        self._funnel["entered"] += 1
         # All conditions met -> ENTER. The confirming (trigger) chain is the
         # position's prime chain — its full propagation to 1h is the target.
         pkey = await self.writer.emit_entry(
@@ -145,6 +172,31 @@ class FourChainEntry:
             symbol, d, chain_id, prime.chain_id, init.chain_id,
         )
         return pkey
+
+    def _veto(self, symbol: str, stage: str) -> None:
+        """Record that a trigger was rejected at `stage`, log it at DEBUG, and
+        every _FUNNEL_SUMMARY_EVERY triggers emit an INFO summary of the funnel
+        so the shape is visible without DEBUG. Always returns None so callers can
+        `return self._veto(...)` inline. This changes NO decision logic — it only
+        observes the existing return-None branches.
+        """
+        self._funnel[f"veto:{stage}"] += 1
+        log.debug("four_chain VETO %s at %s", symbol, stage)
+        triggers = self._funnel["trigger"]
+        if triggers % _FUNNEL_SUMMARY_EVERY == 0:
+            # Render the funnel compactly: triggers, how many cleared the init
+            # pattern, how many entered, and the per-stage veto tally.
+            vetoes = {
+                k.split(":", 1)[1]: v
+                for k, v in sorted(self._funnel.items())
+                if k.startswith("veto:")
+            }
+            log.info(
+                "four_chain FUNNEL: triggers=%d init_ok=%d entered=%d vetoes=%s",
+                triggers, self._funnel["init_pattern_ok"],
+                self._funnel["entered"], vetoes,
+            )
+        return None
 
     def _match_pattern(
         self, symbol: str, direction: int, conf_start, conf_chain_id: str,
