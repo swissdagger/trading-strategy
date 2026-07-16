@@ -12,9 +12,13 @@ is passed in; these are thin async functions over it.
 """
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime
 from typing import Optional, Union
 from collections import deque
+
+log = logging.getLogger("producer.persistence")
 
 def _as_timestamptz(value: Union[str, datetime]) -> datetime:
     """Coerce a decision timestamp to a datetime for a timestamptz bind.
@@ -309,25 +313,69 @@ def make_insert_signal(pool):
         # not coerce it to the timestamptz column — binding it raw raises DataError
         # on every emit. Do not remove this. See _as_timestamptz.
         decided_at = _as_timestamptz(row["decided_at"])
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                INSERT INTO trade_signals
-                    (signal_id, position_key, chain_id, direction, action,
-                     symbol, asset_class, strategy, trigger_level, decision_price,
-                     exit_reason, decided_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                ON CONFLICT (signal_id) DO NOTHING
-                """,
-                row["signal_id"], row["position_key"], row["chain_id"],
-                row["direction"], row["action"], row["symbol"],
-                row["asset_class"], row.get("strategy", "two_ladder"),
-                row.get("trigger_level"),
-                row.get("decision_price"), row.get("exit_reason"),
-                decided_at,
+        # Visibility: log the ATTEMPT before the write, so a row that raises inside
+        # the INSERT (a schema/enum/NULL violation) is still traceable to its
+        # signal_id — the log line exists even if the write never returns. Kept at
+        # INFO because trade_signals writes are rare (one per decision) and are the
+        # PRODUCT: every one is worth a line while proving the path.
+        log.info(
+            "insert_signal ATTEMPT signal_id=%s action=%s %s/%s strategy=%s "
+            "decided_at=%s",
+            row["signal_id"], row["action"], row["symbol"],
+            row["position_key"], row.get("strategy", "two_ladder"),
+            decided_at.isoformat(),
+        )
+        t0 = time.perf_counter()
+        try:
+            async with pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    INSERT INTO trade_signals
+                        (signal_id, position_key, chain_id, direction, action,
+                         symbol, asset_class, strategy, trigger_level, decision_price,
+                         exit_reason, decided_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                    ON CONFLICT (signal_id) DO NOTHING
+                    """,
+                    row["signal_id"], row["position_key"], row["chain_id"],
+                    row["direction"], row["action"], row["symbol"],
+                    row["asset_class"], row.get("strategy", "two_ladder"),
+                    row.get("trigger_level"),
+                    row.get("decision_price"), row.get("exit_reason"),
+                    decided_at,
+                )
+        except Exception:
+            # An exception here is exactly the failure mode that once killed the
+            # pipeline silently. Log it WITH the signal_id and re-raise unchanged —
+            # the caller's error handling is unchanged, we've only made the failure
+            # visible. Do not swallow: swallowing would hide a broken write behind
+            # a "no rows" symptom, which is what we're trying to eliminate.
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            log.exception(
+                "insert_signal FAILED signal_id=%s action=%s %s after %.1fms — "
+                "the trade_signals write raised; row NOT persisted",
+                row["signal_id"], row["action"], row["symbol"], elapsed_ms,
             )
+            raise
+        elapsed_ms = (time.perf_counter() - t0) * 1000
         # asyncpg returns 'INSERT 0 1' on insert, 'INSERT 0 0' on conflict-skip.
-        return result.endswith(" 1")
+        newly = result.endswith(" 1")
+        if newly:
+            log.info(
+                "insert_signal OK signal_id=%s action=%s %s — ROW WRITTEN (%.1fms)",
+                row["signal_id"], row["action"], row["symbol"], elapsed_ms,
+            )
+        else:
+            # Not an error: the deterministic signal_id already existed (a replay or
+            # a re-read of the same decision). Logged at INFO so an idempotent skip
+            # is DISTINGUISHABLE from "nothing happened" while proving the path —
+            # under normal steady-state this could drop to DEBUG.
+            log.info(
+                "insert_signal SKIP signal_id=%s action=%s %s — already present "
+                "(idempotent, %.1fms)",
+                row["signal_id"], row["action"], row["symbol"], elapsed_ms,
+            )
+        return newly
     return insert_signal
 
 def make_load_open_positions(pool):
