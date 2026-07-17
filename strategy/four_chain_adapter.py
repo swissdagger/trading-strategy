@@ -23,7 +23,9 @@ runtime expect. The history view is SHARED between the entry and exit adapters
 ## Event shape
 
 The runtime passes a TaggedChainEvent-like object with: symbol, asset_class,
-chain_id, event_type, direction, propagation_level, timestamp. (This strategy
+chain_id, event_type, direction, propagation_level, timestamp, and (on live
+events) decision_price — read defensively via getattr, since replayed events
+predating the field may lack it. (This strategy
 ignores the A/B `set` tag — it's on its own ladder.) The entry adapter folds
 every event into the history; the exit adapter does not fold (the entry adapter
 already did for this event, under the same per-symbol lock).
@@ -79,13 +81,23 @@ class FourChainExitAdapter:
     async def maybe_emit_exit(
         self, *, symbol: str, asset_class: str, chain_prime_id: str,
         trade_direction: int, decided_at: str,
+        decision_price: Optional[float] = None,
     ) -> Optional[str]:
+        # decision_price is part of the ExitComponent protocol: the runtime's
+        # exit sweep ALWAYS passes it (multi_runtime._sweep_exits), and both
+        # TwoLadderExit and the inner FourChainExit already accept it. This
+        # adapter omitting it made every four_chain exit evaluation raise
+        # TypeError — caught per-position by the sweep, so the position stayed
+        # tracked forever and a four_chain EXIT row could never be written.
+        # Accept it and forward it so the EXIT's decision price lands in
+        # trade_signals.decision_price, per migration 004's contract.
         return await self._exit.maybe_emit_exit(
             symbol=symbol,
             asset_class=asset_class,
             chain_prime_id=chain_prime_id,
             trade_direction=trade_direction,
             decided_at=decided_at,
+            decision_price=decision_price,
         )
 
 

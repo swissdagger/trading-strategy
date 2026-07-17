@@ -35,6 +35,16 @@ small recently-seen set to suppress the most common duplicate (fast-path then
 immediate sweep), but that is an optimisation, not the correctness boundary —
 the handler is.
 
+## The dispatched row carries `strategy`
+
+Both SELECTs include the strategy column (migration 011). This is load-bearing
+for the executor: it keys live trades by (strategy, position_key), and its
+handler falls back to 'two_ladder' when the field is absent — so omitting the
+column here silently mislabeled every non-two_ladder signal, falsifying
+trades.strategy provenance and defeating 011's cross-strategy collision
+protection. If a column is ever added to the signal contract that a consumer
+matches on, it must be added to BOTH SELECTs below.
+
 ## Cursor semantics
 
 The cursor is a created_at timestamp (the row's DB-write time, migration 004's
@@ -254,7 +264,7 @@ class SignalListener:
         rows = await self._pool.fetch(
             """
             SELECT signal_id, position_key, chain_id, direction, action,
-                   symbol, asset_class, trigger_level, decision_price,
+                   symbol, asset_class, strategy, trigger_level, decision_price,
                    exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE created_at >= $1
@@ -277,7 +287,7 @@ class SignalListener:
         row = await self._pool.fetchrow(
             """
             SELECT signal_id, position_key, chain_id, direction, action,
-                   symbol, asset_class, trigger_level, decision_price,
+                   symbol, asset_class, strategy, trigger_level, decision_price,
                    exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE signal_id = $1
