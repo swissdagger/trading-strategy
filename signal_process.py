@@ -60,6 +60,7 @@ from producer.persistence import (
     # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
     make_load_buffers,
+    make_load_last_base_signal,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -371,6 +372,12 @@ class SignalProcess:
                 load_active_chains=make_load_active_chains(
                     self.pool, symbol, asset_class, timeframes),
                 load_buffers=make_load_buffers(self.pool, symbol, timeframes),
+                # Restore _last_base_signal from the signals table so a restart
+                # doesn't INIT a duplicate chain on the first baseline signal
+                # that merely CONTINUES the pre-restart direction. Baseline is
+                # ladder[0], per the hierarchy invariant.
+                load_last_base_signal=make_load_last_base_signal(
+                    self.pool, symbol, timeframes[0]),
                 # Was omitted, so the machine silently used its 30s DEFAULT and
                 # SUMTYME_TIMEOUT_S had no effect on anything (the client
                 # constructor rejected the kwarg, so it was applied nowhere at
@@ -426,6 +433,16 @@ class SignalProcess:
             load_open_positions=load_open,
             save_open_position=save_open,
             remove_open_position=remove_open,
+            # Hydrate the shared two-ladder ChainView from the chains table on
+            # startup. This was imported but never wired, so the view booted
+            # EMPTY after every restart — and a chain already at its ladder's
+            # top never emits another propagate event (seed_active's docstring
+            # names exactly this), so restored open positions whose prime had
+            # reached 10m could never fire their TARGET exit, and entries were
+            # suppressed until Set B chains happened to re-emit. The loader,
+            # the hook field, and seed_active all existed; only this line was
+            # missing.
+            load_chain_view_seed=make_load_chain_view_seed(self.pool),
         )
 
     async def _publish(self, raw: dict) -> None:

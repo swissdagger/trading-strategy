@@ -121,6 +121,12 @@ class ServiceTwoChainMachine(ChainMachine):
         persist_chain_terminate: PersistChainTerminate,
         load_active_chains: Optional[Callable[[], Awaitable[List[dict]]]] = None,
         load_buffers: Optional[Callable[[], Awaitable[Dict[str, deque]]]] = None,
+        # Restores _last_base_signal on hydrate (newest non-zero baseline signal
+        # from the signals table). Optional so tests/standalone machines that
+        # don't wire DB hydration keep working; without it the first non-zero
+        # baseline signal after a restart always INITs, even if it continues the
+        # pre-restart direction (a duplicate same-direction chain).
+        load_last_base_signal: Optional[Callable[[], Awaitable[Optional[int]]]] = None,
         forecast_timeout_s: float = 30.0,
         forecast_gate: Optional["ForecastGate"] = None,
     ):
@@ -139,6 +145,7 @@ class ServiceTwoChainMachine(ChainMachine):
         self._persist_term = persist_chain_terminate
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
+        self._load_last_base_signal = load_last_base_signal
         self._forecast_timeout_s = forecast_timeout_s
         # SHARED across every machine in the process — see ForecastGate. Sumtyme
         # serialises concurrent calls server-side, so we hold a single global
@@ -191,6 +198,23 @@ class ServiceTwoChainMachine(ChainMachine):
                 self._active_chains[chain["chain_id"]] = chain
             log.info("hydrated %d active chains for %s/%s",
                      len(self._active_chains), self.symbol, self.baseline_timeframe)
+        if self._load_last_base_signal is not None:
+            # Restore the "last non-zero baseline signal" invariant so the first
+            # live baseline signal after a restart only INITs on a genuine
+            # direction change, not unconditionally. A failure here must not
+            # block hydration: falling back to None just reproduces the old
+            # (duplicate-INIT-prone) behaviour, which is strictly survivable.
+            try:
+                self._last_base_signal = await self._load_last_base_signal()
+                log.info("hydrated last base signal for %s/%s: %s",
+                         self.symbol, self.baseline_timeframe,
+                         self._last_base_signal)
+            except Exception as e:
+                log.warning(
+                    "last-base-signal hydrate failed for %s/%s (continuing with "
+                    "None; first baseline signal will INIT unconditionally): %r",
+                    self.symbol, self.baseline_timeframe, e,
+                )
         self._hydrated = True
 
     async def on_bar(self, bar: OHLCPoint) -> List[ChainEvent]:
