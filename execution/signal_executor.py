@@ -533,6 +533,22 @@ class SignalExecutor:
             return
 
         reason = row.get("exit_reason") or "MANUAL"
+        # INTERLOCK (remove in the partial-exit rollout step): this executor
+        # closes the WHOLE remaining position on any EXIT. A SCALE tranche
+        # (migration 016, fraction < 1) reaching it would flatten the position
+        # at the first 0.05 tranche — a silent 20x over-close. Refuse loudly
+        # instead; the signal row is durable, so once partial support ships the
+        # catch-up sweep can still act on it if the position remains open.
+        fraction = row.get("fraction")
+        if reason == "SCALE" or (fraction is not None and float(fraction) < 1.0):
+            self._mincr("exits_refused_partial_unsupported")
+            log.error(
+                "partial EXIT %s (reason=%s fraction=%s) for %s/%s but this "
+                "executor has no partial-exit support — refusing (deploy-order "
+                "guard; enable the strategy only after the executor upgrade)",
+                row.get("signal_id"), reason, fraction, strategy, position_key,
+            )
+            return
         # Issue the protective exit at rung 0 (the base cap). The escalation
         # driver escalates from here if it doesn't fill within the window.
         trade.exit_reason = reason

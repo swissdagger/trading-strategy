@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, Union
 from collections import deque
 
@@ -333,8 +334,8 @@ def make_insert_signal(pool):
                     INSERT INTO trade_signals
                         (signal_id, position_key, chain_id, direction, action,
                          symbol, asset_class, strategy, trigger_level, decision_price,
-                         exit_reason, decided_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                         exit_reason, fraction, decided_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                     ON CONFLICT (signal_id) DO NOTHING
                     """,
                     row["signal_id"], row["position_key"], row["chain_id"],
@@ -342,6 +343,14 @@ def make_insert_signal(pool):
                     row["asset_class"], row.get("strategy", "two_ladder"),
                     row.get("trigger_level"),
                     row.get("decision_price"), row.get("exit_reason"),
+                    # fraction (migration 016): portion of the position this
+                    # signal concerns; 1.0 = whole position, the pre-016
+                    # semantics and the default for writers that don't set it.
+                    # Bound via Decimal(str(...)) so the NUMERIC(5,4) column
+                    # receives the schedule's exact decimal (0.05, 0.35, ...),
+                    # not a binary-float approximation — the consumer's
+                    # cumulative-fraction arithmetic relies on exactness.
+                    Decimal(str(row.get("fraction", 1.0))),
                     decided_at,
                 )
         except Exception:

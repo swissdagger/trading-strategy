@@ -48,41 +48,24 @@ def position_key(chain_id: str, side: TradeSide) -> str:
 def _signal_id(strategy: str, position_key_: str, action: str, discriminator: str) -> str:
     """Deterministic signal id. Same logical decision -> same id.
 
-    Includes `strategy`: two strategies can decide on the same chain (same
+    Now includes `strategy`: two strategies can decide on the same chain (same
     position_key + action), and their signals MUST be distinct rows, not
-    deduped into one.
+    deduped into one. Folding strategy into the hash makes the id distinct per
+    strategy while staying deterministic (same strategy + decision -> same id,
+    so replays still dedupe within a strategy). Pre-multi-strategy ids used
+    strategy 'two_ladder'; that value reproduces the original ids for that
+    strategy, so its historical dedupe behaviour is unchanged.
 
-    SCHEME v2 (sig2): the discriminator now carries `decided_at` (the deciding
-    event's timestamp) for BOTH actions — decided_at alone for ENTER,
-    "{reason}|{decided_at}" for EXIT. Why:
-
-      * The v1 discriminator was empty for ENTER ("one per position"), but the
-        strategies genuinely permit ENTER -> EXIT -> re-ENTER cycles on the
-        same (chain_id, side): two_ladder can re-trigger on a still-live prime
-        after a STOP's opposing chain terminates, and four_chain re-triggers on
-        every propagation >= 3m of the same conf chain. Under v1 the second
-        ENTER hashed to the SAME id and was silently swallowed by ON CONFLICT
-        DO NOTHING — no row, no NOTIFY, executor never re-entered — while the
-        runtime re-tracked the position in memory. (load_open_positions
-        explicitly anticipates re-entry; v1 made that history unrepresentable.)
-
-      * decided_at is the EVENT's timestamp (derived from the bar), not wall
-        clock — so a Kafka replay of the same decision reproduces the same
-        decided_at and the same id, preserving replay idempotency exactly.
-        A genuine re-entry decided on a LATER event gets a distinct id.
-
-      * Same reasoning for EXIT: enter/exit/re-enter/exit-again with the same
-        reason must yield two EXIT rows, not one.
-
-    DEPLOY NOTE: rows written under v1 keep their sig1.* ids. A post-deploy
-    replay of a PRE-deploy decision generates a fresh sig2.* id and therefore a
-    duplicate row for that one decision — deploy at a committed-offset boundary
-    (or accept the bounded one-time duplicate window; consumers dedupe by
-    signal_id, so a duplicate row is acted on at most once more, idempotently,
-    by the executor's DB/venue-level dedupe).
+    discriminator distinguishes signals sharing (strategy, position_key, action)
+    — empty for ENTER (one per position), the exit reason for EXIT, and
+    "REASON:k" for a scale-out tranche at offset k (a position emits up to
+    seven SCALE exits; without k in the discriminator they would all hash to
+    ONE id and ON CONFLICT DO NOTHING would silently swallow six of them).
+    Reasons without a tranche hash exactly as before, so every historical id
+    is unchanged.
     """
-    raw = f"sig2|{strategy}|{position_key_}|{action}|{discriminator}"
-    return "sig2." + hashlib.sha256(raw.encode()).hexdigest()[:32]
+    raw = f"sig1|{strategy}|{position_key_}|{action}|{discriminator}"
+    return "sig1." + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 @dataclass
@@ -123,10 +106,7 @@ class SignalWriter:
         Returns the position_key the consumer will track this position by (and
         which a later exit must reference)."""
         pkey = position_key(chain_id, side)
-        # decided_at in the discriminator: distinguishes a genuine re-ENTER of
-        # the same position (later event, new id) from a replay of THIS decision
-        # (same event timestamp, same id -> dedupes). See _signal_id.
-        sig_id = _signal_id(self.strategy, pkey, "ENTER", decided_at)
+        sig_id = _signal_id(self.strategy, pkey, "ENTER", "")
         row = {
             "signal_id": sig_id,
             "position_key": pkey,
@@ -139,6 +119,10 @@ class SignalWriter:
             "trigger_level": trigger_level,
             "decision_price": decision_price,
             "exit_reason": None,
+            # An ENTER always establishes the WHOLE position (migration 016
+            # enforces this with a CHECK). Carried explicitly so the row shape
+            # is uniform across actions for the insert path.
+            "fraction": 1.0,
             "decided_at": decided_at,
         }
         newly = await self.hooks.insert_signal(row)
@@ -160,16 +144,44 @@ class SignalWriter:
         decided_at: str,
         decision_price: Optional[float] = None,
         trigger_level: Optional[int] = None,
+        fraction: float = 1.0,
+        tranche: Optional[int] = None,
     ) -> str:
         """Emit an EXIT signal: references an existing position by key and asks
-        to close it. The consumer matches position_key to the open position it
-        tracks; if it has no such open position, it logs a reconciliation gap
-        (the table carries enough to detect it — see 004's note). Returns the
-        position_key."""
+        to close FRACTION of it (default 1.0 — the whole position, exactly the
+        pre-016 semantics; existing strategies call this unchanged). The
+        consumer matches position_key to the open position it tracks; if it has
+        no such open position, it logs a reconciliation gap (the table carries
+        enough to detect it — see 004's note). Returns the position_key.
+
+        fraction is of the position's ORIGINAL size, in (0, 1].
+
+        tranche is the scale-out offset k (levels past entry) and is REQUIRED
+        for SCALE: it is folded into the deterministic signal_id so each of a
+        position's tranches is a distinct row. Without it, seven SCALE emits
+        would collapse to one signal_id and ON CONFLICT DO NOTHING would
+        silently drop six tranches — the single most dangerous quiet failure in
+        the scale-out design, so it is a loud ValueError here at the source,
+        not a downstream surprise. TERMINAL (close the remainder) takes no
+        tranche: there is exactly one per position, and its idempotency wants
+        exactly that — a replay after a crash must dedupe to the same id.
+        """
+        if not (0 < fraction <= 1.0):
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        if reason == ExitReason.SCALE:
+            if tranche is None or tranche < 1:
+                raise ValueError(
+                    f"SCALE exit requires tranche >= 1 (levels past entry), got {tranche!r}"
+                )
+        elif tranche is not None:
+            raise ValueError(
+                f"tranche is only meaningful for SCALE exits, got {reason.value}:{tranche}"
+            )
+        discriminator = (
+            f"{reason.value}:{tranche}" if tranche is not None else reason.value
+        )
         pkey = position_key(chain_id, side)
-        # reason AND decided_at: a re-entered position exiting for the same
-        # reason as its previous life must produce a new row. See _signal_id.
-        sig_id = _signal_id(self.strategy, pkey, "EXIT", f"{reason.value}|{decided_at}")
+        sig_id = _signal_id(self.strategy, pkey, "EXIT", discriminator)
         row = {
             "signal_id": sig_id,
             "position_key": pkey,
@@ -182,12 +194,13 @@ class SignalWriter:
             "trigger_level": trigger_level,
             "decision_price": decision_price,
             "exit_reason": reason.value,
+            "fraction": fraction,
             "decided_at": decided_at,
         }
         newly = await self.hooks.insert_signal(row)
         if newly:
-            log.info("EXIT signal %s position=%s %s reason=%s",
-                     sig_id, pkey, symbol, reason.value)
+            log.info("EXIT signal %s position=%s %s reason=%s fraction=%s tranche=%s",
+                     sig_id, pkey, symbol, reason.value, fraction, tranche)
         else:
             log.debug("EXIT signal %s already emitted (idempotent skip)", sig_id)
         return pkey
