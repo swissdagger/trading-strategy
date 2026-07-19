@@ -47,7 +47,7 @@ from aiokafka import TopicPartition
 from execution.signal_writer import SignalWriter, SignalWriterHooks
 from producer.async_writer import BatchedAuditWriter
 from producer.fanout_router_multi import MultiLadderRouter
-from producer.forecast_gate import ForecastGate
+from producer.forecast_gate import ForecastGate, ForecastMemo
 from producer.offset_tracker import OffsetTracker
 from producer.symbol_workers import SymbolWorkerPool
 from producer.persistence import (
