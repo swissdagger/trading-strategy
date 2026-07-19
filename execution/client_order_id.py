@@ -32,12 +32,19 @@ FORMAT (single line, venue-safe charset only):
                    money. (See length budget note below.)
   * intent       — "E" (entry) or "X" (exit). One position has exactly one entry
                    but may have several exits over the escalation ladder.
-  * rung         — escalation rung, 0 for entries and first-attempt exits,
-                   incrementing per exit re-issue. Distinguishes the ladder's
-                   successive close orders so each is a DISTINCT venue order with
-                   a DISTINCT id (required — re-issuing a cancelled exit at a
+  * rung         — for entries: always 0. For exits, a STRIDED value
+                   (migration 017): rung = tranche_block * 100 + escalation,
+                   where tranche_block is 0 for whole-position closes (TERMINAL
+                   and every legacy reason — so those rungs are 0, 1, 2..., 
+                   byte-identical to the pre-017 scheme) and the batch's
+                   trigger_level for a SCALE tranche order. The escalation
+                   component increments per exit re-issue within its block.
+                   Each (block, escalation) is a DISTINCT venue order with a
+                   DISTINCT id (required — re-issuing a cancelled exit at a
                    wider cap is a NEW order, and must not collide with the
-                   cancelled one's id).
+                   cancelled one's id). The parse pattern below is unchanged:
+                   it already accepts multi-digit rungs, and consumers that
+                   need the components split them with // 100 and % 100.
 
 Uniqueness contract: (trade_id, intent, rung) is globally unique by
 construction, so the id is too. Entry: rung is always 0 (there is only ever one

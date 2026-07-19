@@ -42,6 +42,7 @@ one in-memory key. DEFAULT_STRATEGY below only documents the column's default.
 """
 from __future__ import annotations
 
+import json
 import logging
 from decimal import Decimal
 from typing import Optional
@@ -95,17 +96,29 @@ def make_persist_trade(pool: asyncpg.Pool):
                 INSERT INTO trades
                     (trade_id, chain_id, symbol, asset_class, side, state,
                      entry_client_order_id, entry_target_qty, entry_filled_qty,
-                     exit_filled_qty, strategy, last_updated)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+                     exit_filled_qty, strategy, scale_banked, exit_reason,
+                     last_updated)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12::jsonb, $13, now())
                 ON CONFLICT (chain_id, side) DO UPDATE SET
                     state             = EXCLUDED.state,
                     entry_filled_qty  = EXCLUDED.entry_filled_qty,
                     exit_filled_qty   = EXCLUDED.exit_filled_qty,
+                    scale_banked      = EXCLUDED.scale_banked,
+                    exit_reason       = EXCLUDED.exit_reason,
                     last_updated      = now()
                 """,
                 t.trade_id, chain_id, t.symbol, t.asset_class, t.side.value,
                 t.state, t.entry_client_order_id, t.target_qty, t.filled_qty,
                 t.exit_filled_qty, t.strategy,
+                # scale_banked: {trigger_level -> fraction}, both as STRINGS so
+                # the fractions stay exact decimals through JSON (a JSON number
+                # would round-trip through binary float). Empty for whole-exit
+                # strategies. exit_reason: the reason driving the current/last
+                # exit lifecycle (distinguishes closing-a-tranche from
+                # closing-for-good across a restart — migration 017).
+                json.dumps({str(k): str(v) for k, v in t.scale_banked.items()}),
+                t.exit_reason,
             )
     return persist_trade
 
@@ -276,6 +289,7 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 SELECT t.trade_id, t.chain_id, t.symbol, t.asset_class, t.side,
                        t.state, t.entry_client_order_id, t.entry_target_qty,
                        t.entry_filled_qty, t.exit_filled_qty, t.strategy,
+                       t.scale_banked::text AS scale_banked_json, t.exit_reason,
                        es.escalation_rung,
                        (EXTRACT(EPOCH FROM es.escalation_deadline) * 1000)::bigint
                            AS escalation_deadline_ms
@@ -303,6 +317,15 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 # NULL when no exit_state row exists yet; keep the field default (0).
                 exit_rung=r["escalation_rung"] if r["escalation_rung"] is not None else 0,
                 exit_deadline_ms=int(deadline_ms) if deadline_ms is not None else None,
+                # Scale-out state (migration 017): banked tranches back to
+                # {int level -> Decimal fraction} (stored as strings for
+                # exactness), and the driving exit reason — together these let
+                # a restarted executor tell a CLOSING tranche (returns to OPEN)
+                # from a CLOSING final (finalizes CLOSED), and recompute the
+                # scale deficit from durable state alone.
+                scale_banked={int(k): Decimal(v)
+                              for k, v in json.loads(r["scale_banked_json"] or "{}").items()},
+                exit_reason=r["exit_reason"],
             ))
         return out
     return load_open_trades

@@ -43,13 +43,15 @@ ASSET_CONFIGS = {
             "BTCUSDT",
             "ETHUSDT",
             "SOLUSDT",
-            "WLDUSDT",
             "BNBUSDT",
             "XRPUSDT",
-            "HYPEUSDT",
             "DOGEUSDT",
             "ADAUSDT",
             "LINKUSDT",
+            "LTCUSDT",
+            "NEARUSDT",
+            "AAVEUSDT",
+            "TRXUSDT"
         ],
         # The union of four_chain's ladder [1m,3m,5m,15m,1h] and
         # prior_failure_scaleout's PF ladder [1m..12h] — all >= 1m, all
@@ -278,7 +280,7 @@ STRATEGIES = {
     # Re-run warmup_process just before enabling so the PF buffers hydrate
     # fresh (a stale warmup leaves a gap between its last bar and live).
     "prior_failure_scaleout": {
-        "enabled": False,
+        "enabled": True,
         # Crypto-only, resolved below to the current crypto universe
         # (mirrors four_chain).
         "symbols": [],

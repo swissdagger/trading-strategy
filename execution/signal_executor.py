@@ -89,6 +89,22 @@ log = logging.getLogger("executor.signal")
 # on a long window. Kept well under a typical rung fill window.
 _EXIT_RETRY_MS = 2_000
 
+# --- Client-order-id rung stride for partial exits (migration 017) ---------
+# One trade can now run SEVERAL exit lifecycles (one per scale-out tranche
+# batch, plus a possible final close), each with its own escalation ladder.
+# The cv1 rung encodes both:  rung = tranche_block * 100 + escalation, where
+# tranche_block is the batch's trigger_level for SCALE orders and 0 for
+# whole-position closes (TERMINAL and every legacy reason). Block-0 rungs are
+# 0, 1, 2... — byte-identical to every pre-017 exit id, so history parses,
+# dedupes, and attributes unchanged. _esc() recovers the escalation component,
+# which is what the ExitCap ladder indexes on.
+_TRANCHE_STRIDE = 100
+
+
+def _esc(rung: int) -> int:
+    """The escalation component of a (possibly strided) exit rung."""
+    return rung % _TRANCHE_STRIDE
+
 
 # ---------------------------------------------------------------------------
 # Injected value types
@@ -120,6 +136,44 @@ class OpenTrade:
     # fill in its window). In-memory only; a trade re-loaded on restart defaults to
     # True (boot reconcile independently re-issues a vanished close order).
     exit_order_submitted: bool = True
+    # --- Scale-out state (migration 017; prior_failure_scaleout) ---
+    # Tranches ACCEPTED for this trade: {trigger_level -> fraction of the
+    # ORIGINAL position}. Presence of a level IS the replay dedupe. The map
+    # drives the DEFICIT model: desired exit = sum(fractions) * filled_qty;
+    # the executor issues orders for (desired - exit_filled_qty), which makes
+    # lot-size accumulation automatic (an unplaceable sliver stays as deficit
+    # and rides into the next tranche's order). Empty for whole-exit
+    # strategies. Persisted on every persist_trade.
+    scale_banked: Dict[int, Decimal] = None  # set in __post_init__
+    # --- Working-exit-cycle tracking (in-memory) ---
+    # The CURRENT exit order's quantity, and exit_filled_qty as of its issue.
+    # Together they answer "has the working order itself completed?" — needed
+    # because a SCALE tranche's deficit can GROW while its order works (new
+    # tranches banking), so 'deficit <= 0' alone would never end the cycle and
+    # the coalesced follow-up would wait on the escalation timer instead of
+    # issuing immediately. In-memory only: after a restart both default to 0,
+    # and the escalation driver's cancel-and-reissue path (which recomputes the
+    # deficit from durable state) is the recovery route for a mid-cycle crash.
+    exit_order_qty: Decimal = Decimal(0)
+    exit_cycle_base: Decimal = Decimal(0)
+
+    def __post_init__(self):
+        if self.scale_banked is None:
+            self.scale_banked = {}
+
+    @property
+    def exit_cycle_done(self) -> bool:
+        """True when the current working exit order has been filled in full
+        (fills since its issue cover its quantity)."""
+        return (self.exit_order_qty > 0
+                and self.exit_filled_qty - self.exit_cycle_base >= self.exit_order_qty)
+
+    @property
+    def closing_final(self) -> bool:
+        """While CLOSING: is this a FINAL close (finalizes CLOSED when filled)
+        rather than a scale tranche (returns to OPEN when filled)? Any reason
+        other than SCALE — TERMINAL and every legacy reason — closes for good."""
+        return self.exit_reason != ExitReason.SCALE.value
 
     @property
     def open_qty(self) -> Decimal:
@@ -202,6 +256,16 @@ class ExecutorHooks:
 
     # --- Global switches ---
     kill_switch_blocks: Callable[[], Awaitable[bool]]   # True => do not open new positions
+
+    # --- Venue quantity constraints (optional) ---
+    # (symbol, asset_class, qty) -> largest venue-valid qty <= input (respecting
+    # lot step / min qty / min notional), or 0 if the input is unplaceable.
+    # None => identity (no constraint knowledge; the adapter's own rejection is
+    # the backstop). Used by the scale-out path so a tranche below the venue
+    # minimum ACCUMULATES into the next tranche instead of being rejected —
+    # wire it from the venue's exchange-info filters when available.
+    quantize_exit_qty: Optional[
+        Callable[[str, str, Decimal], Awaitable[Decimal]]] = None
 
     # --- Clock (injectable so escalation deadlines are testable) ---
     now_ms: Callable[[], int] = None   # defaults to wall clock in __post_init__
@@ -505,6 +569,10 @@ class SignalExecutor:
         if trade.filled_qty > 0:
             trade.state = "OPEN"
             await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
+            # Tranches can have been banked while the entry was in flight (a
+            # catch-up replay, or a fast chain). Now there is a position for
+            # the deficit to act on.
+            await self._advance_scale(trade, key)
         else:
             trade.state = "SUBMITTED"
             await self.hooks.update_trade_state(trade.trade_id, "SUBMITTED", None)
@@ -525,34 +593,149 @@ class SignalExecutor:
         if trade.state in ("CLOSED", "REJECTED", "HALTED"):
             log.debug("EXIT for %s already terminal (%s) — skip", trade.trade_id, trade.state)
             return
-        if trade.state == "CLOSING":
-            # Already closing (a duplicate EXIT, or one arriving while the
-            # escalation driver works it). The working exit + ladder handle it;
-            # a second EXIT must not stack another order.
-            log.debug("EXIT for %s already CLOSING — skip (driver owns it)", trade.trade_id)
-            return
+        # NOTE: CLOSING is deliberately NOT a blanket skip any more. Whether a
+        # working exit absorbs, defers, or is superseded by this signal depends
+        # on the REASONS on both sides — routed below. (A SCALE tranche while a
+        # tranche works just banks and coalesces; a final close while a tranche
+        # works cancels and supersedes; a final close while a final close works
+        # keeps the original blanket-skip behaviour.)
 
         reason = row.get("exit_reason") or "MANUAL"
-        # INTERLOCK (remove in the partial-exit rollout step): this executor
-        # closes the WHOLE remaining position on any EXIT. A SCALE tranche
-        # (migration 016, fraction < 1) reaching it would flatten the position
-        # at the first 0.05 tranche — a silent 20x over-close. Refuse loudly
-        # instead; the signal row is durable, so once partial support ships the
-        # catch-up sweep can still act on it if the position remains open.
-        fraction = row.get("fraction")
-        if reason == "SCALE" or (fraction is not None and float(fraction) < 1.0):
-            self._mincr("exits_refused_partial_unsupported")
-            log.error(
-                "partial EXIT %s (reason=%s fraction=%s) for %s/%s but this "
-                "executor has no partial-exit support — refusing (deploy-order "
-                "guard; enable the strategy only after the executor upgrade)",
-                row.get("signal_id"), reason, fraction, strategy, position_key,
-            )
+
+        # --- SCALE: a partial-exit tranche (migration 016/017). Its own path:
+        # bank the tranche, then work the cumulative deficit as at most ONE
+        # exit order at a time. Never flattens the position.
+        if reason == ExitReason.SCALE.value:
+            await self._on_scale_exit(trade, key, row)
             return
-        # Issue the protective exit at rung 0 (the base cap). The escalation
-        # driver escalates from here if it doesn't fill within the window.
-        trade.exit_reason = reason
+
+        # --- Non-SCALE (TERMINAL + every legacy reason): close the WHOLE
+        # remaining position.
+        if trade.state == "CLOSING":
+            if trade.closing_final:
+                # Already closing for good (a duplicate EXIT, or one arriving
+                # while the escalation driver works it). The working exit +
+                # ladder handle it; a second EXIT must not stack another order.
+                log.debug("EXIT for %s already CLOSING — skip (driver owns it)", trade.trade_id)
+                return
+            # A SCALE tranche order is working, but a FINAL close supersedes
+            # it: the position must go flat, not shed 5%. Cancel the working
+            # tranche order (absorbing any fills it got before the cancel),
+            # then fall through to issue the full-remaining close in a fresh
+            # block-0 lifecycle. Cancel is idempotent on a terminal order.
+            log.info("final EXIT (%s) supersedes working SCALE tranche on %s — "
+                     "cancelling tranche order", reason, trade.trade_id)
+            await self._cancel_working_exit(trade)
+        reason_final = reason
+        trade.exit_reason = reason_final
+        await self.hooks.persist_trade(trade)   # durably record the driving reason
+        # Issue the protective exit at block-0 rung 0 (the base cap). The
+        # escalation driver escalates from here if it doesn't fill in window.
         await self._issue_exit(trade, key, rung=0)
+
+    async def _on_scale_exit(self, trade: OpenTrade, key, row: dict) -> None:
+        """Accept one SCALE tranche and advance the deficit machine.
+
+        The tranche is identified by its trigger_level (= entry level + offset
+        — the offset itself is folded into the opaque signal_id, so the level
+        is the replay-dedupe key the row actually carries). Banking is
+        persisted BEFORE any order work so a crash between accept and issue
+        replays safely: the level is already in the map, the deficit is
+        recomputed from durable state, and the catch-up redelivery no-ops."""
+        lvl = row.get("trigger_level")
+        frac = row.get("fraction")
+        if lvl is None or frac is None:
+            # Can't dedupe or size a tranche without both. Refuse loudly; the
+            # row stays durable for a fixed producer to be re-read later.
+            self._mincr("exits_scale_malformed")
+            log.error("SCALE exit %s missing trigger_level/fraction (%r/%r) — refusing",
+                      row.get("signal_id"), lvl, frac)
+            return
+        lvl = int(lvl)
+        if lvl in trade.scale_banked:
+            log.debug("SCALE tranche @L%d already banked for %s — replay skip",
+                      lvl, trade.trade_id)
+            return
+        trade.scale_banked[lvl] = Decimal(str(frac))
+        total = sum(trade.scale_banked.values())
+        if total > 1:
+            # Producer-side invariant broken (fractions sum past the whole
+            # position). Clamp the DEFICIT model at 1.0 (we can never exit more
+            # than we hold) and scream — this is a bug upstream, not here.
+            self._mincr("exits_scale_overbanked")
+            log.error("scale_banked for %s sums to %s > 1 — clamping to whole "
+                      "position; producer bug upstream", trade.trade_id, total)
+        await self.hooks.persist_trade(trade)
+        self._mincr("exits_scale_banked")
+        log.info("SCALE tranche banked %s @L%d fraction=%s (cum=%s)",
+                 trade.trade_id, lvl, frac, min(total, 1))
+        await self._advance_scale(trade, key)
+
+    def _scale_deficit(self, trade: OpenTrade) -> Decimal:
+        """How much MORE of the position should be exited right now, per the
+        banked tranches: desired = min(sum(fractions), 1) * filled_qty, minus
+        what exit fills have already closed. Derived purely from durable state,
+        so it is restart- and replay-stable; can be <= 0 (nothing owed)."""
+        banked = min(sum(trade.scale_banked.values(), Decimal(0)), Decimal(1))
+        desired = banked * trade.filled_qty
+        return desired - trade.exit_filled_qty
+
+    async def _advance_scale(self, trade: OpenTrade, key) -> None:
+        """Issue the next tranche-batch exit order if one is owed and nothing
+        is working. THE single continuation point of the scale machine — called
+        on tranche accept, on tranche-order completion, and when an entry with
+        pre-banked tranches becomes OPEN. At most one exit order works per
+        trade at any time; tranches arriving while one works simply grow the
+        deficit and coalesce into the NEXT order (the same-tick multi-level
+        propagation case)."""
+        if trade.state != "OPEN":
+            # PENDING/SUBMITTED: no position yet (deficit is against filled 0);
+            # CLOSING: an order is already working — completion re-calls us.
+            return
+        deficit = self._scale_deficit(trade)
+        if deficit <= 0:
+            return
+        qty = deficit
+        if self.hooks.quantize_exit_qty is not None:
+            qty = await self.hooks.quantize_exit_qty(trade.symbol, trade.asset_class, deficit)
+        if qty <= 0:
+            # Below the venue minimum: accumulate. The deficit persists and
+            # rides into the next tranche (or the TERMINAL close sweeps it).
+            self._mincr("exits_scale_below_lot")
+            log.info("scale deficit %s for %s below venue minimum — accumulating",
+                     deficit, trade.trade_id)
+            return
+        trade.exit_reason = ExitReason.SCALE.value
+        await self.hooks.persist_trade(trade)
+        # Deterministic block for this batch: the deepest banked level. A new
+        # tranche arriving mid-escalation changes the deficit, not the block —
+        # ids need distinctness and parseability, and the orders row records
+        # the true quantity.
+        rung = max(trade.scale_banked) * _TRANCHE_STRIDE
+        await self._issue_exit(trade, key, rung=rung)
+
+    async def _cancel_working_exit(self, trade: OpenTrade) -> None:
+        """Cancel the trade's current working exit order (by its deterministic
+        id) and absorb any fills the cancel reports (a partial fill racing the
+        cancel). Used when escalating past a rung and when a final close
+        supersedes a working tranche — the adapter contract (adapter.py) names
+        cancel-then-reissue as the escalation mechanism precisely so two live
+        exit orders can never work the same position at once."""
+        if not trade.exit_order_submitted:
+            return   # the rung was committed but no order was ever placed
+        cid = coid.build(trade.trade_id, OrderIntent.EXIT, trade.exit_rung)
+        try:
+            result = await self.adapter.cancel_order(cid)
+        except Exception:
+            # A cancel that errors leaves an unknown order state — the fill
+            # stream and reconcile remain the safety net; log and continue
+            # (the replacement order's own qty is computed net of fills).
+            log.exception("cancel_order(%s) raised for %s — continuing", cid, trade.trade_id)
+            return
+        self._learn_venue_order_id(result)
+        await self.hooks.advance_order_fill(cid, result.filled_qty, result.status.value)
+        for f in result.fills:
+            await self._record_fill(trade, f)
 
     async def _issue_exit(self, trade: OpenTrade, key, rung: int) -> None:
         """Price + submit an exit for the trade's REMAINING quantity at escalation
@@ -576,12 +759,32 @@ class SignalExecutor:
             await self._finalize_closed(trade, key)
             return
 
+        # Quantity: a FINAL close (block 0) always works the full remainder; a
+        # SCALE tranche works the banked DEFICIT, clamped to the position. If
+        # fills that raced us already satisfied the deficit (or the deficit is
+        # below the venue minimum), the tranche lifecycle is complete-for-now:
+        # back to OPEN, no order.
+        if trade.exit_reason == ExitReason.SCALE.value:
+            deficit = self._scale_deficit(trade)
+            if deficit > 0 and self.hooks.quantize_exit_qty is not None:
+                deficit = await self.hooks.quantize_exit_qty(
+                    trade.symbol, trade.asset_class, deficit)
+            if deficit <= 0:
+                await self._return_to_open(trade, key)
+                return
+            order_qty = min(deficit, remaining)
+        else:
+            order_qty = remaining
+
         # Commit the CLOSING intent + this rung FIRST, so it is durable regardless
         # of what happens during pricing/submit below.
         exit_cap = await self.hooks.get_exit_cap(asset_class)
         trade.state = "CLOSING"
         trade.exit_rung = rung
-        window_s = exit_cap.window_seconds_for_rung(rung)
+        # The ExitCap ladder indexes on the ESCALATION component of the strided
+        # rung (block * 100 + escalation) — block 0 reproduces pre-017 behaviour
+        # exactly.
+        window_s = exit_cap.window_seconds_for_rung(_esc(rung))
 
         touch = await self.hooks.get_touch(symbol, asset_class)
         bad = validate_touch(touch.bid, touch.ask) if touch is not None else "no touch"
@@ -599,23 +802,29 @@ class SignalExecutor:
             self._mincr("exits_retry_bad_touch")
             return
 
-        cap = exit_cap.cap_for_rung(rung)
+        cap = exit_cap.cap_for_rung(_esc(rung))
         limit, reference, cap_applied = price_marketable_limit(
             trade.side, OrderIntent.EXIT, touch.bid, touch.ask, cap,
         )
 
-        # Exit order gets its own deterministic id at THIS escalation rung, so a
-        # re-issue at a higher rung is a distinct, idempotent order.
+        # Exit order gets its own deterministic id at THIS (strided) rung, so a
+        # re-issue at a higher escalation — or a different tranche block — is a
+        # distinct, idempotent order.
         exit_coid = coid.build(trade.trade_id, OrderIntent.EXIT, rung)
         order = OrderRequest(
             client_order_id=exit_coid, trade_id=trade.trade_id, symbol=symbol,
             asset_class=asset_class, intent=OrderIntent.EXIT, side=trade.side,
-            qty=remaining,
+            qty=order_qty,
             limit_price=limit, venue_reference=reference, cap_applied=cap_applied,
             exit_reason=_exit_reason(trade.exit_reason or "MANUAL"), escalation_rung=rung,
         )
         await self.hooks.persist_order(_order_row(order, OrderStatus.WORKING))
 
+        # Working-cycle tracking: what THIS order is for, and where exit fills
+        # stood when it went out — so completion of the ORDER (not just of the
+        # whole deficit) is detectable while new tranches keep banking.
+        trade.exit_order_qty = order_qty
+        trade.exit_cycle_base = trade.exit_filled_qty
         # Deadline = now + this rung's fill window. If the window is None we are
         # at/over the top of the ladder — no deadline, the driver will HALT.
         trade.exit_deadline_ms = (
@@ -641,9 +850,39 @@ class SignalExecutor:
         # submitted, whose trade we know). _record_fill advances exit_filled_qty.
         for f in result.fills:
             await self._record_fill(trade, f)
-        # Fully closed once the exit has closed the whole held quantity.
+        await self._after_exit_fills(trade, key)
+
+    async def _after_exit_fills(self, trade: OpenTrade, key) -> None:
+        """Shared completion check after exit fills advance a trade (sync result
+        and async stream both land here). Order matters: position flat always
+        finalizes CLOSED — even for a tranche, a flat position is a done
+        position. Otherwise a satisfied SCALE tranche returns the trade to OPEN
+        and immediately re-advances the scale machine (tranches that arrived
+        while this one worked coalesce into the next order)."""
         if trade.exit_filled_qty >= trade.filled_qty and trade.filled_qty > 0:
             await self._finalize_closed(trade, key)
+            return
+        if (trade.state == "CLOSING" and not trade.closing_final
+                and (self._scale_deficit(trade) <= 0 or trade.exit_cycle_done)):
+            await self._return_to_open(trade, key)
+            await self._advance_scale(trade, key)
+
+    async def _return_to_open(self, trade: OpenTrade, key) -> None:
+        """A SCALE tranche lifecycle completed without flattening the position:
+        the trade goes back to OPEN (the escalation driver stops watching it),
+        the deadline clears, and the durable rows record both. The exit_rung
+        keeps its last strided value — the next tranche batch overwrites it."""
+        trade.state = "OPEN"
+        trade.exit_deadline_ms = None
+        trade.exit_order_submitted = True
+        trade.exit_order_qty = Decimal(0)
+        trade.exit_cycle_base = trade.exit_filled_qty
+        await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
+        await self.hooks.persist_exit_state(trade.trade_id, trade.exit_rung, None)
+        await self.hooks.persist_trade(trade)
+        self._mincr("exits_scale_tranche_complete")
+        log.info("scale tranche complete for %s — back to OPEN (exited %s of %s)",
+                 trade.trade_id, trade.exit_filled_qty, trade.filled_qty)
 
     async def _finalize_closed(self, trade: OpenTrade, key) -> None:
         trade.state = "CLOSED"
@@ -756,9 +995,12 @@ class SignalExecutor:
             await self._issue_exit(trade, key, rung=trade.exit_rung)
             return
         exit_cap = await self.hooks.get_exit_cap(trade.asset_class)
-        if not exit_cap.has_rung_beyond(trade.exit_rung):
+        if not exit_cap.has_rung_beyond(_esc(trade.exit_rung)):
             # Top of the ladder and still not filled -> HALT + alert. Better a
-            # human looks than an unbounded market order in a fast market.
+            # human looks than an unbounded market order in a fast market. This
+            # applies to a SCALE tranche too: a 5% slice that can't fill through
+            # the full ladder means the book is broken enough that the whole
+            # position deserves eyes, not more automation.
             await self._halt(trade, "escalation: exit unfilled through full ladder")
             self._open.pop(key, None)
             return
@@ -766,6 +1008,12 @@ class SignalExecutor:
         self._mincr("escalations_issued")
         log.info("escalating exit for %s: rung %d -> %d (remaining=%s)",
                  trade.trade_id, trade.exit_rung, next_rung, remaining)
+        # Cancel the outgoing rung's order BEFORE issuing its replacement — the
+        # adapter contract names cancel-then-reissue as the escalation
+        # mechanism. Without it, both rungs work the book at once and can BOTH
+        # fill (an over-close that flips the position). Any fills the cancel
+        # reports are absorbed first, so the replacement's qty is computed net.
+        await self._cancel_working_exit(trade)
         await self._issue_exit(trade, key, rung=next_rung)
 
     # ----------------------------------------------------------------------
@@ -871,14 +1119,15 @@ class SignalExecutor:
 
     async def _maybe_complete_after_async_fill(self, trade: OpenTrade, key) -> None:
         """After an async fill advances a trade, apply the same state transitions
-        the sync paths do: an entry that's now (partly) filled becomes OPEN; an
-        exit that has closed the whole position finalizes CLOSED."""
+        the sync paths do: an entry that's now (partly) filled becomes OPEN (and
+        any pre-banked scale tranches start working); exit fills route through
+        the shared completion check (flat -> CLOSED; tranche satisfied -> OPEN)."""
         if trade.state == "SUBMITTED" and trade.filled_qty > 0:
             trade.state = "OPEN"
             await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
-        if (trade.state == "CLOSING"
-                and trade.exit_filled_qty >= trade.filled_qty and trade.filled_qty > 0):
-            await self._finalize_closed(trade, key)
+            await self._advance_scale(trade, key)
+        if trade.state == "CLOSING":
+            await self._after_exit_fills(trade, key)
 
     async def _record_fill(self, trade: OpenTrade, fill: Fill) -> None:
         """Record a synchronously-known fill against a specific trade and advance
