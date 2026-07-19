@@ -51,24 +51,33 @@ ASSET_CONFIGS = {
             "ADAUSDT",
             "LINKUSDT",
         ],
-        # four_chain's ladder [1m,3m,5m,15m,1h] — all >= 1m, all Binance-native.
-        # Served by CONTINUOUS REST polling (BinanceFuturesFeed.start_live runs a
-        # per-timeframe poll loop at ~tf/2 cadence, closed-window-only, relaunched
-        # on error by feed_process). transport is 'rest' NOT 'ws': the Binance
-        # futures WEBSOCKET (fstream) is unreachable from this host — Binance
+        # The union of four_chain's ladder [1m,3m,5m,15m,1h] and
+        # prior_failure_scaleout's PF ladder [1m..12h] — all >= 1m, all
+        # Binance-native kline intervals. Served by CONTINUOUS REST polling
+        # (BinanceFuturesFeed.start_live runs a per-timeframe poll loop at
+        # ~tf/2 cadence, closed-window-only, relaunched on error by
+        # feed_process). transport is 'rest' NOT 'ws': the Binance futures
+        # WEBSOCKET (fstream) is unreachable from this host — Binance
         # silences futures market data to cloud/datacenter egress IPs, so the ws
         # connects but delivers zero frames. REST (fapi) is reachable and is all
-        # four_chain needs (no sub-minute rungs here). Sub-minute crypto would
+        # these ladders need (no sub-minute rungs here). Sub-minute crypto would
         # require the ws and is therefore not available from this host — two_ladder
         # is scoped off crypto for that reason (see non_crypto_symbols).
-        "timeframes": ["1m", "3m", "5m", "15m", "1h"],
+        #
+        # WARMUP SPANS for the upper rungs (5000 bars each): 30m ~104d,
+        # 2h ~417d, 4h ~2.3y, 6h ~3.4y, 12h ~6.9y. A rung whose venue history
+        # is shorter warms partial and stays INERT (never forecasts) until live
+        # bars top it up — safe by construction (chains cap below it; see the
+        # hydrate fill report), but 12h clears ~6.9y ONLY for BTCUSDT, which is
+        # why PF marks 12h optional in LADDER_OPTIONAL_TIMEFRAMES.
+        "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "rest",
     },
     "equity": {
         "symbols": [
-            # "AAPL"
+            "AAPL"
         ],
         "timeframes": list(TWO_LADDER_TIMEFRAMES),
         "points": 5000,
@@ -225,7 +234,7 @@ VENUE_ENDPOINTS = {
 # ---------------------------------------------------------------------------
 STRATEGIES = {
     "two_ladder": {
-        "enabled": False,
+        "enabled": True,
         # Non-crypto only: two_ladder's sub-minute rungs (5s/10s/30s) can't be
         # sourced for crypto from this host (Binance futures ws is IP-blocked;
         # REST klines don't go sub-minute). Resolved just below the dict to the
@@ -246,6 +255,57 @@ STRATEGIES = {
         # default; omitted => the view's default cap.
         "params": {},
     },
+    # prior_failure_scaleout — the loose-gate sibling of four_chain (same
+    # opposing-failure ingredient, no corroboration requirements; ~3x the
+    # frequency for a similar edge per the research). Entry: a chain reaching
+    # P2 with a recent prior opposing L1-only failure on the same symbol.
+    # Exit: seven scale-out tranches banked as the chain propagates, weighted
+    # toward the deep levels; any remainder closes at chain termination. NO
+    # stop loss — deliberate; giveback/trailing stops failed as a class in the
+    # research, the chain's own termination is the stop.
+    #
+    # DISABLED until the full rollout completes: (1) migration 016 applied,
+    # (2) the consuming team confirms fraction/SCALE/TERMINAL support,
+    # (3) the strategy factory is registered (rollout step 3), (4) the
+    # executor's partial-exit support lands (step 4). The executor carries an
+    # interlock that refuses partial exits until (4), so enabling early fails
+    # loud, not wrong — but don't.  Enable in PAPER mode first.
+    #
+    # NOTE on first enable: the gate needs prior-chain history. The PF
+    # machines start producing chains only once this strategy is enabled
+    # (owned_symbol_ladders gates computation), so for ~failure_window_hours
+    # after first enable the gate cannot fire — expected warm-in, not a bug.
+    # Re-run warmup_process just before enabling so the PF buffers hydrate
+    # fresh (a stale warmup leaves a gap between its last bar and live).
+    "prior_failure_scaleout": {
+        "enabled": False,
+        # Crypto-only, resolved below to the current crypto universe
+        # (mirrors four_chain).
+        "symbols": [],
+        "ladders": ["PF"],            # [1m..12h] below; entry P2=3m, schedule tops at P9=6h
+        "params": {
+            "entry_level": 2,          # P2 (3m on PF). Schedule keys are OFFSETS from this.
+            "gate": {
+                # Admit iff a prior opposing chain on the same symbol FAILED
+                # (exact depth 1 — initiated and died without propagating; a
+                # chain that reached L3 then terminated is NOT a failure) with
+                # its START inside the window before this chain's start.
+                "failure_window_hours": 6,   # research default, never swept
+                "failure_exact_depth": 1,
+            },
+            "exit": {
+                # Fraction of ORIGINAL size banked at each level PAST entry
+                # (offset -> fraction; sums to 1.0). Offsets, not absolute
+                # levels: entry at P2 puts offset 7 at P9 = 6h. Back-loaded on
+                # purpose — the deep levels carry the magnitude.
+                "schedule": {1: 0.05, 2: 0.05, 3: 0.10, 4: 0.10,
+                             5: 0.15, 6: 0.20, 7: 0.35},
+                "remainder_at_termination": True,
+                "stop": None,          # deliberate — see above; do not add one
+            },
+            "sizing": "flat",          # v1; per_symbol_base_rate is a follow-up
+        },
+    },
     # Example of a future strategy on different ladders (disabled):
     # "mean_revert": {
     #     "enabled": False,
@@ -262,9 +322,28 @@ STRATEGIES = {
 # leaking a marker string into the strategy registry.
 STRATEGIES["two_ladder"]["symbols"] = non_crypto_symbols()
 STRATEGIES["four_chain"]["symbols"] = crypto_symbols()
+STRATEGIES["prior_failure_scaleout"]["symbols"] = crypto_symbols()
 
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.
 EXTRA_LADDERS = {
     "FC": ["1m", "3m", "5m", "15m", "1h"],   # four_chain strategy's ladder
+    # prior_failure_scaleout's ladder: the research's 10-level hierarchy.
+    # Levels: 1m=P1 .. 6h=P9, 12h=P10. Entry at P2 (3m); the scale-out
+    # schedule's last tranche is offset 7 = P9 = 6h, so 12h sits ABOVE the
+    # schedule — kept in the ladder so live chain records stay depth-comparable
+    # with the research population, at a cost of 2 forecasts/day/symbol.
+    # PF shares 1m/3m/5m/15m/1h with FC; the ForecastMemo dedupes those
+    # (Sumtyme is deterministic), so PF's marginal Sumtyme demand is only its
+    # five new rungs (~70 calls/day/symbol), not a doubling of the shared ones.
+    "PF": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h"],
+}
+
+# Rungs whose short/unwarmed buffer is EXPECTED and acceptable, per ladder
+# (ladder name -> timeframes). Downgrades the machine's hydrate fill report
+# from WARNING to INFO for those rungs — logging only; an unwarmed rung is
+# inert either way. PF's 12h needs ~6.9y of venue history (BTCUSDT only), and
+# nothing in prior_failure_scaleout depends on it (schedule tops at 6h).
+LADDER_OPTIONAL_TIMEFRAMES = {
+    "PF": ["12h"],
 }

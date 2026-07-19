@@ -388,50 +388,67 @@ def make_insert_signal(pool):
     return insert_signal
 
 def make_load_open_positions(pool):
-    """Load positions currently OPEN per the trade_signals log: an ENTER with no
-    matching EXIT for the same (strategy, position_key). Used by the signal
-    process to rebuild the runtime's open-position watch set on restart so exit
-    evaluation resumes for positions entered before the restart.
- 
+    """Load positions currently OPEN per the trade_signals log. Used by the
+    signal process to rebuild the runtime's open-position watch set on restart
+    so exit evaluation resumes for positions entered before the restart.
+
     Returns list[dict] with keys: position_key, symbol, asset_class, chain_id,
     direction ('LONG'|'SHORT'), strategy — exactly what
     signal_process._runtime_hooks().load_open() maps into OpenPosition.
- 
+
     Matching is on (strategy, position_key) together (migrations 004/011): a
     position_key is unique only within a strategy, so an EXIT closes only its
     OWN strategy's ENTER.
- 
-    For each still-open (strategy, position_key) we return the ENTER row's
-    identity fields (symbol/asset_class/chain_id/direction are fixed at ENTER;
-    an EXIT only references the key). If the same key was entered, exited, and
-    re-entered, the NOT EXISTS correlated on decided_at ordering below treats it
-    as open iff the LATEST action is an ENTER — see the subquery note.
+
+    OPENNESS UNDER PARTIAL EXITS (migration 016). The pre-016 rule — open iff
+    the latest action is an ENTER — is WRONG for a scale-out position: its
+    first SCALE tranche is an EXIT row, which would evict the position from
+    the watch set on restart, stranding the remaining tranches and the
+    TERMINAL (the consumer would hold a position we stopped watching — the
+    exact reconciliation gap 004 exists to prevent). The rule is now:
+
+        OPEN iff an ENTER exists AND
+          * no CLOSING exit exists — any EXIT whose reason is not 'SCALE'
+            (STOP/TARGET/TIME/MANUAL/KILL_SWITCH/TERMINAL all close), AND
+          * cumulative SCALE fraction < 1.0 (all-tranches-banked closes the
+            position with no TERMINAL ever written; fraction is NUMERIC so
+            the sum is exact, and per-tranche signal_ids mean no row is ever
+            double-counted).
+
+    For whole-exit strategies (two_ladder, four_chain) every exit is
+    non-SCALE, so this is behaviourally identical to the old rule. Re-entry
+    on a (strategy, position_key) cannot occur — the deterministic ENTER
+    signal_id admits one ENTER per key, ever — so the old latest-row ordering
+    dance is unnecessary.
     """
     async def load_open_positions() -> list:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                -- The latest action per (strategy, position_key). A position is
-                -- OPEN iff its most recent decision is an ENTER (no EXIT has
-                -- superseded it). DISTINCT ON picks the newest row per key by
-                -- decided_at (then created_at as a tiebreak for equal decided_at).
-                SELECT position_key, symbol, asset_class, chain_id,
-                       direction::text AS direction, strategy
-                FROM (
-                    SELECT DISTINCT ON (strategy, position_key)
-                           strategy, position_key, symbol, asset_class,
-                           chain_id, direction, action
-                    FROM trade_signals
-                    ORDER BY strategy, position_key,
-                             decided_at DESC, created_at DESC
-                ) latest
-                WHERE action = 'ENTER'
+                SELECT e.position_key, e.symbol, e.asset_class, e.chain_id,
+                       e.direction::text AS direction, e.strategy
+                FROM trade_signals e
+                WHERE e.action = 'ENTER'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_signals x
+                      WHERE x.strategy = e.strategy
+                        AND x.position_key = e.position_key
+                        AND x.action = 'EXIT'
+                        AND x.exit_reason <> 'SCALE'
+                  )
+                  AND COALESCE((
+                      SELECT SUM(x.fraction) FROM trade_signals x
+                      WHERE x.strategy = e.strategy
+                        AND x.position_key = e.position_key
+                        AND x.action = 'EXIT'
+                        AND x.exit_reason = 'SCALE'
+                  ), 0) < 1.0
                 """
             )
         # asyncpg Records are mapping-like; the caller uses r["..."] and
         # r.get("strategy", ...). Convert to plain dicts so .get works.
         return [dict(r) for r in rows]
- 
+
     return load_open_positions
 
 # ---- warmup-bars persistence (warmup_bars table, migration 006) -------------

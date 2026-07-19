@@ -53,6 +53,84 @@ from typing import Optional
 log = logging.getLogger("producer.forecast_gate")
 
 
+class ForecastMemo:
+    """Cross-ladder forecast dedupe. ONE instance per process, shared by every
+    chain machine (same discipline as ForecastGate).
+
+    WHY. Sumtyme is DETERMINISTIC: an identical input window produces an
+    identical signal, every time. Chain machines are per (symbol, ladder), and
+    two ladders that share a timeframe (FC and PF share 1m/3m/5m/15m/1h) each
+    hold their own buffer for it and would each forecast the SAME
+    (symbol, timeframe, window) — paying the pipeline's scarcest resource twice
+    for one answer. The 1m rung alone is ~1440 calls/day/symbol, so without
+    this memo a second ladder on crypto roughly DOUBLES Sumtyme demand; with
+    it, the second ladder costs only its genuinely new rungs (~70/day/symbol).
+
+    KEY: (asset_class, symbol, timeframe, first_bar_ts, last_bar_ts, n_bars).
+    The first/last timestamps + length pin the exact window, not just its tail
+    — so two machines whose buffers ever diverge (e.g. hydrated against
+    different warmup snapshots) can never share a result that one of them
+    didn't compute. A diverged window simply misses and forecasts normally.
+
+    RETENTION: only the LATEST entry per (asset_class, symbol, timeframe) —
+    a new bar replaces the previous one. The reuse window is "the other
+    ladder's machine processing the same bar moments later", so history has no
+    value, and memory stays bounded by the number of live (symbol, timeframe)
+    pairs.
+
+    CONCURRENCY: none needed. The router runs a symbol's ladders SEQUENTIALLY
+    under the symbol lock (deterministic ladder order), so for any key the
+    first machine finishes before the second asks; different symbols never
+    share keys. Single event loop, synchronous dict ops.
+
+    Only USABLE results are stored (the caller stores after its own
+    Exception-object / empty-result checks pass), so a failed call is never
+    replayed to the other ladder — the second machine just retries the API.
+    """
+
+    def __init__(self, *, stats_every: int = 500):
+        # (asset_class, symbol, timeframe) -> (full_key, forecast)
+        self._latest: dict[tuple, tuple] = {}
+        self._hits = 0
+        self._misses = 0
+        self._stats_every = stats_every
+
+    @staticmethod
+    def _slot(key: tuple) -> tuple:
+        return key[:3]   # (asset_class, symbol, timeframe)
+
+    def get(self, key: tuple):
+        """The memoized forecast for exactly this window, or None."""
+        entry = self._latest.get(self._slot(key))
+        if entry is not None and entry[0] == key:
+            self._hits += 1
+            self._maybe_log()
+            return entry[1]
+        self._misses += 1
+        self._maybe_log()
+        return None
+
+    def put(self, key: tuple, forecast) -> None:
+        """Store a USABLE forecast for this window, replacing the slot's
+        previous window. Idempotent: re-putting a hit overwrites with the same
+        value."""
+        self._latest[self._slot(key)] = (key, forecast)
+
+    def _maybe_log(self) -> None:
+        total = self._hits + self._misses
+        if total and total % self._stats_every == 0:
+            self.log_stats()
+
+    def log_stats(self) -> None:
+        total = self._hits + self._misses
+        rate = (self._hits / total * 100) if total else 0.0
+        log.info(
+            "forecast memo: %d lookups, %d hits (%.1f%%) — every hit is one "
+            "Sumtyme call NOT made",
+            total, self._hits, rate,
+        )
+
+
 class ForecastGate:
     """One shared permit-holder for Sumtyme calls, plus latency instrumentation.
 

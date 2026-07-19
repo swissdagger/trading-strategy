@@ -53,11 +53,23 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 
-from producer.forecast_gate import ForecastGate
+from producer.forecast_gate import ForecastGate, ForecastMemo
 
 log = logging.getLogger("producer.service2_machine")
 
 WINDOW_SIZE = 5000   # same gate as service_2: no forecast until the buffer fills
+
+
+def _tf_seconds(timeframe: str) -> Optional[int]:
+    """Seconds per bar for a '<n><unit>' timeframe (5s/1m/30m/6h/12h/1d), used
+    only for the hydrate fill report's days-to-fill estimate. Unknown shapes
+    return None (the report just omits the estimate) — deliberately forgiving,
+    a log nicety must never be able to break hydration."""
+    try:
+        n, unit = int(timeframe[:-1]), timeframe[-1]
+        return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    except (ValueError, KeyError, IndexError):
+        return None
 
 
 def _epoch_ms_to_iso(ms: int) -> str:
@@ -121,14 +133,10 @@ class ServiceTwoChainMachine(ChainMachine):
         persist_chain_terminate: PersistChainTerminate,
         load_active_chains: Optional[Callable[[], Awaitable[List[dict]]]] = None,
         load_buffers: Optional[Callable[[], Awaitable[Dict[str, deque]]]] = None,
-        # Restores _last_base_signal on hydrate (newest non-zero baseline signal
-        # from the signals table). Optional so tests/standalone machines that
-        # don't wire DB hydration keep working; without it the first non-zero
-        # baseline signal after a restart always INITs, even if it continues the
-        # pre-restart direction (a duplicate same-direction chain).
-        load_last_base_signal: Optional[Callable[[], Awaitable[Optional[int]]]] = None,
         forecast_timeout_s: float = 30.0,
         forecast_gate: Optional["ForecastGate"] = None,
+        forecast_memo: Optional["ForecastMemo"] = None,
+        optional_timeframes: Optional[set] = None,
     ):
         self.symbol = symbol
         self.asset_class = asset_class
@@ -145,7 +153,6 @@ class ServiceTwoChainMachine(ChainMachine):
         self._persist_term = persist_chain_terminate
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
-        self._load_last_base_signal = load_last_base_signal
         self._forecast_timeout_s = forecast_timeout_s
         # SHARED across every machine in the process — see ForecastGate. Sumtyme
         # serialises concurrent calls server-side, so we hold a single global
@@ -155,6 +162,18 @@ class ServiceTwoChainMachine(ChainMachine):
         # WRONG in the live multi-symbol process, where every machine must share
         # one gate instance. signal_process constructs exactly one and injects it.
         self._forecast_gate = forecast_gate
+        # SHARED across every machine, like the gate. Sumtyme is deterministic,
+        # so two ladders sharing a timeframe can share one forecast per bar —
+        # see ForecastMemo. If None, every call goes to the API (standalone/test
+        # posture); the live process constructs exactly one and injects it.
+        self._forecast_memo = forecast_memo
+        # Rungs whose empty/short buffer is EXPECTED and acceptable (e.g. PF's
+        # 12h top rung, above the scale-out schedule, warmable only for venue
+        # listings older than ~6.9 years). Downgrades the hydrate fill report
+        # for these rungs from WARNING to INFO; affects LOGGING ONLY — an
+        # unwarmed rung is inert either way (it never forecasts until its
+        # buffer reaches WINDOW_SIZE, and chains below it are unaffected).
+        self._optional_timeframes: set = optional_timeframes or set()
 
         # --- per-(symbol,set) state (was module-level, keyed by (ac,symbol)) ---
         self._lock = asyncio.Lock()
@@ -193,29 +212,57 @@ class ServiceTwoChainMachine(ChainMachine):
             log.info("hydrated buffers for %s ladder=%s: %s",
                      self.symbol, self.baseline_timeframe,
                      {tf: len(dq) for tf, dq in self._buffers.items()})
+            self._report_buffer_fill()
         if self._load_active_chains is not None:
             for chain in await self._load_active_chains():
                 self._active_chains[chain["chain_id"]] = chain
             log.info("hydrated %d active chains for %s/%s",
                      len(self._active_chains), self.symbol, self.baseline_timeframe)
-        if self._load_last_base_signal is not None:
-            # Restore the "last non-zero baseline signal" invariant so the first
-            # live baseline signal after a restart only INITs on a genuine
-            # direction change, not unconditionally. A failure here must not
-            # block hydration: falling back to None just reproduces the old
-            # (duplicate-INIT-prone) behaviour, which is strictly survivable.
-            try:
-                self._last_base_signal = await self._load_last_base_signal()
-                log.info("hydrated last base signal for %s/%s: %s",
-                         self.symbol, self.baseline_timeframe,
-                         self._last_base_signal)
-            except Exception as e:
-                log.warning(
-                    "last-base-signal hydrate failed for %s/%s (continuing with "
-                    "None; first baseline signal will INIT unconditionally): %r",
-                    self.symbol, self.baseline_timeframe, e,
-                )
         self._hydrated = True
+
+    def _report_buffer_fill(self) -> None:
+        """Severity-graded startup report of buffer fill per rung, once per
+        machine at hydrate. An unwarmed rung produces NO error at runtime — it
+        is silently inert (never forecasts until WINDOW_SIZE), which is exactly
+        why this report exists: it turns three silent behaviours into log lines.
+
+          * baseline short  -> ERROR.  A chain can only initiate from index 0;
+            no baseline means this symbol can never chain on this ladder AT ALL.
+          * interior short  -> WARNING. The no-skip invariant means propagation
+            is CAPPED at the level below the short rung until it fills; any
+            strategy logic keyed to deeper levels never fires for this symbol.
+          * short rung in optional_timeframes -> INFO. Expected-short by
+            configuration (e.g. PF's 12h, above the scale-out schedule).
+
+        The days-to-fill estimate assumes live bars arrive continuously — true
+        for crypto, an underestimate for session-bound classes.
+        """
+        for i, tf in enumerate(self.ladder):
+            have = len(self._buffers.get(tf, ()))
+            if have >= WINDOW_SIZE:
+                continue
+            missing = WINDOW_SIZE - have
+            secs = _tf_seconds(tf)
+            eta = f" (~{missing * secs / 86400:.0f}d of live bars to fill)" if secs else ""
+            if i == 0:
+                log.error(
+                    "buffer fill %s/%s rung %s (baseline): %d/%d — symbol is "
+                    "INERT on this ladder (chains can never initiate) until "
+                    "this buffer fills%s",
+                    self.symbol, self.baseline_timeframe, tf, have, WINDOW_SIZE, eta)
+            elif tf in self._optional_timeframes:
+                log.info(
+                    "buffer fill %s/%s rung %s: %d/%d — expected-short "
+                    "(optional rung); level %d unreachable until filled%s",
+                    self.symbol, self.baseline_timeframe, tf, have, WINDOW_SIZE,
+                    i + 1, eta)
+            else:
+                log.warning(
+                    "buffer fill %s/%s rung %s: %d/%d — propagation CAPPED at "
+                    "level %d until this buffer fills; logic keyed to level "
+                    ">= %d never fires for this symbol%s",
+                    self.symbol, self.baseline_timeframe, tf, have, WINDOW_SIZE,
+                    i, i + 1, eta)
 
     async def on_bar(self, bar: OHLCPoint) -> List[ChainEvent]:
         """Feed one closed bar. Append to its buffer; if the buffer is full, run
@@ -244,6 +291,26 @@ class ServiceTwoChainMachine(ChainMachine):
         api_ready_df, placeholder_dt = self._prepare_df(df, bar.timeframe)
         interval, interval_unit = self._to_interval(bar.timeframe)
 
+        # CROSS-LADDER MEMO. Sumtyme is deterministic, so if another machine
+        # (a different ladder sharing this timeframe) already forecast this
+        # EXACT window — same symbol, timeframe, first/last bar ts, length —
+        # its result is our result, and the API call (the pipeline bottleneck)
+        # is skipped. The router runs a symbol's ladders sequentially under the
+        # symbol lock, so the sharing machine has fully completed before we ask.
+        # Everything downstream (persist, signal cache, state machine) runs
+        # identically on a hit — only the call itself is elided.
+        memo_key = None
+        forecast = None
+        if self._forecast_memo is not None:
+            memo_key = (
+                self.asset_class, self.symbol, bar.timeframe,
+                buf[0]["timestamp"], bar.timestamp, len(buf),
+            )
+            forecast = self._forecast_memo.get(memo_key)
+            if forecast is not None:
+                log.debug("forecast memo HIT %s/%s ts=%s — Sumtyme call skipped",
+                          self.symbol, bar.timeframe, bar.timestamp)
+
         # Blocking Sumtyme call off the event loop — never await it directly, and
         # BOUND it. Without a timeout, a hung forecast call wedges the consume loop
         # indefinitely: the to_thread worker blocks, the committed offset freezes,
@@ -268,23 +335,10 @@ class ServiceTwoChainMachine(ChainMachine):
         # until the OS returns. Serialising via the gate bounds the damage: at most
         # `concurrency` such calls can ever be stuck at once, instead of one per
         # symbol.
-        try:
-            if self._forecast_gate is not None:
-                forecast = await self._forecast_gate.run(
-                    self._forecast_fn,
-                    time_series_type="ohlc",
-                    data_input=api_ready_df,
-                    interval=interval,
-                    interval_unit=interval_unit,
-                    reasoning_mode="reactive",
-                    timeframe_dependent=False,
-                    timeout_s=self._forecast_timeout_s,
-                )
-            else:
-                # Ungated path: standalone/test use only. In the live process every
-                # machine is given the shared gate.
-                forecast = await asyncio.wait_for(
-                    asyncio.to_thread(
+        if forecast is None:
+            try:
+                if self._forecast_gate is not None:
+                    forecast = await self._forecast_gate.run(
                         self._forecast_fn,
                         time_series_type="ohlc",
                         data_input=api_ready_df,
@@ -292,29 +346,43 @@ class ServiceTwoChainMachine(ChainMachine):
                         interval_unit=interval_unit,
                         reasoning_mode="reactive",
                         timeframe_dependent=False,
-                    ),
-                    timeout=self._forecast_timeout_s,
+                        timeout_s=self._forecast_timeout_s,
+                    )
+                else:
+                    # Ungated path: standalone/test use only. In the live process every
+                    # machine is given the shared gate.
+                    forecast = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._forecast_fn,
+                            time_series_type="ohlc",
+                            data_input=api_ready_df,
+                            interval=interval,
+                            interval_unit=interval_unit,
+                            reasoning_mode="reactive",
+                            timeframe_dependent=False,
+                        ),
+                        timeout=self._forecast_timeout_s,
+                    )
+            except asyncio.TimeoutError:
+                # The hang path. LOUD on purpose: this is the failure that silently
+                # froze the pipeline for days. One per stuck bar; a burst of these
+                # means Sumtyme is down/degraded, not a one-off.
+                log.warning(
+                    "forecast TIMEOUT after %ss for %s/%s ts=%s — skipping bar "
+                    "(repeated timeouts = Sumtyme unreachable/degraded)",
+                    self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
                 )
-        except asyncio.TimeoutError:
-            # The hang path. LOUD on purpose: this is the failure that silently
-            # froze the pipeline for days. One per stuck bar; a burst of these
-            # means Sumtyme is down/degraded, not a one-off.
-            log.warning(
-                "forecast TIMEOUT after %ss for %s/%s ts=%s — skipping bar "
-                "(repeated timeouts = Sumtyme unreachable/degraded)",
-                self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
-            )
-            return []
-        except Exception:
-            # The SDK raised (network, 4xx/5xx, bad payload). Previously a raised
-            # exception here would unwind out of on_bar -> run() and stop the
-            # consume loop entirely (silent DB freeze). Catch, log with traceback,
-            # skip the bar — the loop keeps draining.
-            log.exception(
-                "forecast ERROR for %s/%s ts=%s — skipping bar",
-                self.symbol, bar.timeframe, bar.timestamp,
-            )
-            return []
+                return []
+            except Exception:
+                # The SDK raised (network, 4xx/5xx, bad payload). Previously a raised
+                # exception here would unwind out of on_bar -> run() and stop the
+                # consume loop entirely (silent DB freeze). Catch, log with traceback,
+                # skip the bar — the loop keeps draining.
+                log.exception(
+                    "forecast ERROR for %s/%s ts=%s — skipping bar",
+                    self.symbol, bar.timeframe, bar.timestamp,
+                )
+                return []
 
         # Sumtyme returned but the result is unusable. The SDK can hand back an
         # Exception object or a falsy/empty dict instead of raising; that used to
@@ -333,6 +401,12 @@ class ServiceTwoChainMachine(ChainMachine):
                 forecast, self.symbol, bar.timeframe, bar.timestamp,
             )
             return []
+
+        # Store for the other ladder's machine — only USABLE results reach this
+        # line, so a failure is never replayed cross-ladder. Re-putting a memo
+        # hit is an idempotent same-value overwrite.
+        if memo_key is not None:
+            self._forecast_memo.put(memo_key, forecast)
 
         signal_value = list(forecast.values())[0]
         current_price = bar.close

@@ -60,7 +60,6 @@ from producer.persistence import (
     # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
     make_load_buffers,
-    make_load_last_base_signal,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -69,6 +68,7 @@ from strategy.registry import StrategyRegistry, Strategy
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
 from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
 from strategy.four_chain_adapter import make_four_chain
+from strategy.prior_failure_adapter import make_prior_failure_scaleout
 
 log = logging.getLogger("signal_process")
 
@@ -245,6 +245,16 @@ class SignalProcess:
             self.cfg.forecast_concurrency, self.cfg.sumtyme_timeout_s,
         )
 
+        # --- The ONE forecast memo, shared by every chain machine ---
+        # Same one-per-process discipline as the gate, opposite job: the gate
+        # bounds how many Sumtyme calls run; the memo eliminates the ones that
+        # don't need to run at all. Sumtyme is deterministic, so when two
+        # ladders share a timeframe (FC and PF share 1m/3m/5m/15m/1h), the
+        # second machine's forecast of the same (symbol, timeframe, window) is
+        # a memo hit, not an API call — without this, adding PF would roughly
+        # DOUBLE crypto's Sumtyme demand for identical answers.
+        self.forecast_memo = ForecastMemo()
+
         # --- Batched audit writer: research/audit writes OFF the hot path ---
         # Adopting the writer exactly as its docstring prescribes (it was built,
         # documented, and left dormant for this moment). It takes the signals /
@@ -297,6 +307,17 @@ class SignalProcess:
                 view_registry=self.ladders, writer_factory=make_writer,
             ),
         )
+        # prior_failure_scaleout: same factory shape as four_chain (own
+        # ChainHistoryView on its own ladder). Registered UNCONDITIONALLY —
+        # the config's `enabled` flag decides instantiation, and the factory
+        # validates the schedule-fits-ladder invariant loudly at build time.
+        self.strategies.register_factory(
+            "prior_failure_scaleout",
+            lambda *, name, symbols, ladders, params: make_prior_failure_scaleout(
+                name=name, symbols=symbols, ladders=ladders, params=params,
+                view_registry=self.ladders, writer_factory=make_writer,
+            ),
+        )
         # All tracked symbols across the enabled strategies feed 'symbols: "*"'.
         all_symbols = _all_configured_symbols()
         self.strategies.build_from_config(STRATEGIES, all_symbols=all_symbols)
@@ -339,6 +360,7 @@ class SignalProcess:
         remaining bind points — everything else is wired. They are pure functions
         (no state), so extracting them is mechanical.
         """
+        from config import LADDER_OPTIONAL_TIMEFRAMES
         from producer.service2_utils import (  # extracted service_2 helpers
             prepare_dataframe_for_sumtyme,
             to_sumtyme_interval,
@@ -372,12 +394,6 @@ class SignalProcess:
                 load_active_chains=make_load_active_chains(
                     self.pool, symbol, asset_class, timeframes),
                 load_buffers=make_load_buffers(self.pool, symbol, timeframes),
-                # Restore _last_base_signal from the signals table so a restart
-                # doesn't INIT a duplicate chain on the first baseline signal
-                # that merely CONTINUES the pre-restart direction. Baseline is
-                # ladder[0], per the hierarchy invariant.
-                load_last_base_signal=make_load_last_base_signal(
-                    self.pool, symbol, timeframes[0]),
                 # Was omitted, so the machine silently used its 30s DEFAULT and
                 # SUMTYME_TIMEOUT_S had no effect on anything (the client
                 # constructor rejected the kwarg, so it was applied nowhere at
@@ -387,6 +403,13 @@ class SignalProcess:
                 # One permit total across the process, because Sumtyme serialises
                 # concurrent calls anyway.
                 forecast_gate=self.forecast_gate,
+                # The SHARED memo — also the same object for every machine, so a
+                # window forecast by one ladder's machine is a hit for another's.
+                forecast_memo=self.forecast_memo,
+                # Rungs whose short buffer is expected (config): downgrades the
+                # hydrate fill report to INFO for them (e.g. PF's 12h).
+                optional_timeframes=set(
+                    LADDER_OPTIONAL_TIMEFRAMES.get(ladder_name, [])),
             )
         return factory
 
@@ -433,16 +456,6 @@ class SignalProcess:
             load_open_positions=load_open,
             save_open_position=save_open,
             remove_open_position=remove_open,
-            # Hydrate the shared two-ladder ChainView from the chains table on
-            # startup. This was imported but never wired, so the view booted
-            # EMPTY after every restart — and a chain already at its ladder's
-            # top never emits another propagate event (seed_active's docstring
-            # names exactly this), so restored open positions whose prime had
-            # reached 10m could never fire their TARGET exit, and entries were
-            # suppressed until Set B chains happened to re-emit. The loader,
-            # the hook field, and seed_active all existed; only this line was
-            # missing.
-            load_chain_view_seed=make_load_chain_view_seed(self.pool),
         )
 
     async def _publish(self, raw: dict) -> None:
