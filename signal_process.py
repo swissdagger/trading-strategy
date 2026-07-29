@@ -60,6 +60,7 @@ from producer.persistence import (
     # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
     make_load_buffers,
+    make_load_last_base_signal,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -376,6 +377,10 @@ class SignalProcess:
             return ServiceTwoChainMachine(
                 symbol=symbol, asset_class=asset_class,
                 ladder=timeframes,
+                # Part of the chain's deterministic identity, and the hydrate
+                # discriminator. NOT derivable from `timeframes` — FC and PF
+                # share the 1m baseline.
+                ladder_name=ladder_name,
                 forecast_fn=client.forecast_path,
                 prepare_df_fn=prepare_dataframe_for_sumtyme,
                 to_interval_fn=to_sumtyme_interval,
@@ -391,9 +396,18 @@ class SignalProcess:
                 # oblivious to whether its writes are sync or deferred.
                 persist_chain_propagate=self.audit_writer.persist_chain_propagate,
                 persist_chain_terminate=self.audit_writer.persist_chain_terminate,
+                # Filters on the ladder NAME (migration 019). The old baseline-
+                # timeframe discriminator conflated FC and PF, whose baselines are
+                # both 1m on the same crypto symbols: each machine adopted the
+                # other's chains on restart and advanced them under its own level
+                # numbering.
                 load_active_chains=make_load_active_chains(
-                    self.pool, symbol, asset_class, timeframes),
+                    self.pool, symbol, asset_class, ladder_name),
                 load_buffers=make_load_buffers(self.pool, symbol, timeframes),
+                # Rebuilds the INIT guard so a restart doesn't mint a spurious
+                # chain on the first baseline signal.
+                load_last_base_signal=make_load_last_base_signal(
+                    self.pool, symbol, timeframes[0]),
                 # Was omitted, so the machine silently used its 30s DEFAULT and
                 # SUMTYME_TIMEOUT_S had no effect on anything (the client
                 # constructor rejected the kwarg, so it was applied nowhere at

@@ -44,8 +44,8 @@ MachineFactory.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
-import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -80,6 +80,35 @@ def _epoch_ms_to_iso(ms: int) -> str:
     chronological order (for a fixed offset), so the original's string >= compare
     semantics are preserved."""
     return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat()
+
+
+def chain_id_for(symbol: str, asset_class: str, ladder_name: str,
+                 direction: int, origin_timestamp: str) -> str:
+    """The chain's identity, derived from the initiation that produced it.
+
+    WHY THIS IS NOT uuid4. Bars are delivered at-least-once (see
+    producer/offset_tracker.py) and `_last_base_signal` is process-local, so the
+    SAME initiation can be processed more than once — on replay after a crash, or
+    on the first baseline signal after a restart. With a random id, every one of
+    those wrote a NEW chains row: `ON CONFLICT (chain_id) DO NOTHING` cannot fire
+    on an id that was just minted, so the chains INSERT was the one write on this
+    path with no idempotency at all. Worse, chain_id flows into position_key ->
+    signal_id, so a duplicated chain read downstream as a brand-new position and
+    could open a second trade against one real move.
+
+    Deriving the id from the initiation makes a replayed init a no-op, exactly
+    like chain_steps' (chain_id, step_index) and trade_signals' signal_id. Same
+    "prefix + truncated sha256" shape as signal_writer._signal_id, for consistency.
+
+    LADDER NAME IS PART OF THE KEY AND MUST STAY THERE. Ladders overlap: FC and
+    PF share the 1m baseline and both run on crypto symbols, so one 1m signal
+    legitimately initiates TWO chains — same symbol, direction, and origin_time,
+    different ladders. Keying on the baseline timeframe instead of the ladder name
+    would collapse them into one row and let two machines with different level
+    numbering fight over it.
+    """
+    raw = f"chain1|{symbol}|{asset_class}|{ladder_name}|{direction}|{origin_timestamp}"
+    return "chain1." + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 # Injected collaborators — keep the machine free of module globals so each
@@ -123,6 +152,7 @@ class ServiceTwoChainMachine(ChainMachine):
         asset_class: str,
         ladder: List[str],
         *,
+        ladder_name: str,
         forecast_fn: ForecastFn,
         prepare_df_fn: PrepareDfFn,
         to_interval_fn: ToIntervalFn,
@@ -133,6 +163,8 @@ class ServiceTwoChainMachine(ChainMachine):
         persist_chain_terminate: PersistChainTerminate,
         load_active_chains: Optional[Callable[[], Awaitable[List[dict]]]] = None,
         load_buffers: Optional[Callable[[], Awaitable[Dict[str, deque]]]] = None,
+        load_last_base_signal: Optional[
+            Callable[[], Awaitable[Optional[tuple]]]] = None,
         forecast_timeout_s: float = 30.0,
         forecast_gate: Optional["ForecastGate"] = None,
         forecast_memo: Optional["ForecastMemo"] = None,
@@ -141,6 +173,11 @@ class ServiceTwoChainMachine(ChainMachine):
         self.symbol = symbol
         self.asset_class = asset_class
         self.ladder = ladder
+        # The ladder's REGISTERED NAME ("A"/"B"/"FC"/"PF"), not derivable from
+        # the timeframe list: FC and PF share the 1m baseline, so the baseline
+        # timeframe does not identify a ladder. Part of the chain's identity —
+        # see chain_id_for.
+        self.ladder_name = ladder_name
         self.baseline_timeframe = ladder[0]
 
         self._forecast_fn = forecast_fn
@@ -153,6 +190,7 @@ class ServiceTwoChainMachine(ChainMachine):
         self._persist_term = persist_chain_terminate
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
+        self._load_last_base_signal = load_last_base_signal
         self._forecast_timeout_s = forecast_timeout_s
         # SHARED across every machine in the process — see ForecastGate. Sumtyme
         # serialises concurrent calls server-side, so we hold a single global
@@ -218,7 +256,51 @@ class ServiceTwoChainMachine(ChainMachine):
                 self._active_chains[chain["chain_id"]] = chain
             log.info("hydrated %d active chains for %s/%s",
                      len(self._active_chains), self.symbol, self.baseline_timeframe)
+        await self._restore_last_base_signal()
         self._hydrated = True
+
+    async def _restore_last_base_signal(self) -> None:
+        """Rebuild the INIT guard from durable state.
+
+        WHY. STAGE 1 initiates when the baseline signal DIFFERS from
+        `_last_base_signal`, and `None` counts as different. Hydrate used to
+        restore `_active_chains` but leave this at None, so the first baseline
+        signal after every restart initiated a chain unconditionally — even with
+        a live, same-direction chain just hydrated from the DB. One spurious
+        chain per (symbol, ladder) per restart, on top of whatever replayed bars
+        produced.
+
+        The guard is exactly "the direction of the most recent non-zero baseline
+        signal" — it is only ever compared for inequality, and STAGE 1 sets it to
+        the current baseline signal on every init. So the newest non-zero
+        `signals` row at the baseline timeframe reconstructs it exactly.
+
+        Two sources, newest wins, because neither alone is complete:
+          * `signals` — every baseline signal, but written through the DEFERRED
+            audit writer, so a crash can lose the last batch.
+          * hydrated active chains — each one's origin IS a baseline signal in
+            that chain's direction, and the init write is SYNCHRONOUS, so it
+            survives a crash the signals row may not have.
+        A stale restore is no longer a duplicate-row bug (the chain id is
+        deterministic now), but it still costs a redundant chain and its events.
+        """
+        candidates: List[tuple] = []
+        if self._load_last_base_signal is not None:
+            latest = await self._load_last_base_signal()
+            if latest is not None:
+                candidates.append(latest)          # (signal, iso_timestamp)
+        for chain in self._active_chains.values():
+            history = chain.get("history") or []
+            if history:
+                candidates.append((chain["direction"], history[0]["timestamp"]))
+        if not candidates:
+            return
+        # ISO-8601 at a fixed offset sorts lexically as it sorts chronologically —
+        # the same property the propagation sweep's string >= compares rely on.
+        signal, ts = max(candidates, key=lambda c: c[1])
+        self._last_base_signal = signal
+        log.info("restored last base signal for %s/%s: %+d (from %s)",
+                 self.symbol, self.ladder_name, signal, ts)
 
     def _report_buffer_fill(self) -> None:
         """Severity-graded startup report of buffer fill per rung, once per
@@ -454,31 +536,57 @@ class ServiceTwoChainMachine(ChainMachine):
         base_sig = self._latest_signals.get(0)
         if base_sig and base_sig["signal"] != 0:
             if self._last_base_signal is None or base_sig["signal"] != self._last_base_signal:
-                chain_uuid = str(uuid.uuid4())
-                first_step = {
-                    "level": 1, "timeframe": base_sig["timeframe"],
-                    "timestamp": base_sig["timestamp"], "price": base_sig["price"],
-                }
-                self._last_base_signal = base_sig["signal"]
-                chain = {
-                    "chain_id": chain_uuid, "symbol": self.symbol,
-                    "asset_class": self.asset_class, "direction": base_sig["signal"],
-                    "current_level": 0, "next_expected_level": 1,
-                    "active_timeframes": [base_sig["timeframe"]],
-                    "history": [first_step], "last_timestamp": base_sig["timestamp"],
-                }
-                self._active_chains[chain_uuid] = chain
-                try:
-                    await self._persist_init(chain)
-                except Exception as e:
-                    log.warning("chain init persist failed %s: %r", self.symbol, e)
-                events.append(ChainEvent(
-                    event_type="chain_initiated", chain_id=chain_uuid,
-                    symbol=self.symbol, asset_class=self.asset_class,
-                    direction=base_sig["signal"], propagation_level=1,
-                    timeframe=base_sig["timeframe"], timestamp=base_sig["timestamp"],
-                    price=base_sig["price"],
-                ))
+                chain_id = chain_id_for(
+                    self.symbol, self.asset_class, self.ladder_name,
+                    base_sig["signal"], base_sig["timestamp"],
+                )
+                # Already live? Compare the chain's IDENTITY — direction plus
+                # origin timestamp — not the id. Chains retained across migration
+                # 019 kept their original uuid4, so a computed id will never match
+                # theirs even when it is the same chain, and a replayed bar would
+                # insert a second row for one that is already in memory. This is
+                # the same tuple the hash is built from, so it subsumes an id
+                # comparison and holds across both id generations.
+                #
+                # Re-initiating would fork the in-memory chain and have the two
+                # copies race each other's chain_steps writes to a mutual
+                # ON CONFLICT DO NOTHING. Advance the guard and fall through to
+                # the propagation sweep, which is where a replayed bar belongs.
+                already_live = any(
+                    c["direction"] == base_sig["signal"]
+                    and c["history"][0]["timestamp"] == base_sig["timestamp"]
+                    for c in self._active_chains.values()
+                )
+                if already_live:
+                    self._last_base_signal = base_sig["signal"]
+                    log.debug("init skipped, chain already live: %s %s/%s",
+                              chain_id, self.symbol, self.ladder_name)
+                else:
+                    first_step = {
+                        "level": 1, "timeframe": base_sig["timeframe"],
+                        "timestamp": base_sig["timestamp"], "price": base_sig["price"],
+                    }
+                    self._last_base_signal = base_sig["signal"]
+                    chain = {
+                        "chain_id": chain_id, "symbol": self.symbol,
+                        "asset_class": self.asset_class, "ladder": self.ladder_name,
+                        "direction": base_sig["signal"],
+                        "current_level": 0, "next_expected_level": 1,
+                        "active_timeframes": [base_sig["timeframe"]],
+                        "history": [first_step], "last_timestamp": base_sig["timestamp"],
+                    }
+                    self._active_chains[chain_id] = chain
+                    try:
+                        await self._persist_init(chain)
+                    except Exception as e:
+                        log.warning("chain init persist failed %s: %r", self.symbol, e)
+                    events.append(ChainEvent(
+                        event_type="chain_initiated", chain_id=chain_id,
+                        symbol=self.symbol, asset_class=self.asset_class,
+                        direction=base_sig["signal"], propagation_level=1,
+                        timeframe=base_sig["timeframe"], timestamp=base_sig["timestamp"],
+                        price=base_sig["price"],
+                    ))
 
         # --- STAGE 2 & 3: PROPAGATION & TERMINATION ---
         for cid, chain in list(self._active_chains.items()):

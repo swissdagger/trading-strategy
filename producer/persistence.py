@@ -71,7 +71,7 @@ def make_persist_signal(pool):
 def make_persist_chain_init(pool):
     """chains INSERT at initiation + the initiation step (step_index = 0) into
     chain_steps.
-
+ 
     Per migration 008, chain_steps is the authoritative per-step record and
     chains.history is no longer written per-step (it defaults to '[]' and is
     kept only so nothing reading the column breaks). The initiation step is
@@ -80,6 +80,14 @@ def make_persist_chain_init(pool):
     step-0 row are written in ONE transaction so a chain never exists without
     its initiation step (hydrate reconstructs current_level from the step
     count, so a missing step-0 would under-report the level by one).
+ 
+    Per migration 019 the row also carries `ladder`, the registered ladder name.
+    ON CONFLICT (chain_id) DO NOTHING has been here since 002 but was dead code:
+    chain_id was a fresh uuid4 per call, so the conflict could never fire and a
+    replayed initiation wrote a duplicate row. chain_id is now derived from the
+    initiation (service2_machine.chain_id_for), which makes this clause do the
+    job it always claimed to — a replayed init is a genuine no-op, like
+    chain_steps' (chain_id, step_index).
     """
     async def persist_chain_init(chain: dict) -> None:
         first = chain["history"][0]
@@ -89,15 +97,15 @@ def make_persist_chain_init(pool):
                 await conn.execute(
                     """
                     INSERT INTO chains
-                        (chain_id, symbol, asset_class, direction, origin_time,
-                         origin_price, propagation_levels, active_timeframes,
-                         history, active, last_updated)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '[]'::jsonb, true, $5)
+                        (chain_id, symbol, asset_class, ladder, direction,
+                         origin_time, origin_price, propagation_levels,
+                         active_timeframes, history, active, last_updated)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '[]'::jsonb, true, $6)
                     ON CONFLICT (chain_id) DO NOTHING
                     """,
                     chain["chain_id"], chain["symbol"], chain["asset_class"],
-                    chain["direction"], origin_time, first.get("price"),
-                    1, chain["active_timeframes"],
+                    chain["ladder"], chain["direction"], origin_time,
+                    first.get("price"), 1, chain["active_timeframes"],
                 )
                 await conn.execute(
                     """
@@ -110,7 +118,6 @@ def make_persist_chain_init(pool):
                     origin_time, first.get("price"),
                 )
     return persist_chain_init
-
 
 def make_persist_chain_propagate(pool):
     """chains metadata UPDATE on propagation + an append-only chain_steps INSERT.
@@ -165,14 +172,62 @@ def make_persist_chain_terminate(pool):
             )
     return persist_chain_terminate
 
+def make_load_last_base_signal(pool, symbol: str, baseline_timeframe: str):
+    """The most recent non-zero signal at a ladder's baseline timeframe, as
+    (signal, iso_timestamp), or None if there is none.
+ 
+    This reconstructs the machine's INIT guard across a restart. STAGE 1
+    initiates when the baseline signal differs from _last_base_signal, and None
+    counts as different — so before this existed, the first baseline signal after
+    every restart initiated a chain unconditionally, next to the still-active
+    chain hydrate had just loaded.
+ 
+    The guard is only ever compared for inequality and is set to the current
+    baseline signal at every init, which makes it exactly "the direction of the
+    most recent non-zero baseline signal" — what this query returns.
+ 
+    Cold path (once per machine at hydrate). uq_signals_stream
+    (symbol, timeframe, timestamp) serves it as a backward index scan that stops
+    at the first non-zero row, so the filter does not force a wide scan even
+    though `signals` is the highest-volume table here.
+ 
+    asset_class is deliberately not in the predicate: symbol already determines
+    it, and adding it would put a column outside uq_signals_stream in the way of
+    a query whose whole point is to be a cheap index scan.
+    """
+    async def load_last_base_signal() -> Optional[tuple]:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT signal, timestamp
+                FROM signals
+                WHERE symbol = $1 AND timeframe = $2 AND signal <> 0
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                symbol, baseline_timeframe,
+            )
+        if row is None:
+            return None
+        return int(row["signal"]), row["timestamp"].isoformat()
+    return load_last_base_signal
 
-def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
-    """Hydrate active chains for one (symbol, set) on restart. Filters by symbol +
-    asset_class AND by the chain's timeframes being within this set's ladder, so a
-    Set A machine doesn't adopt a Set B chain (they share the chains table but
-    belong to different ladders). The ladder membership of the chain's baseline
-    timeframe is the discriminator.
-
+def make_load_active_chains(pool, symbol: str, asset_class: str,
+                            ladder_name: str):
+    """Hydrate active chains for one (symbol, ladder) on restart, so chain state
+    survives a restart.
+ 
+    THE DISCRIMINATOR IS THE LADDER NAME (migration 019). It used to be the
+    chain's baseline timeframe (history[0].timeframe == ladder[0]), which is not
+    unique across ladders: FC and PF both baseline at 1m and both run on
+    crypto_symbols(), so each machine adopted the other's chains on restart and
+    advanced them under its own level numbering — 1h is level 5 in FC and level 6
+    in PF. Ownership is now explicit and filtered in SQL.
+ 
+    No legacy branch: migration 019 retired every chain that predates the
+    `ladder` column, and ck_chains_ladder_required makes the column mandatory on
+    anything live, so a NULL ladder cannot reach this query.
+ 
     Per migration 008 the per-step history is reconstructed from chain_steps
     (authoritative, append-only) rather than the chains.history column. One
     indexed SELECT per chain ordered by step_index yields the same ordered list
@@ -185,12 +240,14 @@ def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT chain_id, symbol, asset_class, direction, origin_time,
-                       origin_price, propagation_levels, active_timeframes
+                SELECT chain_id, symbol, asset_class, ladder, direction,
+                       origin_time, origin_price, propagation_levels,
+                       active_timeframes
                 FROM chains
                 WHERE active = true AND symbol = $1 AND asset_class = $2
+                  AND ladder = $3
                 """,
-                symbol, asset_class,
+                symbol, asset_class, ladder_name,
             )
             # Reconstruct each chain's ordered step history from chain_steps.
             step_rows = await conn.fetch(
@@ -200,9 +257,10 @@ def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
                 FROM chain_steps cs
                 JOIN chains c ON c.chain_id = cs.chain_id
                 WHERE c.active = true AND c.symbol = $1 AND c.asset_class = $2
+                  AND c.ladder = $3
                 ORDER BY cs.chain_id, cs.step_index
                 """,
-                symbol, asset_class,
+                symbol, asset_class, ladder_name,
             )
         # Group steps by chain_id, preserving step_index order (query is ORDER BY).
         history_by_chain: dict = {}
@@ -218,17 +276,21 @@ def make_load_active_chains(pool, symbol: str, asset_class: str, ladder: list):
         out = []
         for r in rows:
             history = history_by_chain.get(r["chain_id"], [])
-            # Only adopt chains whose baseline timeframe is this set's baseline —
-            # i.e. chains that belong to THIS ladder.
+            # A chain with no steps cannot be reconstructed (current_level and
+            # next_expected_level derive from the step count). persist_chain_init
+            # writes the row and its step-0 in ONE transaction, so this should be
+            # unreachable — log it rather than silently dropping the chain.
             if not history:
-                continue
-            if history[0]["timeframe"] != ladder[0]:
+                log.warning("skipping chain %s: no chain_steps rows (expected "
+                            "at least step 0 from persist_chain_init)",
+                            r["chain_id"])
                 continue
             # Reconstruct the in-memory chain dict shape the machine expects.
             last = history[-1]
             out.append({
                 "chain_id": r["chain_id"], "symbol": r["symbol"],
-                "asset_class": r["asset_class"], "direction": r["direction"],
+                "asset_class": r["asset_class"], "ladder": r["ladder"],
+                "direction": r["direction"],
                 "current_level": len(history) - 1,
                 "next_expected_level": len(history),
                 "active_timeframes": list(r["active_timeframes"]),
