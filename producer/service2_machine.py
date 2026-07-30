@@ -82,6 +82,29 @@ def _epoch_ms_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat()
 
 
+def _as_signal_candidate(loaded) -> Optional[tuple]:
+    """Normalise whatever load_last_base_signal returned into (signal, iso_ts).
+
+    The hook is expected to return (signal, iso_timestamp), but a bare signal
+    int is accepted too — the contract is easy to get subtly wrong when wiring
+    the persistence layer, and a mismatch used to surface as a TypeError deep in
+    a max() key, which is a miserable way to learn about it.
+
+    A bare int carries no timestamp to order by, so it ranks oldest: an active
+    chain's origin, when there is one, comes from a synchronous write and is the
+    more durable source anyway.
+    """
+    if loaded is None:
+        return None
+    if isinstance(loaded, (tuple, list)):
+        if len(loaded) != 2:
+            raise ValueError(
+                f"load_last_base_signal returned {len(loaded)} values, "
+                f"expected (signal, iso_timestamp)")
+        return int(loaded[0]), str(loaded[1])
+    return int(loaded), ""
+
+
 def chain_id_for(symbol: str, asset_class: str, ladder_name: str,
                  direction: int, origin_timestamp: str) -> str:
     """The chain's identity, derived from the initiation that produced it.
@@ -169,6 +192,7 @@ class ServiceTwoChainMachine(ChainMachine):
         forecast_gate: Optional["ForecastGate"] = None,
         forecast_memo: Optional["ForecastMemo"] = None,
         optional_timeframes: Optional[set] = None,
+        watermarks: Optional["WatermarkRegistry"] = None,
     ):
         self.symbol = symbol
         self.asset_class = asset_class
@@ -191,6 +215,10 @@ class ServiceTwoChainMachine(ChainMachine):
         self._load_active_chains = load_active_chains
         self._load_buffers = load_buffers
         self._load_last_base_signal = load_last_base_signal
+        # SHARED across every machine in the process, like the gate and the memo.
+        # None in tests/standalone; signal_process injects exactly one so the
+        # audit endpoint can see every machine's progress.
+        self._watermarks = watermarks
         self._forecast_timeout_s = forecast_timeout_s
         # SHARED across every machine in the process — see ForecastGate. Sumtyme
         # serialises concurrent calls server-side, so we hold a single global
@@ -260,20 +288,25 @@ class ServiceTwoChainMachine(ChainMachine):
         self._hydrated = True
 
     async def _restore_last_base_signal(self) -> None:
-        """Rebuild the INIT guard from durable state.
+        """Rebuild the INIT guard from durable state. BEST EFFORT — never raises.
 
-        WHY. STAGE 1 initiates when the baseline signal DIFFERS from
-        `_last_base_signal`, and `None` counts as different. Hydrate used to
-        restore `_active_chains` but leave this at None, so the first baseline
-        signal after every restart initiated a chain unconditionally — even with
-        a live, same-direction chain just hydrated from the DB. One spurious
-        chain per (symbol, ladder) per restart, on top of whatever replayed bars
-        produced.
+        WHY IT MUST NOT RAISE. hydrate() is called from
+        MultiLadderRouter._machine_for on the bar path, so an exception here does
+        not just skip the restore, it propagates into the symbol worker and every
+        bar for this (symbol, ladder) is dropped. The whole downside of this
+        method doing nothing is ONE redundant chain at the next baseline signal —
+        the pre-fix behaviour. Trading that for a dead pipeline is never right, so
+        failures are logged and swallowed.
+
+        WHY THE GUARD NEEDS RESTORING. STAGE 1 initiates when the baseline signal
+        DIFFERS from `_last_base_signal`, and None counts as different. Hydrate
+        used to restore `_active_chains` but leave this at None, so the first
+        baseline signal after every restart initiated a chain unconditionally —
+        even with a live, same-direction chain just hydrated from the DB.
 
         The guard is exactly "the direction of the most recent non-zero baseline
-        signal" — it is only ever compared for inequality, and STAGE 1 sets it to
-        the current baseline signal on every init. So the newest non-zero
-        `signals` row at the baseline timeframe reconstructs it exactly.
+        signal": it is only ever compared for inequality, and STAGE 1 sets it to
+        the current baseline signal on every init.
 
         Two sources, newest wins, because neither alone is complete:
           * `signals` — every baseline signal, but written through the DEFERRED
@@ -281,12 +314,19 @@ class ServiceTwoChainMachine(ChainMachine):
           * hydrated active chains — each one's origin IS a baseline signal in
             that chain's direction, and the init write is SYNCHRONOUS, so it
             survives a crash the signals row may not have.
-        A stale restore is no longer a duplicate-row bug (the chain id is
-        deterministic now), but it still costs a redundant chain and its events.
         """
+        try:
+            await self._restore_last_base_signal_inner()
+        except Exception as e:
+            log.warning(
+                "last base signal restore failed for %s/%s: %r — continuing "
+                "without it; costs at most one redundant chain at the next "
+                "baseline signal", self.symbol, self.ladder_name, e)
+
+    async def _restore_last_base_signal_inner(self) -> None:
         candidates: List[tuple] = []
         if self._load_last_base_signal is not None:
-            latest = await self._load_last_base_signal()
+            latest = _as_signal_candidate(await self._load_last_base_signal())
             if latest is not None:
                 candidates.append(latest)          # (signal, iso_timestamp)
         for chain in self._active_chains.values():
@@ -518,6 +558,18 @@ class ServiceTwoChainMachine(ChainMachine):
             "timestamp": bar_iso,
             "price": current_price,
         }
+
+        # PROCESSED-THROUGH WATERMARK. Recorded here — after the forecast landed
+        # and the cache advanced — so it means "this machine consumed this bar",
+        # not "a bar arrived". A neutral signal still counts: the machine did its
+        # work and decided nothing, which is exactly the case an auditor cannot
+        # distinguish from a dropped bar by watching chain events alone.
+        #
+        # Deliberately before the signal_value == 0 return, so silence in the
+        # chain stream is still visible as forward progress.
+        if self._watermarks is not None:
+            self._watermarks.record(
+                self.symbol, self.ladder_name, bar.timeframe, bar.timestamp)
 
         if signal_value == 0:
             return []   # neutral signals are recorded but don't drive chain logic

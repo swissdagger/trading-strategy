@@ -44,7 +44,14 @@ from typing import Optional
 import asyncpg
 from aiokafka import TopicPartition
 
+from execution.observability import HealthServer, Metrics
 from execution.signal_writer import SignalWriter, SignalWriterHooks
+from producer.audit import (
+    AuditCache,
+    WatermarkRegistry,
+    build_signal_health_document,
+    make_chain_audit_refresher,
+)
 from producer.async_writer import BatchedAuditWriter
 from producer.fanout_router_multi import MultiLadderRouter
 from producer.forecast_gate import ForecastGate, ForecastMemo
@@ -100,6 +107,16 @@ class Config:
         # Wall-clock age (bar timestamp -> now) above which we warn. This is the
         # gauge that would have caught the multi-day stall on day one.
         self.lag_warn_s = float(os.environ.get("LAG_WARN_S", "300"))
+        # --- Audit + health endpoint ---
+        # Port the health/watermark/audit surface binds. Expose it to whoever is
+        # auditing; it is read-only and carries no credentials or trade detail.
+        self.health_port = int(os.environ.get("HEALTH_PORT", "8081"))
+        # How often the chain-integrity counts are recomputed. NOT per request —
+        # a scraping loop must not be able to load the DB. 60s is well inside the
+        # window anyone auditing would care about, and the document reports its
+        # own age so a stale view is never mistaken for a fresh one.
+        self.audit_refresh_seconds = float(
+            os.environ.get("AUDIT_REFRESH_S", "60"))
         # Client-side request timeout for the blocking Sumtyme SDK call.
         #
         # With the ForecastGate holding a single permit, this now measures what it
@@ -256,6 +273,25 @@ class SignalProcess:
         # DOUBLE crypto's Sumtyme demand for identical answers.
         self.forecast_memo = ForecastMemo()
 
+        # --- Audit surface: processed-through watermarks + chain integrity ---
+        # Chain events are a SPARSE output — a machine can consume bars correctly
+        # for hours and emit nothing because nothing propagated. So the chain
+        # stream cannot distinguish "working, nothing to say" from "wedged" or
+        # "dropping bars", and a raising hydrate once took down bar processing for
+        # every symbol while the process stayed up and looked fine. The watermark
+        # makes forward progress observable independently of whether anything fired.
+        #
+        # SHARED like the gate and the memo: one registry, injected into every
+        # machine, so /watermarks shows the whole process.
+        self.watermarks = WatermarkRegistry()
+        # Chain-integrity counts, refreshed on a timer rather than per request, so
+        # a scraping loop cannot put load on the DB and the HTTP thread never
+        # touches asyncio.
+        self.audit_cache = AuditCache()
+        self.metrics = Metrics()
+        self._audit_task: Optional[asyncio.Task] = None
+        self._health_server: Optional[HealthServer] = None
+
         # --- Batched audit writer: research/audit writes OFF the hot path ---
         # Adopting the writer exactly as its docstring prescribes (it was built,
         # documented, and left dormant for this moment). It takes the signals /
@@ -346,6 +382,32 @@ class SignalProcess:
             locks=self.router._locks,   # SHARE the router's lock map
         )
         await self.runtime.start()
+
+        # --- Audit + health endpoint ---
+        # Started LAST, so a 200 from /health means the whole pipeline is up, not
+        # just the process. Threaded (stdlib http.server on a daemon thread), NOT
+        # async: a wedged event loop is precisely the failure this must report, so
+        # the server must not share it.
+        self._audit_task = asyncio.create_task(
+            make_chain_audit_refresher(
+                self.pool, self.audit_cache,
+                interval_seconds=self.cfg.audit_refresh_seconds)(),
+            name="chain-audit-refresh")
+        self._health_server = HealthServer(
+            lambda: build_signal_health_document(
+                booted=True,
+                watermarks=self.watermarks.snapshot(),
+                audit=self.audit_cache.snapshot(),
+                metrics_snapshot=self.metrics.snapshot()),
+            self.metrics,
+            port=self.cfg.health_port,
+            extra_routes={
+                "/watermarks": lambda: {"watermarks": self.watermarks.snapshot()},
+                "/audit": self.audit_cache.snapshot,
+            },
+        )
+        self._health_server.start()
+
         log.info("signal process started: strategies=%s ladders=%s bars<-%s events->%s",
                  [s.name for s in self.strategies.active()],
                  self.strategies.all_ladders(),
@@ -424,6 +486,10 @@ class SignalProcess:
                 # hydrate fill report to INFO for them (e.g. PF's 12h).
                 optional_timeframes=set(
                     LADDER_OPTIONAL_TIMEFRAMES.get(ladder_name, [])),
+                # SHARED across every machine, like the gate and the memo:
+                # the audit endpoint reads one registry to see the whole
+                # process's progress.
+                watermarks=self.watermarks,
             )
         return factory
 
@@ -634,6 +700,14 @@ class SignalProcess:
         # viable (single-call latency L, and the resulting 1/L ceiling).
         if self.forecast_gate is not None:
             self.forecast_gate.log_stats()
+
+        # Stop serving BEFORE draining: a health check during shutdown should
+        # fail to connect (unambiguously "going away") rather than return a 200
+        # describing a pipeline that is already tearing down.
+        if self._health_server is not None:
+            self._health_server.stop()
+        if self._audit_task is not None:
+            self._audit_task.cancel()
 
         if self.workers is not None:
             await self.workers.drain()

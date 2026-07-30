@@ -95,9 +95,16 @@ class HealthServer:
 
     def __init__(self, snapshot_fn: Callable[[], dict],
                  metrics: "Metrics", *, host: str = "0.0.0.0",
-                 port: int = 8080) -> None:
+                 port: int = 8080,
+                 extra_routes: Optional[Dict[str, Callable[[], dict]]] = None) -> None:
         self._snapshot_fn = snapshot_fn
         self._metrics = metrics
+        # Optional path -> callback map, e.g. {"/watermarks": registry.snapshot}.
+        # Each callback must return a JSON-serialisable dict and must NOT touch
+        # asyncio: it runs on the HTTP thread, deliberately isolated from the
+        # event loop so a wedged loop can still be reported. Always 200 — these
+        # are informational surfaces; only /health carries a verdict.
+        self._extra_routes = dict(extra_routes or {})
         self._host = host
         self._port = port
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -110,8 +117,8 @@ class HealthServer:
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="health-server", daemon=True)
         self._thread.start()
-        log.info("health server listening on %s:%d (/health, /metrics)",
-                 self._host, self._port)
+        log.info("health server listening on %s:%d (%s)", self._host, self._port,
+                 ", ".join(["/health", "/metrics", *sorted(self._extra_routes)]))
 
     def stop(self) -> None:
         """Stop serving and join the thread. Idempotent."""
@@ -127,6 +134,7 @@ class HealthServer:
     def _make_handler(self):
         snapshot_fn = self._snapshot_fn
         metrics = self._metrics
+        extra_routes = self._extra_routes
 
         class _Handler(BaseHTTPRequestHandler):
             # Silence the default per-request stderr logging; the app logs what
@@ -152,9 +160,15 @@ class HealthServer:
                     self._write(200 if doc.get("healthy") else 503, doc)
                 elif self.path.rstrip("/") == "/metrics":
                     self._write(200, metrics.snapshot())
+                elif self.path.rstrip("/") in extra_routes:
+                    try:
+                        self._write(200, extra_routes[self.path.rstrip("/")]())
+                    except Exception as e:
+                        self._write(500, {"error": repr(e)})
                 else:
                     self._write(404, {"error": "not found",
-                                      "paths": ["/health", "/metrics"]})
+                                      "paths": ["/health", "/metrics",
+                                                *sorted(extra_routes)]})
 
         return _Handler
 
