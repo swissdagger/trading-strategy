@@ -557,48 +557,6 @@ def make_persist_warmup_bars(pool):
             )
     return persist_warmup_bars
 
-def make_load_last_base_signal(pool, symbol: str, baseline_timeframe: str):
-    """Restore a machine's _last_base_signal on hydrate: the newest NON-ZERO
-    signal for (symbol, baseline timeframe) from the signals table.
-
-    WHY NON-ZERO: the machine's _last_base_signal invariant is "the last
-    non-zero baseline signal seen" — it is only ever assigned inside the INIT
-    branch (which fires exactly when a non-zero baseline signal differs from
-    it), so zeros never touch it. Restoring the newest non-zero row reproduces
-    that invariant exactly; filtering on signal <> 0 is therefore load-bearing,
-    not an optimisation.
-
-    WHY THIS MATTERS: without it, _last_base_signal is None after every
-    restart, so the FIRST non-zero baseline signal always INITs a new chain —
-    even when it's the same direction that was already running pre-restart —
-    yielding duplicate concurrent same-direction chains and spurious extra
-    entry triggers into trade_signals.
-
-    STALENESS CAVEAT (accepted): signals rows are written via the deferred
-    BatchedAuditWriter, so the newest row can lag by up to the flush interval
-    (and the unflushed tail is lost on a hard crash). Worst case the restored
-    value is one bar stale, which degrades to exactly today's behaviour (a
-    possible duplicate same-direction INIT) — never worse than not restoring.
-
-    Ordering is by the signals PK's timestamp (the forecast's predicted-bar
-    time), the same ordering the machine's ISO-string compares use, so
-    (symbol, timeframe) equality + timestamp DESC rides the upsert's index.
-    """
-    async def load_last_base_signal() -> Optional[int]:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT signal
-                FROM signals
-                WHERE symbol = $1 AND timeframe = $2 AND signal <> 0
-                ORDER BY timestamp DESC
-                LIMIT 1
-                """,
-                symbol, baseline_timeframe,
-            )
-        return int(row["signal"]) if row is not None else None
-    return load_last_base_signal
-
 
 def make_load_buffers(pool, symbol: str, timeframes: list):
     """Hydrate one machine's per-timeframe buffers from warmup_bars (migration
