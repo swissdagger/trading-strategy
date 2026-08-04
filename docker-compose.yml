@@ -64,6 +64,13 @@ services:
     restart: unless-stopped
     command: ["python", "signal_process.py"]
     env_file: .env
+    # NOT `ports:`. The health/audit endpoints have no authentication of
+    # their own, so 8081 is deliberately NOT published to the host — it is
+    # reachable only inside the compose network, where the caddy service
+    # terminates TLS and checks a bearer token in front of it. Publishing
+    # it here would bypass that entirely.
+    expose:
+      - "8081"
     environment:
       KAFKA_BOOTSTRAP: "kafka:9092"
     depends_on:
@@ -82,5 +89,35 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+  # --- Public, authenticated access to the signal process's read-only
+  # health/audit endpoints. See Caddyfile for the reasoning and setup.
+  #
+  # A downstream team consumes trade_signals and needs to verify pipeline
+  # liveness and chain integrity before trusting the signals. Rather than
+  # publishing 8081 unauthenticated, this terminates TLS, checks a bearer token,
+  # and proxies only the four read-only routes.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      # 80 is required for the ACME HTTP challenge (certificate issuance and
+      # renewal), not just for redirecting to HTTPS. Restrict BOTH to the
+      # consuming team's egress IPs in the cloud firewall.
+      - "80:80"
+      - "443:443"
+    environment:
+      HEALTH_PUBLIC_HOST: "${HEALTH_PUBLIC_HOST}"
+      HEALTH_BEARER_TOKEN: "${HEALTH_BEARER_TOKEN}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account keys. MUST persist, or every container
+      # restart re-requests a certificate and will hit Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - signal
+
 volumes:
   kafka_data:
+  caddy_data:
+  caddy_config:
