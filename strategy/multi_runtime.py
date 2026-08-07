@@ -228,6 +228,9 @@ class MultiStrategyRuntime:
             #
             # Scoped per-strategy, not around the whole loop, so a failure in
             # strategy #1 does not skip strategy #2's entry evaluation.
+            # NEW GATEKEEPER: Only pass the event if the strategy declared this ladder
+            if ladder not in strategy.ladders:
+                continue
             try:
                 await self._try_entry(strategy, event_for_strategies, raw)
             except Exception:
