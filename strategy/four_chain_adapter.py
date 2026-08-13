@@ -1,10 +1,10 @@
 """
-strategy/four_chain_adapter.py — bridges the four-chain strategy to the
+strategy/two_chain_adapter.py — bridges the two-chain strategy to the
 registry's component protocol and feeds its private ChainHistoryView.
 
 The MultiStrategyRuntime folds each event into the SHARED two-ladder ChainView
 and then calls each strategy's entry.on_event(ev) / exit.maybe_emit_exit(...).
-But the four-chain strategy:
+But the two-chain strategy:
   * reads from its OWN ChainHistoryView (retains terminated chains + per-tf
     timestamps), not the two-ladder ChainView;
   * needs that history fed the raw event BEFORE its on_event runs.
@@ -12,35 +12,28 @@ But the four-chain strategy:
 So this module provides thin adapters that:
   1. own the ChainHistoryView,
   2. fold each incoming event into it (entry side, once per event),
-  3. translate the runtime's TaggedChainEvent into the four-chain components'
+  3. translate the runtime's TaggedChainEvent into the two-chain components'
      keyword call.
 
-This keeps the four-chain strategy fully decoupled from the two-ladder view
+This keeps the two-chain strategy fully decoupled from the two-ladder view
 while satisfying the EntryComponent / ExitComponent protocols the registry and
 runtime expect. The history view is SHARED between the entry and exit adapters
 (one view per (symbol-space) strategy instance), so both see the same chains.
-
-## Event shape
-
-The runtime passes a TaggedChainEvent-like object with: symbol, asset_class,
-chain_id, event_type, direction, propagation_level, timestamp. (This strategy
-ignores the A/B `set` tag — it's on its own ladder.) The entry adapter folds
-every event into the history; the exit adapter does not fold (the entry adapter
-already did for this event, under the same per-symbol lock).
 """
 from __future__ import annotations
 
 from typing import Optional
 
 from strategy.chain_history import ChainHistoryView
-from strategy.four_chain_strategy import FourChainEntry, FourChainExit
+# Assuming the main strategy file was renamed to two_chain_strategy.py
+from strategy.two_chain_strategy import TwoChainEntry, TwoChainExit
 
 
-class FourChainEntryAdapter:
+class TwoChainEntryAdapter:
     """EntryComponent for the registry. Folds each event into the shared
-    ChainHistoryView, then runs the four-chain entry check."""
+    ChainHistoryView, then runs the two-chain entry check."""
 
-    def __init__(self, view: ChainHistoryView, entry: FourChainEntry):
+    def __init__(self, view: ChainHistoryView, entry: TwoChainEntry):
         self._view = view
         self._entry = entry
 
@@ -68,12 +61,12 @@ class FourChainEntryAdapter:
         )
 
 
-class FourChainExitAdapter:
+class TwoChainExitAdapter:
     """ExitComponent for the registry. Does NOT fold the event (the entry
     adapter already did, under the same per-symbol lock); just evaluates exit
     against the shared history view."""
 
-    def __init__(self, exit_: FourChainExit):
+    def __init__(self, exit_: TwoChainExit):
         self._exit = exit_
 
     async def maybe_emit_exit(
@@ -83,9 +76,8 @@ class FourChainExitAdapter:
     ) -> Optional[str]:
         # decision_price accepted + passed through. The runtime's sweep passes
         # it on EVERY call; without this parameter the call raised TypeError
-        # into the sweep's per-position isolation, so four_chain exits were
-        # being logged as evaluation failures instead of evaluated. FourChainExit
-        # itself always accepted it — only this adapter was missing it.
+        # into the sweep's per-position isolation, so two_chain exits were
+        # being logged as evaluation failures instead of evaluated.
         return await self._exit.maybe_emit_exit(
             symbol=symbol,
             asset_class=asset_class,
@@ -96,24 +88,23 @@ class FourChainExitAdapter:
         )
 
 
-def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_factory):
+def make_two_chain(*, name, symbols, ladders, params, view_registry, writer_factory):
     """Strategy factory for the registry.
 
-    Builds the four-chain strategy: its own ChainHistoryView on the ladder it
+    Builds the two-chain strategy: its own ChainHistoryView on the ladder it
     declares (must be exactly one — this is a single-ladder strategy), a
     SignalWriter bound to `name`, and the entry/exit adapters.
 
     view_registry: the LadderRegistry, to resolve the ladder by name.
     writer_factory: callable(strategy_name) -> SignalWriter, so each strategy
                     gets a writer tagged with its own name.
-    params may carry 'max_chains_per_symbol' to tune the per-symbol history cap
-    (memory backstop; there is no time-based retention — see ChainHistoryView).
+    params may carry 'max_chains_per_symbol' to tune the per-symbol history cap.
     """
     from strategy.registry import Strategy
 
     if len(ladders) != 1:
         raise ValueError(
-            f"four_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
+            f"two_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
         )
     ladder = view_registry.get(ladders[0])
     cap = params.get("max_chains_per_symbol")
@@ -124,12 +115,12 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
     )
     writer = writer_factory(name)
 
-    entry = FourChainEntry(history, ladder, writer)
-    exit_ = FourChainExit(history, ladder, writer)
+    entry = TwoChainEntry(history, ladder, writer)
+    exit_ = TwoChainExit(history, ladder, writer)
     return Strategy(
         name=name,
-        entry=FourChainEntryAdapter(history, entry),
-        exit=FourChainExitAdapter(exit_),
+        entry=TwoChainEntryAdapter(history, entry),
+        exit=TwoChainExitAdapter(exit_),
         symbols=symbols,
         ladders=ladders,
     )
