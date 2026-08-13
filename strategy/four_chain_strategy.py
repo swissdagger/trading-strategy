@@ -9,7 +9,7 @@ from execution.types import ExitReason, TradeSide
 from strategy.chain_history import ChainHistoryView, ChainLifecycle
 from strategy.ladder_registry import Ladder
 
-log = logging.getLogger("strategy.two_chain")
+log = logging.getLogger("strategy.four_chain")
 
 _FUNNEL_SUMMARY_EVERY = 25
 
@@ -120,7 +120,7 @@ class FourChainEntry:
 
     def _veto(self, symbol: str, stage: str) -> None:
         self._funnel[f"veto:{stage}"] += 1
-        log.debug("trade_strategy_2 VETO %s at %s", symbol, stage)
+        log.debug("four_chain VETO %s at %s", symbol, stage)
         triggers = self._funnel["trigger"]
         if triggers % _FUNNEL_SUMMARY_EVERY == 0:
             vetoes = {
@@ -129,7 +129,7 @@ class FourChainEntry:
                 if k.startswith("veto:")
             }
             log.info(
-                "trade_strategy_2 FUNNEL: triggers=%d init_ok=%d entered=%d vetoes=%s",
+                "four_chain FUNNEL: triggers=%d init_ok=%d entered=%d vetoes=%s",
                 triggers, self._funnel["init_pattern_ok"],
                 self._funnel["entered"], vetoes,
             )

@@ -10,15 +10,14 @@ from __future__ import annotations
 from typing import Optional
 
 from strategy.chain_history import ChainHistoryView
-# Assuming the main strategy file was renamed to two_chain_strategy.py
-from strategy.two_chain_strategy import TwoChainEntry, TwoChainExit
+from strategy.four_chain_strategy import FourChainEntry, FourChainExit
 
 
-class TwoChainEntryAdapter:
+class FourChainEntryAdapter:
     """EntryComponent for the registry. Folds each event into the shared
     ChainHistoryView, then runs the entry check."""
 
-    def __init__(self, view: ChainHistoryView, entry: TwoChainEntry):
+    def __init__(self, view: ChainHistoryView, entry: FourChainEntry):
         self._view = view
         self._entry = entry
 
@@ -47,7 +46,7 @@ class FourChainExitAdapter:
     """ExitComponent for the registry. Does NOT fold the event; just evaluates 
     exit against the shared history view."""
 
-    def __init__(self, exit_: TwoChainExit):
+    def __init__(self, exit_: FourChainExit):
         self._exit = exit_
 
     async def maybe_emit_exit(
@@ -71,7 +70,7 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
 
     if len(ladders) != 1:
         raise ValueError(
-            f"two_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
+            f"four_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
         )
     ladder = view_registry.get(ladders[0])
     cap = params.get("max_chains_per_symbol")
@@ -82,12 +81,12 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
     )
     writer = writer_factory(name)
 
-    entry = TwoChainEntry(history, ladder, writer)
-    exit_ = TwoChainExit(history, ladder, writer)
+    entry = FourChainEntry(history, ladder, writer)
+    exit_ = FourChainExit(history, ladder, writer)
     return Strategy(
         name=name,
-        entry=TwoChainEntryAdapter(history, entry),
-        exit=TwoChainExitAdapter(exit_),
+        entry=FourChainEntryAdapter(history, entry),
+        exit=FourChainExitAdapter(exit_),
         symbols=symbols,
         ladders=ladders,
     )
