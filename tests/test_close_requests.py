@@ -1,7 +1,13 @@
 """
-Kill switch 'flatten' mode: while engaged, the executor cancels working entries
-and closes every open position (reason KILL_SWITCH) through the normal exit
-path. Driven with the fakes from test_signal_executor / test_executor_hardening.
+Final closes that must settle the entry first:
+  * the kill switch's 'flatten' mode closes every open position (reason
+    KILL_SWITCH);
+  * a normal EXIT on a trade whose entry is still working cancels the entry
+    before selling (before this, the trade was marked CLOSED while its buy
+    kept working).
+Both go through SignalExecutor._request_close and the per-tick retry in
+run_close_requests_once. Driven with the fakes from test_signal_executor /
+test_executor_hardening.
 """
 import asyncio
 from decimal import Decimal
@@ -12,8 +18,8 @@ from test_executor_hardening import SpotAdapter, db_trade, positions
 from test_signal_executor import enter_row, exit_row, make_hooks
 
 from execution.gated_adapter import GATED_PREFIX
-from execution.signal_executor import SignalExecutor
-from execution.types import ExitReason, Fill, OrderIntent, OrderResult, OrderStatus
+from execution.signal_executor import OpenTrade, SignalExecutor
+from execution.types import ExitReason, Fill, OrderIntent, OrderResult, OrderStatus, TradeSide
 
 
 class CancelAdapter(SpotAdapter):
@@ -74,7 +80,7 @@ def _exits(adapter):
 async def test_does_nothing_while_switch_is_not_in_flatten_mode():
     ex, adapter, _, _ = await _executor()
     await ex.handle_signal(enter_row())
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _trade(ex).state == "OPEN"
     assert _exits(adapter) == [] and adapter.cancels == []
 
@@ -86,7 +92,7 @@ async def test_no_hook_means_no_flatten():
     ex = SignalExecutor(adapter, hooks)       # kill_switch_flatten left None
     await ex.start()
     await ex.handle_signal(enter_row())
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _trade(ex).state == "OPEN"
 
 
@@ -96,7 +102,7 @@ async def test_filled_position_is_closed_with_kill_switch_reason():
     await ex.handle_signal(enter_row())
     trade_id = _trade(ex).trade_id
     switch["on"] = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     (exit_order,) = _exits(adapter)
     assert exit_order.side.value == "LONG" and exit_order.qty == Decimal("10")
     assert adapter.cancels == []                  # entry was complete: nothing to cancel
@@ -113,7 +119,7 @@ async def test_working_entry_with_no_fill_is_cancelled_and_closed_with_nothing_t
     trade = _trade(ex)
     assert trade.state == "SUBMITTED"
     switch["on"] = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert adapter.cancels == [trade.entry_client_order_id]
     assert _exits(adapter) == []
     assert ex._open == {}
@@ -130,7 +136,7 @@ async def test_partial_entry_cancels_the_rest_then_sells_what_was_bought():
     assert trade.state == "OPEN" and trade.filled_qty == Decimal("4")
     switch["on"] = True
     adapter.cancel_results = [_result(OrderStatus.CANCELLED, "4")]
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert adapter.cancels == [trade.entry_client_order_id]
     (exit_order,) = _exits(adapter)
     assert exit_order.qty == Decimal("4")
@@ -148,12 +154,12 @@ async def test_close_waits_for_entry_fills_the_cancel_reported_but_the_stream_ha
     trade = _trade(ex)
     switch["on"] = True
     adapter.cancel_results = [_result(OrderStatus.CANCELLED, "6")]
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _exits(adapter) == []
-    await ex.run_flatten_once()                   # still waiting; no re-cancel
+    await ex.run_close_requests_once()                   # still waiting; no re-cancel
     assert _exits(adapter) == [] and len(adapter.cancels) == 1
     await ex._on_fill(_fill("e2", "2", cid=trade.entry_client_order_id))
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     (exit_order,) = _exits(adapter)
     assert exit_order.qty == Decimal("6")
 
@@ -165,9 +171,9 @@ async def test_unconfirmed_cancel_does_not_sell_and_retries():
     await ex.handle_signal(enter_row())
     switch["on"] = True
     adapter.cancel_results = [_result(OrderStatus.WORKING)]
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _trade(ex).state == "SUBMITTED" and _exits(adapter) == []
-    await ex.run_flatten_once()                   # default: cancel confirmed
+    await ex.run_close_requests_once()                   # default: cancel confirmed
     assert len(adapter.cancels) == 2 and ex._open == {}
 
 
@@ -178,10 +184,10 @@ async def test_cancel_that_raises_is_retried_next_pass():
     await ex.handle_signal(enter_row())
     switch["on"] = True
     adapter.cancel_raises = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _trade(ex).state == "SUBMITTED"
     adapter.cancel_raises = False
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert ex._open == {}
 
 
@@ -195,7 +201,7 @@ async def test_gated_cancel_is_not_taken_as_cancelled():
     switch["on"] = True
     adapter.cancel_results = [OrderResult(client_order_id="x", status=OrderStatus.CANCELLED,
                                           reject_reason=f"{GATED_PREFIX}trade_disabled")]
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert _trade(ex).state == "SUBMITTED"
 
 
@@ -208,7 +214,7 @@ async def test_final_exit_already_working_is_left_to_the_escalation_driver():
     assert _trade(ex).state == "CLOSING"
     n = len(adapter.submitted)
     switch["on"] = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert len(adapter.submitted) == n and adapter.cancels == []
     assert _trade(ex).exit_reason == "STOP"
 
@@ -220,7 +226,7 @@ async def test_halted_trade_is_left_for_a_human():
     hooks, state = make_hooks(open_trades=[db_trade("t1", state="HALTED")])
     ex, adapter, _, switch = await _executor(adapter, hooks, state)
     switch["on"] = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert adapter.submitted == [] and adapter.cancels == []
 
 
@@ -230,7 +236,7 @@ async def test_flattens_every_symbol():
     await ex.handle_signal(enter_row(chain="c1", symbol="AAPL"))
     await ex.handle_signal(enter_row(chain="c2", symbol="MSFT"))
     switch["on"] = True
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     assert sorted(o.symbol for o in _exits(adapter)) == ["AAPL", "MSFT"]
     assert ex._open == {}
 
@@ -241,10 +247,10 @@ async def test_unfilled_flatten_exit_escalates_like_any_exit():
     await ex.handle_signal(enter_row())
     switch["on"] = True
     adapter.set_next_result(_result(OrderStatus.WORKING))
-    await ex.run_flatten_once()
+    await ex.run_close_requests_once()
     trade = _trade(ex)
     assert trade.state == "CLOSING" and trade.exit_rung == 0
-    await ex.run_flatten_once()                   # already closing for good: no-op
+    await ex.run_close_requests_once()                   # already closing for good: no-op
     assert len(_exits(adapter)) == 1
     state["now"][0] = trade.exit_deadline_ms + 1
     await ex.run_escalation_once()                # rung 0 expired -> re-issue wider
@@ -273,3 +279,125 @@ async def test_entries_are_still_blocked_while_flattening():
     switch["on"] = True
     await ex.handle_signal(enter_row())
     assert adapter.submitted == []
+
+
+# --------------------------------------------------------------------
+# A normal EXIT also cancels a still-working entry first
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_exit_on_unfilled_working_entry_cancels_it():
+    # The bug: the trade was marked CLOSED while its buy order kept working,
+    # so a late fill would have been an unmanaged position.
+    ex, adapter, state, _ = await _executor()
+    adapter.set_next_result(_result(OrderStatus.WORKING))
+    await ex.handle_signal(enter_row())
+    trade = _trade(ex)
+    await ex.handle_signal(exit_row(reason="STOP"))
+    assert adapter.cancels == [trade.entry_client_order_id]
+    assert _exits(adapter) == [] and ex._open == {}
+    assert state["states"][trade.trade_id][0] == "CLOSED"
+    assert state["trades"][trade.trade_id].exit_reason == "STOP"
+
+
+@pytest.mark.asyncio
+async def test_exit_on_partial_entry_cancels_the_rest_and_sells_what_was_bought():
+    ex, adapter, _, _ = await _executor()
+    adapter.set_next_result(_result(OrderStatus.PARTIALLY_FILLED, "4", [_fill("e1", "4")]))
+    await ex.handle_signal(enter_row())
+    adapter.cancel_results = [_result(OrderStatus.CANCELLED, "4")]
+    await ex.handle_signal(exit_row(reason="TARGET"))
+    assert len(adapter.cancels) == 1
+    (exit_order,) = _exits(adapter)
+    assert exit_order.qty == Decimal("4") and ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_exit_on_fully_filled_entry_makes_no_cancel_call():
+    ex, adapter, _, _ = await _executor()
+    await ex.handle_signal(enter_row())
+    await ex.handle_signal(exit_row())
+    assert adapter.cancels == [] and len(_exits(adapter)) == 1 and ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_exit_with_unconfirmed_entry_cancel_is_retried_by_the_loop():
+    ex, adapter, _, _ = await _executor()
+    adapter.set_next_result(_result(OrderStatus.WORKING))
+    await ex.handle_signal(enter_row())
+    adapter.cancel_results = [_result(OrderStatus.WORKING)]
+    await ex.handle_signal(exit_row(reason="STOP"))
+    assert _trade(ex).state == "SUBMITTED" and _exits(adapter) == []
+    await ex.run_close_requests_once()            # default: cancel confirmed
+    assert len(adapter.cancels) == 2 and ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_exit_waits_for_entry_fills_still_on_the_stream():
+    ex, adapter, _, _ = await _executor()
+    adapter.set_next_result(_result(OrderStatus.PARTIALLY_FILLED, "4", [_fill("e1", "4")]))
+    await ex.handle_signal(enter_row())
+    trade = _trade(ex)
+    adapter.cancel_results = [_result(OrderStatus.CANCELLED, "6")]
+    await ex.handle_signal(exit_row(reason="STOP"))
+    assert _exits(adapter) == []
+    await ex._on_fill(_fill("e2", "2", cid=trade.entry_client_order_id))
+    await ex.run_close_requests_once()
+    (exit_order,) = _exits(adapter)
+    assert exit_order.qty == Decimal("6") and len(adapter.cancels) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_exit_while_waiting_does_not_cancel_twice():
+    ex, adapter, _, _ = await _executor()
+    adapter.set_next_result(_result(OrderStatus.PARTIALLY_FILLED, "4", [_fill("e1", "4")]))
+    await ex.handle_signal(enter_row())
+    adapter.cancel_results = [_result(OrderStatus.CANCELLED, "6")]
+    await ex.handle_signal(exit_row(reason="STOP"))
+    await ex.handle_signal(exit_row(reason="STOP"))
+    assert len(adapter.cancels) == 1 and _exits(adapter) == []
+
+
+@pytest.mark.asyncio
+async def test_requested_close_survives_a_restart():
+    # Crash after the EXIT was recorded but before the entry cancel settled:
+    # the trade comes back SUBMITTED with exit_reason STOP.
+    t = OpenTrade(trade_id="t1", strategy="s", position_key="c1:L", symbol="AAPL",
+                  asset_class="equity", side=TradeSide.LONG, target_qty=Decimal("10"),
+                  filled_qty=Decimal("0"), state="SUBMITTED",
+                  entry_client_order_id="e-t1", exit_reason="STOP")
+    hooks, state = make_hooks(open_trades=[t])
+    ex, adapter, _, _ = await _executor(hooks=hooks, state=state)
+    assert ex._close_requests == {("s", "c1:L"): "STOP"}
+    await ex.run_close_requests_once()
+    assert adapter.cancels == ["e-t1"] and ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_releasing_flatten_keeps_a_signal_requested_close():
+    ex, adapter, _, switch = await _executor()
+    adapter.set_next_result(_result(OrderStatus.WORKING))
+    await ex.handle_signal(enter_row())
+    adapter.cancel_results = [_result(OrderStatus.WORKING)]
+    await ex.handle_signal(exit_row(reason="STOP"))
+    switch["on"] = False
+    await ex.run_close_requests_once()            # flatten off: STOP request kept
+    assert ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_final_exit_supersedes_a_working_scale_tranche():
+    ex, adapter, _, _ = await _executor()
+    await ex.handle_signal(enter_row())
+    adapter.set_next_result(_result(OrderStatus.WORKING))
+    scale = {**exit_row(reason="SCALE"), "signal_id": "sig-scale", "trigger_level": 6,
+             "fraction": "0.25"}
+    await ex.handle_signal(scale)
+    trade = _trade(ex)
+    assert trade.state == "CLOSING" and not trade.closing_final
+    (tranche,) = _exits(adapter)
+    assert tranche.qty == Decimal("2.5")
+    await ex.handle_signal(exit_row(reason="STOP"))
+    assert len(adapter.cancels) == 1              # the tranche, not the entry
+    final = _exits(adapter)[-1]
+    assert final.qty == Decimal("10") and ex._open == {}

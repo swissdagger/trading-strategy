@@ -207,7 +207,7 @@ UPDATE kill_switch SET engaged = true, mode = 'flatten',
 Both modes block new ENTERs; the row is read on every ENTER, with no cache.
 
 **`flatten`** is read every second by the executor's escalation loop. For each
-live trade it:
+live trade it runs the same close as a normal EXIT signal:
 1. cancels a working entry first, so nothing keeps buying while it sells. If
    Coinbase has not confirmed the cancel, or trading is `off`, it retries rather
    than guess;
@@ -362,6 +362,10 @@ and expect a restart.
   Replays and restarts dedupe.
 - **Boot order:** connect → reconcile → diff → fill stream → subscribe. The
   executor never takes a signal before it knows what it holds.
+- **An exit settles the entry first:** a final close (EXIT signal or flatten)
+  cancels a still-working entry and waits for its reported fills before selling,
+  so a late buy fill can't be left behind. A close waiting on that is retried
+  every second and survives a restart.
 - **Escalation:** an exit that does not fill widens its cap rung by rung. The top
   rung HALTs rather than selling at an unbounded price.
 - **The chain machine is copied from CausaView**, not shared. It differs by the
