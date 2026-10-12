@@ -493,34 +493,39 @@ def make_persist_exit_state(pool: asyncpg.Pool):
 # Global switches
 # ---------------------------------------------------------------------------
 
+async def _read_kill_switch(pool: asyncpg.Pool):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT engaged, mode FROM kill_switch WHERE id = true")
+
+
 def make_kill_switch_blocks(pool: asyncpg.Pool):
     """True if the global kill switch forbids opening new positions. Reads the
     singleton kill_switch row on EVERY call (no cache) — the switch must take
     effect faster than a redeploy, which means faster than any cache TTL.
 
-    Engaged in EITHER mode blocks new entries. The policy is HALT-NEW-ONLY: when
-    engaged we stop opening but leave open positions to their normal protective
-    exits (the exit path never consults this). The 'flatten' mode (auto-close
-    everything) is NOT implemented; if it is ever set in the DB we still block new
-    entries (correct) but log a warning, so no operator relies on an auto-flatten
-    that doesn't exist."""
+    Engaged in EITHER mode blocks new entries. 'halt_new' leaves open positions
+    to their normal exits; 'flatten' also closes them (make_kill_switch_flatten,
+    driven by the executor's escalation loop)."""
     async def kill_switch_blocks() -> bool:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT engaged, mode FROM kill_switch WHERE id = true"
-            )
+        row = await _read_kill_switch(pool)
         # Missing row => treat as blocked (fail safe): if we can't confirm the
         # switch is off, don't open new risk.
         if row is None:
             log.warning("kill_switch row missing — failing safe (blocking new entries)")
             return True
-        engaged = bool(row["engaged"])
-        if engaged and row["mode"] == "flatten":
-            log.warning("kill_switch mode='flatten' is NOT implemented — behaving as "
-                        "'halt_new' (blocking new entries; open positions run their "
-                        "normal exits). Do not rely on auto-flatten.")
-        return engaged
+        return bool(row["engaged"])
     return kill_switch_blocks
+
+
+def make_kill_switch_flatten(pool: asyncpg.Pool):
+    """True if the kill switch is engaged in 'flatten' mode: close every open
+    position now. Read on every escalation pass (no cache). A missing row does
+    NOT flatten — selling everything is not a safe default; it only blocks
+    entries (make_kill_switch_blocks)."""
+    async def kill_switch_flatten() -> bool:
+        row = await _read_kill_switch(pool)
+        return row is not None and bool(row["engaged"]) and row["mode"] == "flatten"
+    return kill_switch_flatten
 
 
 def make_set_kill_switch(pool: asyncpg.Pool):
@@ -532,16 +537,14 @@ def make_set_kill_switch(pool: asyncpg.Pool):
     emergency halt. Idempotent — setting the same state twice just refreshes the
     audit fields.
 
-    mode is accepted for forward-compatibility but only 'halt_new' is honored by
-    the executor; passing 'flatten' is rejected here rather than silently stored,
-    so the DB can't hold a mode the system won't act on."""
+    mode: 'halt_new' (stop opening; open positions run their normal exits) or
+    'flatten' (stop opening AND close every open position at once)."""
     async def set_kill_switch(engaged: bool, *, reason: Optional[str] = None,
                               engaged_by: Optional[str] = None,
                               mode: str = "halt_new") -> None:
-        if mode != "halt_new":
-            raise ValueError(
-                f"unsupported kill_switch mode {mode!r}: only 'halt_new' is "
-                f"implemented (flatten/auto-exit is deliberately not built)")
+        if mode not in ("halt_new", "flatten"):
+            raise ValueError(f"unsupported kill_switch mode {mode!r}: "
+                             f"expected 'halt_new' or 'flatten'")
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -556,8 +559,8 @@ def make_set_kill_switch(pool: asyncpg.Pool):
                 """,
                 engaged, mode, reason, engaged_by,
             )
-        log.warning("kill_switch %s by %s (reason=%s)",
-                    "ENGAGED" if engaged else "DISENGAGED",
+        log.warning("kill_switch %s (%s) by %s (reason=%s)",
+                    "ENGAGED" if engaged else "DISENGAGED", mode,
                     engaged_by or "unknown", reason or "-")
     return set_kill_switch
 
@@ -667,26 +670,6 @@ def make_save_executor_cursor(pool: asyncpg.Pool):
                 cursor_at,
             )
     return save_executor_cursor
-
-
-# ---------------------------------------------------------------------------
-# Alerts (migration 021)
-# ---------------------------------------------------------------------------
-
-def make_alert(pool: asyncpg.Pool):
-    """(kind, detail) -> insert an executor_alerts row; its trigger fires
-    pg_notify('executor_alert'). The executor calls this best-effort."""
-    async def alert(kind: str, detail: dict) -> None:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO executor_alerts (kind, trade_id, symbol, detail)
-                VALUES ($1, $2, $3, $4::jsonb)
-                """,
-                kind, detail.get("trade_id"), detail.get("symbol"),
-                json.dumps(detail, default=str),
-            )
-    return alert
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +792,7 @@ def build_executor_hooks(pool: asyncpg.Pool) -> ExecutorHooks:
         get_exit_cap=make_get_exit_cap(pool),
         persist_exit_state=make_persist_exit_state(pool),
         kill_switch_blocks=make_kill_switch_blocks(pool),
-        alert=make_alert(pool),
+        kill_switch_flatten=make_kill_switch_flatten(pool),
     )
 
 

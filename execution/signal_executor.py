@@ -66,6 +66,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, FrozenSet, Optional
 
 from execution.adapter import ExecutionAdapter
+from execution.gated_adapter import GATED_PREFIX
 from execution.observability import Metrics, build_health_document
 from execution.pricing import (
     CapConfig, price_marketable_limit, quantize_limit_price, validate_touch,
@@ -285,11 +286,11 @@ class ExecutorHooks:
     quantize_exit_qty: Optional[
         Callable[[str, str, Decimal], Awaitable[Decimal]]] = None
 
-    # --- Alerting (optional) ---
-    # (kind, detail) -> raise a human-visible alert. Called on every HALT and on
-    # a refused boot. Best-effort: a failing alert is logged, never allowed to
-    # block the HALT itself. Wired to executor_alerts (migration 021).
-    alert: Optional[Callable[[str, dict], Awaitable[None]]] = None
+    # --- Kill switch, flatten mode (optional) ---
+    # () -> True while the kill switch is engaged in 'flatten' mode: every open
+    # position is to be closed now (run_flatten_once). None => flatten is
+    # unavailable and an engaged switch only blocks entries.
+    kill_switch_flatten: Optional[Callable[[], Awaitable[bool]]] = None
 
     # --- Clock (injectable so escalation deadlines are testable) ---
     now_ms: Callable[[], int] = None   # defaults to wall clock in __post_init__
@@ -359,6 +360,12 @@ class SignalExecutor:
         # client id on the stream) still resolve through to the key.
         self._venue_to_coid: Dict[str, str] = {}
         self._booted = False
+        # Flatten bookkeeping, per (strategy, position_key): the entry quantity
+        # the venue reported filled when flatten cancelled the trade's working
+        # entry. Present => the entry is cancelled; the close waits until the
+        # fill stream has delivered that quantity, so a late entry fill can
+        # never be left behind as an unmanaged position.
+        self._flatten_entry_filled: Dict[tuple[str, str], Decimal] = {}
         # Signals the escalation loop to exit and marks the executor stopping.
         # Shared by run_escalation_loop() and stop() so the host has one switch.
         self._stop = asyncio.Event()
@@ -447,7 +454,7 @@ class SignalExecutor:
             trade on the symbol. Netting cannot say WHICH trade is wrong, so all
             of them stop — consistent with never guessing with real money.
           * Venue balance with no DB trade -> orphan: refuse boot unless it is
-            dust or allowlisted (OrphanPositionError, after alerting).
+            dust or allowlisted (OrphanPositionError).
           * Recent fills attributed by parsing the cv1 client_order_id.
         """
         venue_pos = {p.symbol: p for p in snapshot.positions}
@@ -506,9 +513,6 @@ class SignalExecutor:
             orphans.append({"symbol": sym, "qty": str(p.qty)})
         if orphans:
             self._mincr("boot_refused_orphans")
-            detail = {"reason": "orphan venue balances with no DB trade",
-                      "orphans": orphans}
-            await self._alert("boot_refused", detail)
             log.error("reconcile: ORPHAN balances %s — refusing to boot", orphans)
             raise OrphanPositionError(
                 f"venue holds balances with no DB trade: {orphans}. Reconcile by "
@@ -550,27 +554,12 @@ class SignalExecutor:
             return abs(qty) < mins.base
         return abs(qty) <= await self._qty_epsilon(symbol, asset_class)
 
-    async def _alert(self, kind: str, detail: dict) -> None:
-        """Best-effort human alert. Never raises: an alert sink that is down
-        must not stop a HALT or mask the original error."""
-        if self.hooks.alert is None:
-            return
-        try:
-            await self.hooks.alert(kind, detail)
-        except Exception:
-            self._mincr("alerts_failed")
-            log.exception("alert %s failed to send: %s", kind, detail)
-
     async def _halt(self, t: OpenTrade, reason: str) -> None:
         t.state = "HALTED"
         self._mincr("trades_halted")
         await self.hooks.update_trade_state(t.trade_id, "HALTED", reason)
-        log.error("trade %s HALTED: %s", t.trade_id, reason)
-        await self._alert("trade_halted", {
-            "trade_id": t.trade_id, "strategy": t.strategy,
-            "position_key": t.position_key, "symbol": t.symbol,
-            "side": t.side.value, "reason": reason,
-        })
+        log.error("trade %s HALTED (%s %s %s): %s", t.trade_id, t.strategy,
+                  t.symbol, t.side.value, reason)
 
     # ----------------------------------------------------------------------
     # Signal ingress — the SignalListener's handler
@@ -1158,6 +1147,107 @@ class SignalExecutor:
                     continue   # deadline moved out from under us (rung re-issued)
                 await self._escalate(fresh, key)
 
+    async def run_flatten_once(self) -> None:
+        """One pass of the kill switch's 'flatten' mode: while it is engaged,
+        close every live trade. Runs on the escalation loop's cadence, so it
+        reacts within a tick of the switch being set, and it is idempotent: a
+        trade already on its way out is left alone.
+
+        Per trade, under the symbol lock:
+          * a working entry (PENDING/SUBMITTED, or OPEN with an unfilled
+            remainder) is cancelled first, so the entry can't keep buying while
+            we sell;
+          * then the whole remaining position is closed with reason KILL_SWITCH
+            through the normal exit path (marketable limit + escalation ladder,
+            which HALTs at the top rather than selling at any price). A working
+            SCALE tranche is superseded, as by any final EXIT;
+          * a trade whose entry never filled is finalized with nothing to sell.
+        Trades already CLOSING for good are left to the escalation driver, and
+        HALTED trades to a human. Shadow (virtual) positions are untouched:
+        they hold no capital."""
+        if self.hooks.kill_switch_flatten is None:
+            return
+        if not await self.hooks.kill_switch_flatten():
+            self._flatten_entry_filled.clear()   # switch released: forget
+            return
+        for key, trade in list(self._open.items()):
+            if not self._needs_flatten(trade):
+                continue
+            async with self._lock(trade.symbol):
+                fresh = self._open.get(key)
+                if fresh is None or not self._needs_flatten(fresh):
+                    continue
+                await self._flatten(fresh, key)
+
+    @staticmethod
+    def _needs_flatten(trade: OpenTrade) -> bool:
+        if trade.state in ("PENDING", "SUBMITTED", "OPEN"):
+            return True
+        return trade.state == "CLOSING" and not trade.closing_final
+
+    async def _flatten(self, trade: OpenTrade, key) -> None:
+        if key not in self._flatten_entry_filled:
+            if trade.state in ("PENDING", "SUBMITTED") or trade.filled_qty < trade.target_qty:
+                try:
+                    result = await self.adapter.cancel_order(trade.entry_client_order_id)
+                except Exception:
+                    # Unknown entry state: don't sell against a buy that may
+                    # still be working. Retry on the next pass.
+                    log.exception("flatten: cancelling entry %s of %s failed — retrying",
+                                  trade.entry_client_order_id, trade.trade_id)
+                    return
+                if (result.reject_reason or "").startswith(GATED_PREFIX):
+                    # Trading is off: the cancel never reached the venue, so the
+                    # entry's real state is unknown. Wait for trading to resume.
+                    log.warning("flatten: trading disabled — cannot cancel entry of %s yet",
+                                trade.trade_id)
+                    return
+                if result.status in (OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED):
+                    # The venue has not confirmed the cancel; the entry can still
+                    # fill. Selling now could leave the rest of it behind.
+                    log.warning("flatten: entry %s of %s not cancelled yet (%s) — retrying",
+                                trade.entry_client_order_id, trade.trade_id,
+                                result.status.value)
+                    return
+                self._learn_venue_order_id(result)
+                await self.hooks.advance_order_fill(
+                    trade.entry_client_order_id, result.filled_qty, result.status.value)
+                for f in result.fills:
+                    await self._record_fill(trade, f, trade.entry_client_order_id)
+                venue_filled = result.filled_qty
+            else:
+                venue_filled = trade.filled_qty
+            self._flatten_entry_filled[key] = venue_filled
+            log.warning("kill switch FLATTEN: %s %s entry closed at %s of %s",
+                        trade.trade_id, trade.symbol, venue_filled, trade.target_qty)
+
+        venue_filled = self._flatten_entry_filled[key]
+        if trade.filled_qty < venue_filled:
+            # The venue filled more of the entry than we have recorded: those
+            # fills are still on the stream. Close once they land, so the
+            # close covers the whole position.
+            log.info("flatten: %s waiting for entry fills (%s of %s recorded)",
+                     trade.trade_id, trade.filled_qty, venue_filled)
+            return
+
+        self._flatten_entry_filled.pop(key, None)
+        self._mincr("trades_flattened")
+        if trade.filled_qty <= 0:
+            # Entry never filled: nothing held, nothing to sell.
+            trade.exit_reason = ExitReason.KILL_SWITCH.value
+            await self.hooks.persist_trade(trade)
+            await self._finalize_closed(trade, key)
+            log.warning("kill switch FLATTEN: %s closed with no position", trade.trade_id)
+            return
+        if trade.state == "CLOSING":
+            # A SCALE tranche is working; the final close supersedes it.
+            await self._cancel_working_exit(trade)
+        trade.exit_reason = ExitReason.KILL_SWITCH.value
+        await self.hooks.persist_trade(trade)
+        log.warning("kill switch FLATTEN: closing %s %s qty %s", trade.trade_id,
+                    trade.symbol, trade.filled_qty - trade.exit_filled_qty)
+        await self._issue_exit(trade, key, rung=0)
+
     async def run_escalation_loop(self, tick_seconds: float = 1.0) -> None:
         """Periodic host driver for the escalation ladder: call
         run_escalation_once() every `tick_seconds` until stop() is set. This is
@@ -1176,6 +1266,10 @@ class SignalExecutor:
         """
         log.info("escalation loop started (%.2fs tick)", tick_seconds)
         while not self._stop.is_set():
+            try:
+                await self.run_flatten_once()
+            except Exception:
+                log.exception("flatten pass failed; continuing")
             try:
                 await self.run_escalation_once()
             except Exception:
@@ -1215,7 +1309,7 @@ class SignalExecutor:
             return
         exit_cap = await self.hooks.get_exit_cap(trade.asset_class)
         if not exit_cap.has_rung_beyond(_esc(trade.exit_rung)):
-            # Top of the ladder and still not filled -> HALT + alert. Better a
+            # Top of the ladder and still not filled -> HALT. Better a
             # human looks than an unbounded market order in a fast market. This
             # applies to a SCALE tranche too: a 5% slice that can't fill through
             # the full ladder means the book is broken enough that the whole

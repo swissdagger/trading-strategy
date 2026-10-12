@@ -97,7 +97,7 @@ services:
   # restart: unless-stopped is load-bearing: a paper<->live mode change blocks
   # all writes and exits 3 so it restarts against the new venue, and a refused
   # or failed boot waits EXECUTOR_BOOT_RETRY_S (default 300 s) before exiting, so
-  # the restart loop (and its alerts) runs at most every few minutes.
+  # the restart loop runs at most every few minutes.
   executor:
     build: .
     image: trading-system:latest

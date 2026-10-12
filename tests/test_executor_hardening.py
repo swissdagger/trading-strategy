@@ -7,7 +7,6 @@ Tests for the ADR-001 Phase 3 executor hardening:
     shadow book (virtual fills at the touch, fees on both legs)
   * open-position cap, stale-ENTER gate, price-increment rounding, venue minimums
   * sizing off available equity
-  * HALT / refused-boot alerts (best-effort)
   * the listener's cursor-advance callback (persisted cursor)
 
 Reuses the fakes from test_signal_executor so the executor is driven exactly
@@ -76,14 +75,6 @@ def db_trade(trade_id, symbol="AAPL", qty="10", side=TradeSide.LONG, state="OPEN
     )
 
 
-def with_alerts(hooks):
-    alerts = []
-    async def alert(kind, detail):
-        alerts.append((kind, detail))
-    hooks.alert = alert
-    return alerts
-
-
 class MemShadowStore:
     """In-memory shadow_trades."""
     def __init__(self, touch=Touch(Decimal("100"), Decimal("100.10"))):
@@ -142,17 +133,14 @@ async def test_two_trades_one_symbol_netted_match_keeps_both():
 
 
 @pytest.mark.asyncio
-async def test_netted_mismatch_halts_every_trade_on_symbol_and_alerts():
+async def test_netted_mismatch_halts_every_trade_on_symbol():
     adapter = SpotAdapter()
     adapter.reconcile_result = positions(AAPL=12)
     hooks, state = make_hooks(open_trades=[db_trade("t1", qty="10"), db_trade("t2", qty="5")])
-    alerts = with_alerts(hooks)
     ex, _ = await booted(adapter, hooks)
     assert state["states"]["t1"][0] == "HALTED"
     assert state["states"]["t2"][0] == "HALTED"
     assert "db_net=15" in state["states"]["t1"][1] and "venue=12" in state["states"]["t1"][1]
-    assert [k for k, _ in alerts] == ["trade_halted", "trade_halted"]
-    assert {d["trade_id"] for _, d in alerts} == {"t1", "t2"}
 
 
 @pytest.mark.asyncio
@@ -229,18 +217,15 @@ async def test_boot_reconcile_nets_per_symbol():
 # --------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_orphan_balance_refuses_boot_and_alerts():
+async def test_orphan_balance_refuses_boot():
     adapter = SpotAdapter()
     adapter.reconcile_result = positions(**{"ETH-USD": "2"})
     hooks, _ = make_hooks()
-    alerts = with_alerts(hooks)
     ex = SignalExecutor(adapter, hooks)
     with pytest.raises(OrphanPositionError, match="ETH-USD"):
         await ex.start()
     assert not ex._booted
     assert not adapter.fill_stream_started
-    assert alerts[0][0] == "boot_refused"
-    assert alerts[0][1]["orphans"] == [{"symbol": "ETH-USD", "qty": "2"}]
 
 
 @pytest.mark.asyncio
@@ -546,23 +531,6 @@ async def test_sizing_zero_available_places_nothing():
     eq = AccountEquity(total=Decimal("100000"), available=Decimal("0"), currency="USD")
     size = make_size_position(lambda: SizingAdapter(eq))
     assert await size("BTC-USD", "crypto", TradeSide.LONG, None) == Decimal("0")
-
-
-# --------------------------------------------------------------------
-# Alerts are best-effort
-# --------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_failing_alert_does_not_block_the_halt():
-    adapter = SpotAdapter()
-    adapter.reconcile_result = positions()
-    hooks, state = make_hooks(open_trades=[db_trade("t1")])
-    async def broken(kind, detail):
-        raise ConnectionError("alert sink down")
-    hooks.alert = broken
-    ex, _ = await booted(adapter, hooks)
-    assert state["states"]["t1"][0] == "HALTED"
-    assert ex._booted
 
 
 # --------------------------------------------------------------------

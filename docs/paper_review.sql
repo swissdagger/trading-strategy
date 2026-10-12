@@ -32,9 +32,7 @@ SELECT f.intent, count(*) AS fills,
  WHERE o.venue_reference > 0
  GROUP BY f.intent;
 
--- Reconcile stability: HALTs and refused boots.
-SELECT kind, count(*) AS n, max(created_at) AS last
-  FROM executor_alerts GROUP BY kind ORDER BY n DESC;
+-- Reconcile stability: HALTs (refused boots are in the executor log).
 SELECT state, count(*) FROM trades GROUP BY state ORDER BY state;
 SELECT trade_id, symbol, halt_reason, last_updated FROM trades WHERE state = 'HALTED';
 

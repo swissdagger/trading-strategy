@@ -317,5 +317,16 @@ Each phase is independently mergeable and leaves the system runnable.
   - `get_exit_cap` received the JSONB escalation ladder as text (asyncpg has no JSON codec on the pool), so **every EXIT raised `TypeError`**. It now decodes it.
 - **Ops:** `executor` service in `docker-compose.yml` (after warmup, `restart: unless-stopped`). A refused or failed boot sleeps `EXECUTOR_BOOT_RETRY_S` (300 s) before exiting 1, so a restart loop alerts at most every few minutes. `README.md` and `RUNBOOK.md` rewritten for the Coinbase topology; `RUNBOOK.md` §8 is the go-live gate; review queries in `docs/paper_review.sql`.
 - **Shared trade tables:** `trades`/`orders`/`fills` carry no mode, so paper positions must be drained before going live (else boot HALTs them) and reviews filter by the go-live time. Documented in the runbook; a `mode` column is a candidate if this proves error-prone.
-- **Still open:** alert *delivery* (a notifier that LISTENs on `executor_alert`), `kill_switch` `flatten` (behaves as `halt_new`), and the paper run itself.
+- **Still open:** the paper run itself. (Alert delivery and `flatten` were resolved after this PR; see below.)
+
+### PR 7 (alerts removed, kill switch flatten)
+
+- **Alerts removed (owner decision).** Nothing delivered from the `executor_alerts` outbox, and the owner chose not to build a notifier. Migration 024 drops the table, its trigger and function; the executor's `alert` hook, `make_alert` and the boot-failure alert are gone. HALTs are logged at ERROR (with strategy, symbol and side) and stay visible as `trades.state = 'HALTED'` + `halt_reason`; a refused boot is logged and retried every `EXECUTOR_BOOT_RETRY_S`. Migration 018 (`email_notifications`, the cursor table of an external trade-signal notifier) is untouched. `execution/boot.py` keeps its own alert callback parameter; that module is not on the live path.
+- **Kill switch `flatten` implemented.** `make_kill_switch_flatten` reads the row (engaged AND mode = 'flatten'; a missing row does not flatten). `SignalExecutor.run_flatten_once`, run every tick by the escalation loop, takes each live trade under its symbol lock and:
+  1. cancels a working entry (PENDING/SUBMITTED, or OPEN with an unfilled remainder). It does not proceed when the cancel raises, is unconfirmed (WORKING/PARTIALLY_FILLED), or was suppressed by the trade gate (`off`). It retries next tick instead.
+  2. waits until the entry fills the venue reported at cancel are recorded, so a late fill can't be left as an unmanaged position.
+  3. closes the whole remainder with reason `KILL_SWITCH` via `_issue_exit` (marketable limit + the normal escalation ladder, which HALTs at the top). A working SCALE tranche is cancelled and superseded.
+  4. finalizes CLOSED a trade whose entry never filled.
+  It skips trades already CLOSING for good (the ladder owns them), HALTED trades, and shadow positions. `make_set_kill_switch` now accepts `flatten`.
+- **Pre-existing gap noted, not changed:** a normal EXIT on a trade whose entry is still working does not cancel the entry first. Flatten does.
 
