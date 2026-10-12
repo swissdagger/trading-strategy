@@ -39,6 +39,7 @@ import logging
 import os
 import signal as _signal
 import sys
+import time
 
 import asyncpg
 
@@ -276,10 +277,23 @@ async def main() -> None:
     log.info("executor stopped cleanly")
 
 
+# A refused or failed boot waits this long before exiting, so a restart loop
+# under docker-compose (restart: unless-stopped) retries — and alerts — at most
+# every few minutes instead of every few seconds.
+BOOT_RETRY_S = float(os.getenv("EXECUTOR_BOOT_RETRY_S", "300"))
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except SystemExit:
+        raise
     except (NotImplementedError, OrphanPositionError, CoinbaseConnectError,
             CoinbaseAuthError) as e:
-        log.error("cannot start: %s", e)
+        log.error("cannot start: %s — retrying in %.0fs", e, BOOT_RETRY_S)
+        time.sleep(BOOT_RETRY_S)
+        sys.exit(1)
+    except Exception:
+        log.exception("executor failed — retrying in %.0fs", BOOT_RETRY_S)
+        time.sleep(BOOT_RETRY_S)
         sys.exit(1)

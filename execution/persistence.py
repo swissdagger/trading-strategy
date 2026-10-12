@@ -194,32 +194,49 @@ def make_persist_fill(pool: asyncpg.Pool):
     relies on this bool to avoid double-counting into filled_qty.
 
     The fill row must resolve to a real order_id and trade_id (both NOT NULL FKs
-    on `fills`). The executor passes trade_id explicitly; order_id is looked up
-    from venue_order_id (the fill carries the venue's order id, not our client
-    id). A fill whose order we cannot map (venue_order_id unknown) cannot satisfy
-    the FK — we skip it and return False, logging for the watchdog, rather than
-    raising and stalling the fill stream. reconcile's best-effort persist_fill
-    (trade_id=None) path hits this same skip.
+    on `fills`). The parent order is found by client_order_id — written on the
+    orders row at submit, and carried on every fill row the executor builds —
+    falling back to venue_order_id. (Looking up by venue_order_id alone, as
+    before, never matched: nothing wrote orders.venue_order_id, so EVERY fill was
+    skipped and reported as a duplicate, and the executor never advanced a
+    trade's filled quantity.) The venue's order id is recorded on the order row
+    the first time a fill reveals it.
+
+    A fill that cannot be mapped cannot satisfy the FK: we skip it and return
+    False. For a fill of a known trade that is a real fault (logged ERROR); for
+    the reconcile sweep's foreign fills it is expected.
 
     filled_at_ms (epoch ms) maps to the timestamptz filled_at via to_timestamp.
     """
     async def persist_fill(row: dict) -> bool:
+        cid = row.get("client_order_id")
         venue_order_id = row.get("venue_order_id")
         trade_id = row.get("trade_id")
         async with pool.acquire() as conn:
             order_id = None
-            if venue_order_id is not None:
+            if cid is not None:
+                order_id = await conn.fetchval(
+                    "SELECT order_id FROM orders WHERE client_order_id = $1", cid)
+            if order_id is None and venue_order_id is not None:
                 order_id = await conn.fetchval(
                     "SELECT order_id FROM orders WHERE venue_order_id = $1",
                     venue_order_id,
                 )
             if order_id is None or trade_id is None:
-                # Cannot satisfy the NOT NULL FKs. Not an error in the reconcile
-                # sweep (which passes trade_id=None deliberately); log and skip.
-                log.info("persist_fill: unmapped fill venue_exec_id=%s "
-                         "venue_order_id=%s trade_id=%s — skipped",
-                         row.get("venue_exec_id"), venue_order_id, trade_id)
+                if trade_id is not None:
+                    log.error("persist_fill: fill %s of trade %s has no matching order "
+                              "(client_order_id=%s venue_order_id=%s) — NOT recorded",
+                              row.get("venue_exec_id"), trade_id, cid, venue_order_id)
+                else:
+                    log.info("persist_fill: unattributed fill venue_exec_id=%s "
+                             "venue_order_id=%s — skipped",
+                             row.get("venue_exec_id"), venue_order_id)
                 return False
+            if venue_order_id is not None:
+                await conn.execute(
+                    "UPDATE orders SET venue_order_id = $2 "
+                    "WHERE order_id = $1 AND venue_order_id IS NULL",
+                    order_id, venue_order_id)
             # INSERT; ON CONFLICT on the venue_exec_id UNIQUE makes the dup a
             # no-op. xmax=0 trick: RETURNING tells us whether a row was inserted.
             inserted = await conn.fetchval(
@@ -422,8 +439,12 @@ def make_get_exit_cap(pool: asyncpg.Pool):
             cap_spread_mult=row["cap_spread_mult"],
             cap_abs_bps=row["cap_abs_bps"],
         )
-        # asyncpg returns JSONB as a parsed Python list here.
+        # asyncpg returns JSONB as TEXT unless a json codec is registered on
+        # the connection (none is, here), so parse it. (Iterating the raw
+        # string, as before, raised on every EXIT: no exit could be priced.)
         ladder_raw = row["escalation_ladder"] or []
+        if isinstance(ladder_raw, str):
+            ladder_raw = json.loads(ladder_raw)
         ladder = tuple(
             EscalationRung(
                 widen_to_spread_mult=Decimal(str(r["widen_to_spread_mult"])),
