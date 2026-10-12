@@ -109,3 +109,81 @@ async def test_alert_row_and_notify(pool):
     assert r["kind"] == "trade_halted"
     assert r["trade_id"] == "t-1" and r["symbol"] == "BTC-USD"
     assert r["delivered_at"] is None
+
+
+# --------------------------------------------------------------------
+# Paper ledger (migration 022)
+# --------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def paper_pool():
+    p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
+    await p.execute("TRUNCATE paper_fills, paper_orders, paper_balances")
+    yield p
+    await p.close()
+
+
+@pytest.mark.asyncio
+async def test_paper_account_persists_and_resumes(paper_pool):
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_paper_adapter import FakeMarket, order
+    from execution.paper_adapter import PaperCoinbaseAdapter
+    from execution.persistence import make_paper_ledger_hooks
+
+    market = FakeMarket()
+    def adapter():
+        return PaperCoinbaseAdapter(market, make_paper_ledger_hooks(paper_pool),
+                                    starting_cash=Decimal("10000"))
+    a = adapter()
+    await a.connect()
+    filled = order(qty="0.05", limit="100020")
+    resting = order(qty="0.01", limit="99000")
+    r = await a.submit_order(filled)
+    await a.submit_order(resting)
+    assert r.status.value == "FILLED"
+
+    bal = {row["currency"]: row["qty"] for row in
+           await paper_pool.fetch("SELECT currency, qty FROM paper_balances")}
+    assert bal["BTC"] == Decimal("0.05")
+    assert bal["USD"] == a.state.balances["USD"]
+    assert await paper_pool.fetchval("SELECT count(*) FROM paper_fills") == 1
+
+    b = adapter()                                     # restart
+    await b.connect()
+    assert b.state.balances == a.state.balances
+    assert b.state.orders[resting.client_order_id].status == "OPEN"
+    assert [f.client_order_id for f in b.state.fills] == [filled.client_order_id]
+    market.books["BTC-USD"] = (Decimal("98990"), Decimal("98995"))
+    got = []
+    async def cb(f): got.append(f)
+    assert await b.check_resting_once(cb) == 1
+    status = await paper_pool.fetchval(
+        "SELECT status FROM paper_orders WHERE client_order_id = $1", resting.client_order_id)
+    assert status == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_paper_fill_writes_are_atomic(paper_pool):
+    from execution.paper_adapter import PaperOrder
+    from execution.persistence import make_paper_ledger_hooks
+    from execution.types import Fill, OrderIntent
+
+    h = make_paper_ledger_hooks(paper_pool)
+    await h.seed({"USD": Decimal("1000")})
+    await h.seed({"USD": Decimal("5")})               # second seed is a no-op
+    o = PaperOrder("cid-1", "paper-1", "BTC-USD", "BUY", "ENTRY", Decimal("0.001"),
+                   Decimal("100000"), "OPEN")
+    await h.save_order(o)
+    fill = Fill(venue_exec_id="f-1", qty=Decimal("0.001"), price=Decimal("100000"),
+                intent=OrderIntent.ENTRY, filled_at_ms=1_791_000_000_000,
+                fee=Decimal("0.6"), fee_currency="USD", venue_order_id="paper-1",
+                client_order_id="cid-1")
+    deltas = {"USD": Decimal("-100.6"), "BTC": Decimal("0.001")}
+    filled = PaperOrder(**{**o.__dict__, "status": "FILLED", "filled_qty": Decimal("0.001")})
+    await h.apply_fill(fill, "BTC-USD", filled, deltas)
+    with pytest.raises(asyncpg.UniqueViolationError):          # same fill id again
+        await h.apply_fill(fill, "BTC-USD", filled, deltas)
+    bal = {r["currency"]: r["qty"] for r in
+           await paper_pool.fetch("SELECT currency, qty FROM paper_balances")}
+    assert bal == {"USD": Decimal("899.4"), "BTC": Decimal("0.001")}   # applied once

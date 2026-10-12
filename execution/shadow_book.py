@@ -93,10 +93,26 @@ def _ms_to_dt(ms: int) -> datetime:
 
 
 class ShadowBook:
-    def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal):
+    def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal,
+                 fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None):
+        """taker_fee_bps: the fallback fee per leg. fee_bps_fn: optional async
+        source of the account's real taker fee (the venue's fee tier); when it
+        returns a value, that is what a new virtual entry is charged."""
         self.hooks = hooks
         self.taker_fee_bps = Decimal(str(taker_fee_bps))
+        self.fee_bps_fn = fee_bps_fn
         self._open: Dict[Tuple[str, str], ShadowPosition] = {}
+
+    async def _fee_bps(self) -> Decimal:
+        if self.fee_bps_fn is not None:
+            try:
+                bps = await self.fee_bps_fn()
+                if bps is not None:
+                    return Decimal(str(bps))
+            except Exception:
+                log.exception("shadow: fee tier read failed; using fallback %s bps",
+                              self.taker_fee_bps)
+        return self.taker_fee_bps
 
     async def start(self) -> None:
         for p in await self.hooks.load_open():
@@ -139,18 +155,19 @@ class ShadowBook:
         if source != "touch":
             log.warning("shadow ENTER %s/%s priced off %s (no usable touch)",
                         strategy, position_key, source)
+        fee_bps = await self._fee_bps()
         pos = ShadowPosition(
             strategy=strategy, position_key=position_key, symbol=row["symbol"],
             asset_class=row["asset_class"], side=side,
             entry_signal_id=row["signal_id"], entry_px=px,
-            fee_bps=self.taker_fee_bps,
+            fee_bps=fee_bps,
         )
         inserted = await self.hooks.insert_entry({
             "strategy": strategy, "position_key": position_key,
             "symbol": pos.symbol, "asset_class": pos.asset_class,
             "side": side.value, "entry_signal_id": pos.entry_signal_id,
             "entry_px": px, "entry_at": _ms_to_dt(self.hooks.now_ms()),
-            "fee_bps": self.taker_fee_bps,
+            "fee_bps": fee_bps,
         })
         if not inserted:
             # Already in the table (a restart between insert and the in-memory

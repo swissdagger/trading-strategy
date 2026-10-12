@@ -27,14 +27,16 @@ def test_venue_change_detection():
     assert endpoint_kind_for_mode(TradeMode.OFF) != endpoint_kind_for_mode(TradeMode.LIVE)
 
 
-@pytest.mark.parametrize("mode", [TradeMode.OFF, TradeMode.LIVE])
+@pytest.mark.parametrize("mode", list(TradeMode))
 def test_coinbase_builder_fails_fast_without_credentials(mode):
     # No key configured: refuse at build time, never connect half-configured.
+    # Paper needs the key too (it reads the real market).
     from execution.coinbase_client import CoinbaseAuthError
+    from execution.paper_adapter import MemPaperLedger
     with pytest.raises(CoinbaseAuthError):
-        build_coinbase_adapter({}, mode)
+        build_coinbase_adapter({}, mode, paper_ledger=MemPaperLedger().hooks())
 
 
-def test_coinbase_paper_refuses_until_phase5():
-    with pytest.raises(NotImplementedError, match="Phase 5"):
+def test_coinbase_paper_needs_a_ledger():
+    with pytest.raises(ValueError, match="paper ledger"):
         build_coinbase_adapter({}, TradeMode.PAPER)

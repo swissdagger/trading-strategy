@@ -16,10 +16,10 @@ Every mode maps to an endpoint KIND:
 
 ADR-001: the only venue is Coinbase Advanced Trade spot. Coinbase has no paper
 venue endpoint (its sandbox returns canned responses and has no matching
-engine), so 'paper' will mean the in-process PaperCoinbaseAdapter wrapping the
-live adapter's READS (Phase 5), and 'live' the real CoinbaseAdapter (Phase 4).
-OFF builds the real adapter wrapped READ-ONLY (no write can reach the venue).
-The kind mapping below is unchanged by that; only what each kind builds is.
+engine), so 'paper' is the in-process PaperCoinbaseAdapter over the real
+adapter's READS (wrapped read-only), and 'live' is the real CoinbaseAdapter.
+OFF builds the paper adapter too, so a stray order in OFF could only ever be a
+simulated one.
 
 ## Reconnect on mode change
 
@@ -48,40 +48,59 @@ def endpoint_kind_for_mode(mode: TradeMode) -> str:
     return "live" if mode == TradeMode.LIVE else "paper"
 
 
-def build_coinbase_adapter(venue_cfg: dict, mode: TradeMode):
-    """Build the Coinbase adapter for `mode`. Returns (adapter, endpoint_kind).
-
-      LIVE  -> CoinbaseAdapter (key must be able to trade).
-      OFF   -> the real CoinbaseAdapter for READS (connect, reconcile, balances,
-               touches, fills) wrapped in ReadOnlyAdapter, so no write can reach
-               the venue whatever the mode gate does. The key need not trade.
-      PAPER -> PaperCoinbaseAdapter, ADR-001 Phase 5. Until then this raises
-               NotImplementedError and the executor refuses to start in paper.
-
-    venue_cfg is config.VENUE_ENDPOINTS["coinbase"]: api_key_name,
-    api_private_key, portfolio_uuid, base_url, quote_currency.
-    """
-    kind = endpoint_kind_for_mode(mode)
-    if mode == TradeMode.PAPER:
-        raise NotImplementedError(
-            "Coinbase paper adapter (PaperCoinbaseAdapter) lands in ADR-001 Phase 5. "
-            "Run in 'off' (read-only against the real portfolio) or 'live'.")
+def build_coinbase_market(venue_cfg: dict, *, require_trade: bool):
+    """The real CoinbaseAdapter from config.VENUE_ENDPOINTS["coinbase"]
+    (api_key_name, api_private_key, portfolio_uuid, base_url, quote_currency)."""
     from execution.coinbase_adapter import CoinbaseAdapter
     from execution.coinbase_client import DEFAULT_BASE_URL, CoinbaseClient
-    from execution.read_only_adapter import ReadOnlyAdapter
 
     client = CoinbaseClient(
         venue_cfg.get("api_key_name", ""), venue_cfg.get("api_private_key", ""),
         base_url=venue_cfg.get("base_url") or DEFAULT_BASE_URL,
     )
-    adapter = CoinbaseAdapter(
+    return CoinbaseAdapter(
         client,
         portfolio_uuid=venue_cfg.get("portfolio_uuid", ""),
         quote_currency=venue_cfg.get("quote_currency", "USD"),
-        require_trade=(mode == TradeMode.LIVE),
+        require_trade=require_trade,
     )
-    if mode == TradeMode.OFF:
-        log.info("built Coinbase adapter READ-ONLY for mode=off")
-        return ReadOnlyAdapter(adapter), kind
-    log.warning("built Coinbase adapter LIVE (real orders) for mode=%s", mode.value)
+
+
+def build_coinbase_adapter(venue_cfg: dict, mode: TradeMode, *, paper_ledger=None,
+                           paper_starting_cash=None, fallback_fee_bps=None):
+    """Build the Coinbase adapter for `mode`. Returns (adapter, endpoint_kind).
+
+      LIVE        -> CoinbaseAdapter: real orders (the key must be able to trade).
+      OFF, PAPER  -> PaperCoinbaseAdapter over the real adapter wrapped READ-ONLY:
+                     real touch, product rules and fee tier; simulated fills in
+                     the paper ledger. No write can reach the venue. OFF places
+                     nothing at all (the GatedAdapter refuses orders); off<->paper
+                     is the same adapter, so no rebuild.
+
+    paper_ledger: PaperLedgerHooks (execution/persistence.make_paper_ledger_hooks);
+    required for OFF and PAPER.
+    """
+    from execution.read_only_adapter import ReadOnlyAdapter
+
+    kind = endpoint_kind_for_mode(mode)
+    if mode == TradeMode.LIVE:
+        adapter = build_coinbase_market(venue_cfg, require_trade=True)
+        log.warning("built Coinbase adapter LIVE (real orders)")
+        return adapter, kind
+    if paper_ledger is None:
+        raise ValueError(f"mode={mode.value} needs a paper ledger (PaperLedgerHooks)")
+    from decimal import Decimal
+    from execution.paper_adapter import PaperCoinbaseAdapter
+
+    market = ReadOnlyAdapter(build_coinbase_market(venue_cfg, require_trade=False))
+    kwargs = {}
+    if paper_starting_cash is not None:
+        kwargs["starting_cash"] = Decimal(str(paper_starting_cash))
+    if fallback_fee_bps is not None:
+        kwargs["fallback_fee_bps"] = Decimal(str(fallback_fee_bps))
+    adapter = PaperCoinbaseAdapter(market, paper_ledger,
+                                   quote_currency=venue_cfg.get("quote_currency", "USD"),
+                                   **kwargs)
+    log.info("built Coinbase PAPER adapter for mode=%s (real reads, simulated fills)",
+             mode.value)
     return adapter, kind

@@ -669,6 +669,100 @@ def make_alert(pool: asyncpg.Pool):
 
 
 # ---------------------------------------------------------------------------
+# Paper ledger (migration 022) — the simulated account behind paper mode
+# ---------------------------------------------------------------------------
+
+def make_paper_ledger_hooks(pool: asyncpg.Pool):
+    """PaperLedgerHooks over paper_balances / paper_orders / paper_fills. A
+    fill's writes (fill row, order, balance deltas) run in one transaction."""
+    from datetime import datetime, timezone
+    from execution.paper_adapter import PaperLedgerHooks, PaperOrder, PaperState
+    from execution.types import Fill, OrderIntent
+
+    def _dt(ms: int):
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+    async def load(fills_since_ms: int) -> PaperState:
+        async with pool.acquire() as conn:
+            bals = await conn.fetch("SELECT currency, qty FROM paper_balances")
+            orders = await conn.fetch(
+                """SELECT client_order_id, venue_order_id, symbol, side, intent, qty,
+                          limit_price, status, filled_qty,
+                          (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms
+                     FROM paper_orders
+                    WHERE status = 'OPEN' OR created_at >= $1""",
+                _dt(fills_since_ms))
+            fills = await conn.fetch(
+                """SELECT fill_id, client_order_id, venue_order_id, intent, qty, price,
+                          fee, fee_currency,
+                          (EXTRACT(EPOCH FROM filled_at) * 1000)::bigint AS filled_ms
+                     FROM paper_fills WHERE filled_at >= $1 ORDER BY filled_at""",
+                _dt(fills_since_ms))
+        return PaperState(
+            balances={r["currency"]: r["qty"] for r in bals},
+            orders={r["client_order_id"]: PaperOrder(
+                client_order_id=r["client_order_id"], venue_order_id=r["venue_order_id"],
+                symbol=r["symbol"], side=r["side"], intent=r["intent"], qty=r["qty"],
+                limit_price=r["limit_price"], status=r["status"],
+                filled_qty=r["filled_qty"], created_ms=r["created_ms"]) for r in orders},
+            fills=[Fill(venue_exec_id=r["fill_id"], qty=r["qty"], price=r["price"],
+                        intent=OrderIntent(r["intent"]), filled_at_ms=r["filled_ms"],
+                        fee=r["fee"], fee_currency=r["fee_currency"],
+                        venue_order_id=r["venue_order_id"],
+                        client_order_id=r["client_order_id"]) for r in fills],
+        )
+
+    async def seed(balances) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT count(*) FROM paper_balances"):
+                    return
+                for cur, qty in balances.items():
+                    await conn.execute(
+                        "INSERT INTO paper_balances (currency, qty) VALUES ($1, $2)", cur, qty)
+
+    async def _upsert_order(conn, o) -> None:
+        await conn.execute(
+            """INSERT INTO paper_orders
+                   (client_order_id, venue_order_id, symbol, side, intent, qty,
+                    limit_price, status, filled_qty)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (client_order_id) DO UPDATE SET
+                   limit_price = EXCLUDED.limit_price,
+                   status      = EXCLUDED.status,
+                   filled_qty  = EXCLUDED.filled_qty,
+                   updated_at  = now()""",
+            o.client_order_id, o.venue_order_id, o.symbol, o.side, o.intent, o.qty,
+            o.limit_price, o.status, o.filled_qty)
+
+    async def save_order(o) -> None:
+        async with pool.acquire() as conn:
+            await _upsert_order(conn, o)
+
+    async def apply_fill(fill, symbol: str, o, deltas) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _upsert_order(conn, o)
+                await conn.execute(
+                    """INSERT INTO paper_fills
+                           (fill_id, client_order_id, venue_order_id, symbol, intent, qty,
+                            price, fee, fee_currency, filled_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                    fill.venue_exec_id, fill.client_order_id, fill.venue_order_id, symbol,
+                    fill.intent.value, fill.qty, fill.price, fill.fee, fill.fee_currency,
+                    _dt(fill.filled_at_ms))
+                for cur, d in deltas.items():
+                    await conn.execute(
+                        """INSERT INTO paper_balances (currency, qty) VALUES ($1, $2)
+                           ON CONFLICT (currency) DO UPDATE SET
+                               qty = paper_balances.qty + EXCLUDED.qty, updated_at = now()""",
+                        cur, d)
+
+    return PaperLedgerHooks(load=load, seed=seed, save_order=save_order,
+                            apply_fill=apply_fill)
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 

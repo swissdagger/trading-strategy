@@ -176,11 +176,16 @@ ENTER_MAX_AGE_SECONDS = 2 * 60
 # portfolio should make this rarely needed (ADR-001 debt D13).
 ORPHAN_BALANCE_ALLOWLIST: frozenset = frozenset()
 
-# Taker fee, in basis points per side, applied by the shadow book to its
-# virtual short fills. Coinbase Advanced Trade's lowest volume tier taker rate
-# at the time of writing (check your account's tier); Phase 4/5 replace this
-# with the live tier from GET /transaction_summary.
+# FALLBACK taker fee, in basis points per side, for the shadow book's virtual
+# fills and paper fills. Both normally use the account's live fee tier
+# (GET /transaction_summary); this applies only when that can't be read.
+# Coinbase Advanced Trade's lowest volume tier taker rate at the time of writing.
 SHADOW_TAKER_FEE_BPS = 120
+
+# Paper mode (ADR-001 Phase 5): the simulated account's starting cash, in
+# QUOTE_CURRENCY, seeded into paper_balances on the executor's first paper
+# start. Truncate the paper_* tables to reset the account.
+PAPER_STARTING_CASH = 10_000
 
 # ---------------------------------------------------------------------------
 # STRATEGIES — the multi-strategy registry config (strategy/registry.py).

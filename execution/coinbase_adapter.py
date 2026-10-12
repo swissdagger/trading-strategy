@@ -229,6 +229,14 @@ class CoinbaseAdapter(ExecutionAdapter):
     def to_venue_symbol(self, symbol: str) -> str:
         return symbol
 
+    async def get_taker_fee_bps(self) -> Optional[Decimal]:
+        """The account's current taker fee in bps, from GET /transaction_summary
+        (fee_tier.taker_fee_rate is a fraction, e.g. "0.006" = 60 bps). None if
+        the venue doesn't report one."""
+        d = await self.client.get("/transaction_summary")
+        rate = _dec((d.get("fee_tier") or {}).get("taker_fee_rate"))
+        return None if rate is None else rate * 10_000
+
     # ------------------------------------------------------------------
     # Market / account reads
     # ------------------------------------------------------------------

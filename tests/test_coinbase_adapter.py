@@ -580,16 +580,32 @@ async def test_read_only_adapter_refuses_writes_and_passes_reads():
 
 
 def test_factory_mode_mapping(monkeypatch):
+    # Phase 5: off and paper both build the paper adapter over a read-only real
+    # adapter (see test_paper_adapter); live is the real adapter.
+    from execution.paper_adapter import MemPaperLedger, PaperCoinbaseAdapter
     key, pem = ec_pem()
     cfg = {"api_key_name": KEY_NAME, "api_private_key": pem, "portfolio_uuid": PORTFOLIO,
            "quote_currency": "USD"}
-    off, kind = build_coinbase_adapter(cfg, TradeMode.OFF)
-    assert isinstance(off, ReadOnlyAdapter) and kind == "paper"
-    assert off.inner.require_trade is False
+    off, kind = build_coinbase_adapter(cfg, TradeMode.OFF, paper_ledger=MemPaperLedger().hooks())
+    assert isinstance(off, PaperCoinbaseAdapter) and kind == "paper"
+    assert isinstance(off.market, ReadOnlyAdapter) and off.market.inner.require_trade is False
     live, kind = build_coinbase_adapter(cfg, TradeMode.LIVE)
     assert isinstance(live, CoinbaseAdapter) and kind == "live" and live.require_trade
-    with pytest.raises(NotImplementedError, match="Phase 5"):
-        build_coinbase_adapter(cfg, TradeMode.PAPER)
+
+
+@pytest.mark.asyncio
+async def test_taker_fee_tier_from_transaction_summary():
+    fake, a = setup()
+    orig = fake.handler
+    def handler(request):
+        if request.url.path.endswith("/transaction_summary"):
+            fake._auth(request)
+            return httpx.Response(200, json={"fee_tier": {"pricing_tier": "Intro 1",
+                                                          "taker_fee_rate": "0.012",
+                                                          "maker_fee_rate": "0.006"}})
+        return orig(request)
+    a.client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await a.get_taker_fee_bps() == Decimal("120")
 
 
 # --------------------------------------------------------------------

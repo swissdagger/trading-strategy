@@ -18,13 +18,13 @@ import asyncio
 import sys
 
 import config
-from execution.adapter_factory import build_coinbase_adapter
-from execution.trade_enable import TradeMode
+from execution.adapter_factory import build_coinbase_market
+from execution.read_only_adapter import ReadOnlyAdapter
 
 
 async def main() -> int:
-    adapter, _ = build_coinbase_adapter(config.VENUE_ENDPOINTS["coinbase"], TradeMode.OFF)
-    inner = adapter.inner
+    inner = build_coinbase_market(config.VENUE_ENDPOINTS["coinbase"], require_trade=False)
+    adapter = ReadOnlyAdapter(inner)
     try:
         await adapter.connect()
         p = inner.permissions
@@ -51,6 +51,10 @@ async def main() -> int:
                   f"base_inc={prod.base_increment} px_inc={prod.price_increment} "
                   f"min={prod.base_min_size}/{prod.quote_min_size}")
 
+        try:
+            print(f"taker fee tier: {await inner.get_taker_fee_bps()} bps")
+        except Exception as e:
+            print(f"taker fee tier: unavailable ({e})")
         snap = await adapter.reconcile()
         print(f"open orders: {len(snap.open_orders)}; fills in last 24h: {len(snap.recent_fills)}")
         known = set(config.crypto_symbols())
