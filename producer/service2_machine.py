@@ -402,6 +402,24 @@ class ServiceTwoChainMachine(ChainMachine):
         # original via _append_with_fill; if needed it can be injected, but the
         # core gate is the same: don't forecast until WINDOW_SIZE.)
         buf = self._buffers.setdefault(bar.timeframe, deque(maxlen=WINDOW_SIZE))
+
+        # MONOTONIC GUARD. A bar at or before the newest buffered bar for this
+        # timeframe is dropped, never appended. In step mode the buffer's row
+        # order IS Sumtyme's definition of "one step", so a repeated or
+        # out-of-order bar corrupts the series it reconstructs — and a repeat
+        # would also re-run the forecast and re-emit the same chain events.
+        # Repeats are expected (Kafka is at-least-once: a restart replays bars
+        # since the last committed offset; the feed/warmup cursor overlap);
+        # an OLDER bar means an upstream ordering bug, so it is louder.
+        if buf and bar.timestamp <= buf[-1]["timestamp"]:
+            newest = buf[-1]["timestamp"]
+            if bar.timestamp == newest:
+                log.debug("drop duplicate bar %s/%s ts=%s",
+                          self.symbol, bar.timeframe, bar.timestamp)
+            else:
+                log.warning("drop out-of-order bar %s/%s ts=%s (newest buffered %s)",
+                            self.symbol, bar.timeframe, bar.timestamp, newest)
+            return []
         buf.append(self._tick_dict(bar))
 
         # >= not == : an over-filled buffer from a race-y warmup must still
