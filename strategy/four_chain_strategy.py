@@ -37,7 +37,11 @@ class FourChainEntry:
     ) -> Optional[str]:
         
         # --- ENTRY TRIGGER ---
-        if propagation_level != self._L_15M or event_type != "level_reached":
+        # Chain 2 reaching 15m is a chain_propagated event at the 15m level
+        # (propagation ascends one rung at a time, so this fires once per
+        # chain). The event-type check is load-bearing: chain_terminated also
+        # carries a level — the rung it died on — and can be 15m.
+        if propagation_level != self._L_15M or event_type != "chain_propagated":
             return None
 
         self._funnel["trigger"] += 1
