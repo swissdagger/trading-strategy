@@ -52,15 +52,18 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import List, Set
+from typing import List, Optional, Set
 
 from execution.adapter import ExecutionAdapter, FillCallback
 from execution.trade_enable import TradeEnableState
 from execution.types import (
+    AccountEquity,
+    MinOrderSize,
     OrderRequest,
     OrderResult,
     OrderStatus,
     ReconcileResult,
+    Touch,
     VenuePosition,
 )
 
@@ -87,6 +90,7 @@ class GatedAdapter(ExecutionAdapter):
         # asset_class see no difference.
         self.venue = inner.venue
         self.supported_classes = inner.supported_classes
+        self.supports_short = inner.supports_short
 
     # ---- session lifecycle: pass through ----
     # connect/start_fill_stream are NOT gated: we still want a live session and
@@ -106,6 +110,24 @@ class GatedAdapter(ExecutionAdapter):
 
     async def get_positions(self) -> List[VenuePosition]:
         return await self._inner.get_positions()
+
+    # Market/account reads: pass through (sizing and pricing need them even
+    # while trading is off, and they place nothing).
+
+    async def get_touch(self, symbol: str, asset_class: str) -> Optional[Touch]:
+        return await self._inner.get_touch(symbol, asset_class)
+
+    async def get_account_equity(self) -> AccountEquity:
+        return await self._inner.get_account_equity()
+
+    async def get_step_size(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        return await self._inner.get_step_size(symbol, asset_class)
+
+    async def get_price_increment(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        return await self._inner.get_price_increment(symbol, asset_class)
+
+    async def get_min_order_size(self, symbol: str, asset_class: str) -> Optional[MinOrderSize]:
+        return await self._inner.get_min_order_size(symbol, asset_class)
 
     # ---- order placement: GATED ----
 

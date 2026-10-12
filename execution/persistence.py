@@ -555,6 +555,120 @@ def make_kill_switch_status(pool: asyncpg.Pool):
 
 
 # ---------------------------------------------------------------------------
+# Shadow book (migration 019) — virtual fills for signals the venue can't take
+# ---------------------------------------------------------------------------
+
+def make_shadow_hooks(pool: asyncpg.Pool, get_touch):
+    """ShadowHooks over shadow_trades. get_touch is the live-adapter touch
+    closure the launcher already builds (not DB-backed)."""
+    from execution.shadow_book import ShadowHooks, ShadowPosition
+
+    async def insert_entry(row: dict) -> bool:
+        async with pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                INSERT INTO shadow_trades
+                    (strategy, position_key, symbol, asset_class, side,
+                     entry_signal_id, entry_px, entry_at, fee_bps)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT DO NOTHING
+                """,
+                row["strategy"], row["position_key"], row["symbol"],
+                row["asset_class"], row["side"], row["entry_signal_id"],
+                row["entry_px"], row["entry_at"], row["fee_bps"],
+            )
+        return res.endswith(" 1")
+
+    async def close(row: dict) -> bool:
+        async with pool.acquire() as conn:
+            res = await conn.execute(
+                """
+                UPDATE shadow_trades
+                   SET exit_signal_id = $3, exit_px = $4, exit_at = $5,
+                       exit_reason = $6, pnl_bps = $7
+                 WHERE strategy = $1 AND position_key = $2 AND exit_at IS NULL
+                """,
+                row["strategy"], row["position_key"], row["exit_signal_id"],
+                row["exit_px"], row["exit_at"], row["exit_reason"], row["pnl_bps"],
+            )
+        return res.endswith(" 1")
+
+    async def load_open() -> list:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT strategy, position_key, symbol, asset_class, side,
+                       entry_signal_id, entry_px, fee_bps
+                  FROM shadow_trades
+                 WHERE exit_at IS NULL
+                """
+            )
+        return [
+            ShadowPosition(
+                strategy=r["strategy"], position_key=r["position_key"],
+                symbol=r["symbol"], asset_class=r["asset_class"],
+                side=TradeSide(r["side"]), entry_signal_id=r["entry_signal_id"],
+                entry_px=r["entry_px"], fee_bps=r["fee_bps"],
+            )
+            for r in rows
+        ]
+
+    return ShadowHooks(get_touch=get_touch, insert_entry=insert_entry,
+                       close=close, load_open=load_open)
+
+
+# ---------------------------------------------------------------------------
+# Listener cursor (migration 020)
+# ---------------------------------------------------------------------------
+
+def make_load_executor_cursor(pool: asyncpg.Pool):
+    """The persisted listener cursor, or None if the executor never ran."""
+    async def load_executor_cursor():
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT cursor_at FROM executor_cursor WHERE id = true")
+    return load_executor_cursor
+
+
+def make_save_executor_cursor(pool: asyncpg.Pool):
+    """Upsert the listener cursor. Monotonic (GREATEST): it can never move
+    backwards, even if two writes land out of order."""
+    async def save_executor_cursor(cursor_at) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO executor_cursor (id, cursor_at, updated_at)
+                VALUES (true, $1, now())
+                ON CONFLICT (id) DO UPDATE SET
+                    cursor_at  = GREATEST(executor_cursor.cursor_at, EXCLUDED.cursor_at),
+                    updated_at = now()
+                """,
+                cursor_at,
+            )
+    return save_executor_cursor
+
+
+# ---------------------------------------------------------------------------
+# Alerts (migration 021)
+# ---------------------------------------------------------------------------
+
+def make_alert(pool: asyncpg.Pool):
+    """(kind, detail) -> insert an executor_alerts row; its trigger fires
+    pg_notify('executor_alert'). The executor calls this best-effort."""
+    async def alert(kind: str, detail: dict) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO executor_alerts (kind, trade_id, symbol, detail)
+                VALUES ($1, $2, $3, $4::jsonb)
+                """,
+                kind, detail.get("trade_id"), detail.get("symbol"),
+                json.dumps(detail, default=str),
+            )
+    return alert
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
@@ -580,6 +694,7 @@ def build_executor_hooks(pool: asyncpg.Pool) -> ExecutorHooks:
         get_exit_cap=make_get_exit_cap(pool),
         persist_exit_state=make_persist_exit_state(pool),
         kill_switch_blocks=make_kill_switch_blocks(pool),
+        alert=make_alert(pool),
     )
 
 

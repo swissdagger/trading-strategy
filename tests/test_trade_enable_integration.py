@@ -15,6 +15,7 @@ import os
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from execution.trade_enable import TradeEnableState, TradeMode
 
@@ -22,7 +23,7 @@ DSN = os.environ.get("QISS_TEST_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="QISS_TEST_DSN not set; needs real Postgres")
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
     await p.execute("UPDATE trade_enabled SET mode = 'off' WHERE id = true")

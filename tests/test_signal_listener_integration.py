@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from execution.signal_listener import SignalListener, CHANNEL
 
@@ -65,7 +66,7 @@ async def _insert(pool, row) -> bool:
     return result.endswith(" 1")
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
     # Clean slate for each test.

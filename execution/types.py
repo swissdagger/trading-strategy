@@ -240,6 +240,17 @@ class AccountEquity:
     available: Optional[Decimal] = None
 
 
+@dataclass(frozen=True)
+class MinOrderSize:
+    """A venue's minimum order size for a symbol, in base units and/or in quote
+    notional (Coinbase: base_min_size / quote_min_size on the product). Either
+    may be None when the venue doesn't publish it. The executor rejects an entry
+    below either minimum BEFORE submitting, rather than paying a venue round
+    trip for a certain rejection."""
+    base: Optional[Decimal] = None
+    quote: Optional[Decimal] = None
+
+
 # ---------------------------------------------------------------------------
 # Quantity-match tolerances. Venues report position sizes with their own
 # rounding, so reconcile compares |db - venue| against an epsilon rather than
