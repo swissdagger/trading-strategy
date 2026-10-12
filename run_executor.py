@@ -214,18 +214,9 @@ async def main() -> None:
 
     # Boot ordering invariant: connect -> reconcile -> diff -> fill stream.
     # Raises if a trading session can't be confirmed or the venue holds orphan
-    # balances; we stay down rather than trade blind. Orphans alert from inside
-    # start(); any other boot failure alerts here.
-    try:
-        await executor.start()
-    except (OrphanPositionError, CoinbaseConnectError):
-        raise   # already explained (and, for orphans, alerted) at the source
-    except Exception as e:
-        try:
-            await hooks.alert("executor_boot_failed", {"error": repr(e)})
-        except Exception:
-            log.exception("could not record executor_boot_failed alert")
-        raise
+    # balances; we stay down rather than trade blind (logged at the source and
+    # in __main__ below).
+    await executor.start()
 
     # Only NOW subscribe to signals. Resume from the persisted cursor
     # (migration 020) so signals written while we were down — EXITs above all —
@@ -252,7 +243,8 @@ async def main() -> None:
 
     listener_task = asyncio.create_task(listener.run(), name="signal-listener")
     # The escalation driver: widens unfilled exits rung by rung and HALTs at the
-    # top of the ladder. Without it, a working exit that never fills is never
+    # top of the ladder, and closes every position while the kill switch is in
+    # 'flatten' mode. Without it, a working exit that never fills is never
     # escalated.
     escalation_task = asyncio.create_task(
         executor.run_escalation_loop(), name="escalation-loop")
@@ -278,8 +270,8 @@ async def main() -> None:
 
 
 # A refused or failed boot waits this long before exiting, so a restart loop
-# under docker-compose (restart: unless-stopped) retries — and alerts — at most
-# every few minutes instead of every few seconds.
+# under docker-compose (restart: unless-stopped) retries at most every few
+# minutes instead of every few seconds.
 BOOT_RETRY_S = float(os.getenv("EXECUTOR_BOOT_RETRY_S", "300"))
 
 

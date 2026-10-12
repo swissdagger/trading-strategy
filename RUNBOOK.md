@@ -169,7 +169,7 @@ SELECT action, count(*), max(created_at) FROM trade_signals GROUP BY 1;
 SELECT state, count(*) FROM trades GROUP BY 1;
 ```
 
-### Logs worth alerting on
+### Logs worth watching
 
 | Process | Line | Meaning |
 |---|---|---|
@@ -177,19 +177,15 @@ SELECT state, count(*) FROM trades GROUP BY 1;
 | signal | `forecast TIMEOUT` | a bar was skipped. A burst means Sumtyme is down, degraded or over-subscribed |
 | executor | `stale ENTER ... skipped` | a replayed or late ENTER was older than `ENTER_MAX_AGE_SECONDS` |
 | executor | `persist_fill: ... no matching order` (ERROR) | a fill for a known trade could not be attributed. Investigate before the next boot |
+| executor | `HALTED` (ERROR) | a trade needs a human (§6.2) |
+| executor | `kill switch FLATTEN` | flatten is closing a position (§6.1) |
 | executor | `cannot start` / `retrying in` | boot refused (§6.3) |
 
-### `executor_alerts`
-
-Every HALT and refused or failed boot inserts a row (`trade_halted`,
-`boot_refused`, `executor_boot_failed`) and fires `pg_notify('executor_alert')`.
-**Nothing in this repo delivers them to a human yet.** Delivery needs a notifier
-that LISTENs on `executor_alert`, sends the email (or page), and sets
-`delivered_at`. Until that exists, poll:
+There is no alerting: nothing pages or emails. Check the HALTs and the
+executor log as part of the routine:
 
 ```sql
-SELECT alert_id, kind, symbol, trade_id, detail, created_at
-  FROM executor_alerts WHERE delivered_at IS NULL ORDER BY created_at;
+SELECT trade_id, symbol, halt_reason, last_updated FROM trades WHERE state = 'HALTED';
 ```
 
 ---
@@ -199,17 +195,40 @@ SELECT alert_id, kind, symbol, trade_id, detail, created_at
 ### 6.1 Stop trading now
 
 ```sql
+-- stop opening; open positions keep their normal exits
 UPDATE kill_switch SET engaged = true, mode = 'halt_new',
+       reason = '<why>', engaged_by = '<you>', engaged_at = now();
+
+-- stop opening AND close everything
+UPDATE kill_switch SET engaged = true, mode = 'flatten',
        reason = '<why>', engaged_by = '<you>', engaged_at = now();
 ```
 
-- New ENTERs are blocked. The row is read on every order, with no cache.
-- Open positions keep their normal exits.
-- `flatten` is **not implemented** and behaves as `halt_new`. To flatten, close
-  the positions by hand in Coinbase (then see 6.2), or set `mode = 'off'`, which
-  stops all orders, exits included.
+Both modes block new ENTERs; the row is read on every ENTER, with no cache.
 
-Release it with `engaged = false`.
+**`flatten`** is read every second by the executor's escalation loop. For each
+live trade it runs the same close as a normal EXIT signal:
+1. cancels a working entry first, so nothing keeps buying while it sells. If
+   Coinbase has not confirmed the cancel, or trading is `off`, it retries rather
+   than guess;
+2. waits until every entry fill the venue reported has been recorded, so the
+   close covers the whole position;
+3. closes the remaining position with exit reason `KILL_SWITCH`, as a
+   marketable limit on the normal escalation ladder. An exit that is still
+   unfilled at the top of the ladder HALTs (§6.2) instead of selling at any price;
+4. finalizes a trade whose entry never filled, with nothing to sell.
+
+It leaves alone trades already closing on a STOP or TARGET (the ladder is
+working them), HALTED trades, and shadow positions (they hold no capital).
+Flatten places orders, so it needs `paper` or `live`: in `off` every order is
+suppressed. Watch for `kill switch FLATTEN` in the log, then:
+
+```sql
+SELECT count(*) FROM trades WHERE state NOT IN ('CLOSED','REJECTED');   -- 0 when done
+```
+
+Release with `engaged = false`. Releasing mid-flatten stops starting new closes;
+exits already working carry on.
 
 ### 6.2 A HALTED trade
 
@@ -217,7 +236,7 @@ A HALTED trade is one the executor refuses to act on. Triggers:
 - boot reconcile found a DB/venue mismatch for the symbol;
 - an exit climbed the escalation ladder to the top without filling.
 
-The reason is in `trades.halt_reason` and in the alert's `detail`.
+The reason is in `trades.halt_reason` and in the executor log.
 
 1. Compare the DB with Coinbase:
    ```sql
@@ -238,7 +257,7 @@ Never edit the DB to "un-HALT" without first checking the venue.
 
 On a refused or failed boot, the executor logs the reason, waits
 `EXECUTOR_BOOT_RETRY_S` (default 300 s) and exits 1. Compose retries, so a broken
-boot alerts at most every few minutes. Common causes:
+boot retries at most every few minutes. Common causes:
 
 - **Orphan balance.** The portfolio holds a non-dust asset outside the traded
   universe with no DB trade explaining it. Sell or move it, or add the currency to
@@ -289,7 +308,7 @@ API can serve only adds timeouts.
 `docs/paper_review.sql` holds the review queries:
 - realized P&L and fee drag per symbol;
 - fill price vs. touch (slippage in bps);
-- alerts and HALTs;
+- HALTs;
 - shadow-book results for shorts;
 - the paper account.
 
@@ -310,7 +329,7 @@ Go live only when every step passes, in order:
      before fees does not go live.
    - **Fill vs. touch.** Entry and exit slippage is within the caps in
      `execution_caps`.
-   - **Reconcile.** Every alert in the period is explained, and there are no
+   - **Reconcile.** Every HALT and refused boot in the period is explained, and there are no
      `no matching order` fill errors.
    - **Shadow book.** Read as context only: it is the short side the account
      cannot trade.
@@ -319,7 +338,8 @@ Go live only when every step passes, in order:
    - Set `CRYPTO_BASES` to **one** symbol.
    - Confirm that 5% of available balance exceeds the product's minimum order
      size.
-6. **Drain paper.** Engage the kill switch (`halt_new`) and wait until
+6. **Drain paper.** Engage the kill switch (`halt_new` to let positions exit on
+   their own signals, or `flatten` to close them now) and wait until
    `SELECT count(*) FROM trades WHERE state NOT IN ('CLOSED','REJECTED')` is 0.
    Note the timestamp.
 7. **Switch.** `UPDATE trade_enabled SET mode = 'live', reason = 'go-live'`,
@@ -342,7 +362,11 @@ and expect a restart.
   Replays and restarts dedupe.
 - **Boot order:** connect → reconcile → diff → fill stream → subscribe. The
   executor never takes a signal before it knows what it holds.
+- **An exit settles the entry first:** a final close (EXIT signal or flatten)
+  cancels a still-working entry and waits for its reported fills before selling,
+  so a late buy fill can't be left behind. A close waiting on that is retried
+  every second and survives a restart.
 - **Escalation:** an exit that does not fill widens its cap rung by rung. The top
-  rung HALTs and alerts rather than selling at an unbounded price.
+  rung HALTs rather than selling at an unbounded price.
 - **The chain machine is copied from CausaView**, not shared. It differs by the
   monotonic bar guard; apply any change in both places.

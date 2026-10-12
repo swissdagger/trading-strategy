@@ -1,9 +1,9 @@
 """
 Integration tests for the Phase 3 persistence (migrations 019-021) against a
-real Postgres with all migrations applied: shadow_trades, executor_cursor and
-executor_alerts, through the same make_* factories run_executor wires in.
+real Postgres with all migrations applied: shadow_trades and executor_cursor,
+plus the paper ledger and the kill switch, through the same make_* factories
+run_executor wires in.
 """
-import asyncio
 import uuid
 import os
 from datetime import datetime, timedelta, timezone
@@ -14,7 +14,8 @@ import pytest
 import pytest_asyncio
 
 from execution.persistence import (
-    make_alert, make_load_executor_cursor, make_save_executor_cursor,
+    make_kill_switch_blocks, make_kill_switch_flatten, make_load_executor_cursor,
+    make_set_kill_switch, make_save_executor_cursor,
     make_shadow_hooks,
 )
 from execution.shadow_book import ShadowBook
@@ -27,7 +28,7 @@ pytestmark = pytest.mark.skipif(not DSN, reason="QISS_TEST_DSN not set; needs re
 @pytest_asyncio.fixture
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
-    await p.execute("TRUNCATE shadow_trades, executor_cursor, executor_alerts")
+    await p.execute("TRUNCATE shadow_trades, executor_cursor")
     yield p
     await p.close()
 
@@ -94,22 +95,27 @@ async def test_executor_cursor_load_save_monotonic(pool):
 
 
 @pytest.mark.asyncio
-async def test_alert_row_and_notify(pool):
-    got = asyncio.get_running_loop().create_future()
-    conn = await asyncpg.connect(DSN, statement_cache_size=0)
+async def test_executor_alerts_dropped(pool):
+    # Migration 024 removed the alert outbox.
+    assert await pool.fetchval("SELECT to_regclass('executor_alerts')") is None
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_modes_round_trip(pool):
+    blocks, flatten = make_kill_switch_blocks(pool), make_kill_switch_flatten(pool)
+    set_ks = make_set_kill_switch(pool)
     try:
-        await conn.add_listener("executor_alert",
-                                lambda *a: got.done() or got.set_result(a[3]))
-        await make_alert(pool)("trade_halted", {
-            "trade_id": "t-1", "symbol": "BTC-USD", "reason": "test", "qty": Decimal("1")})
-        alert_id = await asyncio.wait_for(got, timeout=5)
+        await set_ks(False)
+        assert not await blocks() and not await flatten()
+        await set_ks(True, reason="test", engaged_by="pytest", mode="halt_new")
+        assert await blocks() and not await flatten()
+        await set_ks(True, reason="test", engaged_by="pytest", mode="flatten")
+        assert await blocks() and await flatten()
+        with pytest.raises(ValueError):
+            await set_ks(True, mode="sell_everything")
     finally:
-        await conn.close()
-    r = await pool.fetchrow("SELECT * FROM executor_alerts")
-    assert str(r["alert_id"]) == alert_id
-    assert r["kind"] == "trade_halted"
-    assert r["trade_id"] == "t-1" and r["symbol"] == "BTC-USD"
-    assert r["delivered_at"] is None
+        await set_ks(False)
+    assert not await blocks() and not await flatten()
 
 
 # --------------------------------------------------------------------

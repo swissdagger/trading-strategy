@@ -76,7 +76,7 @@ fees — the only short-side data available.
 | Producer | bars | tagged chain events | `service2_machine.py`, `fanout_router_multi.py`, `ladder_registry.py` |
 | Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `confirmed_15m_*.py`, `signal_writer.py` |
 | Execution | trade signals | venue orders | `signal_listener.py`, `signal_executor.py`, `sizing.py`, `shadow_book.py`, `gated_adapter.py`, `coinbase_adapter.py`, `paper_adapter.py` |
-| Schema | — | the trading DB | `migrations/001…023` |
+| Schema | — | the trading DB | `migrations/001…024` |
 
 Dependencies point downward only. The executor never imports the strategy; both
 sides share only the DB contract and the event shape.
@@ -177,8 +177,10 @@ risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
   `live` → real orders. off↔paper takes effect immediately; a paper↔live change
   blocks every write and restarts the executor so it reconciles against the new
   venue.
-- **Kill switch** (`kill_switch`): blocks new entries; open positions keep their
-  normal exits. (`flatten` mode is not implemented and behaves as `halt_new`.)
+- **Kill switch** (`kill_switch`): blocks new entries. `halt_new` lets open
+  positions run their normal exits; `flatten` also cancels working entries and
+  closes every open position within a second (reason `KILL_SWITCH`, through the
+  normal exit path and its escalation ladder).
 - **Key checks at connect**: the key must be bound to the bot portfolio, must not
   be able to transfer funds, and (live) must be able to trade.
 - **Boot reconcile**: venue positions vs. DB trades, **netted per symbol**;
@@ -187,8 +189,9 @@ risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
   entry; venue minimums enforced before submit.
 - **Execution caps** (`execution_caps`): marketable-limit caps per class and
   intent, with an exit escalation ladder that HALTs at the top. Hot-reloadable.
-- **Alerts**: every HALT and refused boot writes `executor_alerts` and fires
-  `pg_notify('executor_alert')`.
+- **HALTs** are logged at ERROR and stay visible in `trades` (`state = 'HALTED'`,
+  `halt_reason`); a refused boot is logged and retried every few minutes. There is
+  no alerting.
 - **Idempotency everywhere**: `signal_id`, `client_order_id` (deterministic `cv1`;
   Coinbase returns the existing order for a repeated id), `venue_exec_id`, and a
   unique `(chain_id, side)` on trades.
