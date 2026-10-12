@@ -146,6 +146,34 @@ VENUE_ENDPOINTS = {
 }
 
 # ---------------------------------------------------------------------------
+# Executor risk and safety settings (ADR-001 Phase 3). Read by run_executor.py
+# and injected into the executor; execution/ never imports config directly.
+# ---------------------------------------------------------------------------
+
+# Hard cap on concurrently open positions across all symbols and strategies
+# (non-terminal trades, HALTED included: a halted trade may still hold capital).
+# Checked under a lock before every ENTER. Placeholder — tune in paper.
+MAX_OPEN_POSITIONS = 5
+
+# An ENTER signal older than this (decided_at -> now) is skipped, never acted
+# on: after downtime the catch-up sweep replays history and a stale entry would
+# buy at a price the strategy never saw. EXITs are ALWAYS honoured regardless of
+# age. Default 2 x the 1m baseline timeframe.
+ENTER_MAX_AGE_SECONDS = 2 * 60
+
+# Venue balances the executor ignores when checking for orphans at boot: base
+# assets (e.g. "ETH") or full symbols (e.g. "ETH-USD"). Any OTHER non-dust
+# balance in the bot portfolio with no open trade refuses boot. The dedicated
+# portfolio should make this rarely needed (ADR-001 debt D13).
+ORPHAN_BALANCE_ALLOWLIST: frozenset = frozenset()
+
+# Taker fee, in basis points per side, applied by the shadow book to its
+# virtual short fills. Coinbase Advanced Trade's lowest volume tier taker rate
+# at the time of writing (check your account's tier); Phase 4/5 replace this
+# with the live tier from GET /transaction_summary.
+SHADOW_TAKER_FEE_BPS = 120
+
+# ---------------------------------------------------------------------------
 # STRATEGIES — the multi-strategy registry config (strategy/registry.py).
 # Each entry: enabled, the symbols it trades ('*' = all tracked), the LADDERS
 # it reads chains from (strategy/ladder_registry.py), and opaque params. A

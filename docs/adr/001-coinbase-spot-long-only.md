@@ -163,13 +163,13 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ### Phase 3 — Executor hardening (venue-independent; testable with existing fakes)
 
-- [ ] **Netted reconcile.** `SignalExecutor._reconcile` and `boot._position_matches`: group open DB trades by symbol, sum signed `open_qty`, diff once; on mismatch HALT all trades on that symbol. Epsilon = product `base_increment`.
-- [ ] **Side gate.** `ExecutionAdapter.supports_short: bool` class attribute. `_on_enter` routes SHORT to the shadow book before sizing/kill-switch when unsupported.
-- [ ] **Shadow book.** Migration 019 `shadow_trades (strategy, position_key, symbol, side, entry_signal_id UNIQUE, entry_px, entry_at, exit_signal_id, exit_px, exit_at, exit_reason, fee_bps, pnl_bps)`. New `execution/shadow_book.py`: ENTER fills at the touch on the side you would get (ask for short), EXIT at the opposite touch, taker fee applied twice; runs under the per-symbol lock.
-- [ ] **Sizing.** `make_size_position` uses `equity.available`; `MAX_OPEN_POSITIONS` in config, checked under the lock; new `ExecutionAdapter.get_price_increment`; `limit_price` quantized to `quote_increment` toward the reference (buys floor, sells ceil); reject below `base_min_size` / `quote_min_size` pre-submit.
-- [ ] **Orphans HALT boot.** Unknown non-dust balances in the bot portfolio raise in `start()`; config allowlist of base assets to ignore.
-- [ ] **Persisted cursor.** Migration 020 `executor_cursor` singleton; `run_executor.py` loads it as `initial_cursor`; listener writes after each dispatch. ENTER max-age (default 2 × baseline tf) — stale ENTERs skipped, EXITs always honoured.
-- [ ] **HALT alerting.** Confirm the trigger path in migration 018 (email notifications); wire `_halt` and boot refusal into it.
+- [x] **Netted reconcile.** `SignalExecutor._reconcile` and `boot._position_matches`: group open DB trades by symbol, sum signed `open_qty`, diff once; on mismatch HALT all trades on that symbol. Epsilon = product `base_increment`.
+- [x] **Side gate.** `ExecutionAdapter.supports_short: bool` class attribute. `_on_enter` routes SHORT to the shadow book before sizing/kill-switch when unsupported.
+- [x] **Shadow book.** Migration 019 `shadow_trades (strategy, position_key, symbol, side, entry_signal_id UNIQUE, entry_px, entry_at, exit_signal_id, exit_px, exit_at, exit_reason, fee_bps, pnl_bps)`. New `execution/shadow_book.py`: ENTER fills at the touch on the side you would get (bid for a short, which sells to open; corrected from "ask" in the original draft), EXIT at the opposite touch, taker fee applied twice; runs under the per-symbol lock.
+- [x] **Sizing.** `make_size_position` uses `equity.available`; `MAX_OPEN_POSITIONS` in config, checked under the lock; new `ExecutionAdapter.get_price_increment`; `limit_price` quantized to `quote_increment` toward the reference (buys floor, sells ceil); reject below `base_min_size` / `quote_min_size` pre-submit.
+- [x] **Orphans HALT boot.** Unknown non-dust balances in the bot portfolio raise in `start()`; config allowlist of base assets to ignore.
+- [x] **Persisted cursor.** Migration 020 `executor_cursor` singleton; `run_executor.py` loads it as `initial_cursor`; listener writes after each dispatch. ENTER max-age (default 2 × baseline tf) — stale ENTERs skipped, EXITs always honoured.
+- [x] **HALT alerting.** Confirm the trigger path in migration 018 (email notifications); wire `_halt` and boot refusal into it. *(018 has no trigger; alerts go to a new outbox, migration 021 — see Implementation notes, PR 2.)*
 
 ### Phase 4 — `CoinbaseAdapter`
 
@@ -191,7 +191,7 @@ Each phase is independently mergeable and leaves the system runnable.
 ### Phase 5 — `PaperCoinbaseAdapter`
 
 - [ ] Wraps a `CoinbaseAdapter` for reads (touch, products, fee tier from `GET /transaction_summary`); simulates writes: immediate full fill at `limit_price`, real taker fee.
-- [ ] Migration 021 `paper_ledger` (cash, positions) + `paper_fills`; paper reconcile exercises the real boot path.
+- [ ] Migration 022 `paper_ledger` (cash, positions) + `paper_fills` (renumbered: 021 is `executor_alerts`); paper reconcile exercises the real boot path.
 - [ ] `supports_short = False` so shadow shorts behave identically in paper and live.
 - [ ] Factory: `off` / `paper` → paper adapter; `live` → real adapter (unchanged mapping).
 
@@ -250,10 +250,25 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ---
 
-## Implementation notes (PR 1)
+## Implementation notes
+
+### PR 1 (Phases 0–1)
 
 - **`four_chain` entry trigger was unreachable (fixed).** `FourChainEntry.on_event` returned early unless `event_type == "level_reached"`, which no chain machine emits, so from the 2026-08-13 switch to the two-chain rules the strategy never entered (every four_chain row in `trade_signals` predates it). The trigger is now `chain_propagated` at 15m. The event-type check is kept on purpose: `chain_terminated` carries the level the chain died on, which can be 15m. `tests/test_four_chain_strategy.py` is rewritten from the old four-chain spec to the two-chain rules, including a test that a termination at 15m does not enter.
 - Test failures that were *not* config drift: `test_fanout_router_multi` fakes lacked `ChainEvent.price`; `test_multi_runtime` fakes declared ladder `A` while the runtime now gates entries by declared ladder, and lacked the `decision_price` kwarg on exit; `test_signal_executor` scripted results carried placeholder client ids (now echo the submitted `cv1` id, as a venue does), and two tests asserted that unattributable fills are persisted with `trade_id = NULL`, whereas the executor deliberately counts them (`fills_unattributable`) and leaves them for reconcile because `fills.trade_id` is NOT NULL; `test_strategy_signals_integration` imported `make_insert_signal` from the wrong module.
 - Symbols stay in Binance form (`BTCUSDT`) and the feed stays on Binance klines until Phase 2, so the signal side keeps running between PRs. `feeds/binance_ws.py` and `feeds/streaming_base.py` stay for the same reason.
 - `build_coinbase_adapter` raises `NotImplementedError` until Phase 4; `run_executor.py` exits 1 with that message rather than trading through a missing venue.
 - Migration 015 is edited in place (equity rows commented out) because Phase 2 starts from a fresh DB. On an existing DB, the equity rows are inert and can be deleted by hand.
+
+### PR 2 (Phase 3)
+
+- **Alerting: migration 018 has no trigger.** It is only the dedupe/cursor table of an email notifier that consumes `trade_signals`, and that notifier is not in this repo. HALTs and refused boots therefore write to a new outbox, `executor_alerts` (migration 021), whose trigger fires `pg_notify('executor_alert', alert_id)`. **Email delivery still needs the notifier to LISTEN on that channel (or sweep `delivered_at IS NULL`).** Alerts are best-effort: a failing insert never blocks the HALT.
+- **Migration numbering:** 019 `shadow_trades`, 020 `executor_cursor`, 021 `executor_alerts`. Phase 5's paper ledger becomes 022.
+- **Shadow fills:** a short ENTER fills at the **bid** (it sells), and its EXIT at the ask. The original draft said "ask for short", which would have recorded short entries at the wrong side of the book. SCALE tranches are ignored; the virtual position closes on the final EXIT. With no usable touch, the signal's `decision_price` is used and logged.
+- **Ordering of entry gates:** replay check → stale-ENTER check → side gate (SHORT → shadow) → kill switch → open-position cap (under a cross-symbol entry lock) → sizing → pricing → venue minimums. Shadow entries are therefore not limited by the kill switch or the cap (they take no risk), but are age-gated, so the shadow book only records entries the long book would really have taken.
+- **Reconcile tolerance** is one venue quantity increment (`get_step_size`, i.e. `base_increment`), falling back to the per-class epsilon. HALTED trades count toward the symbol's net (their quantity is still at the venue) and toward `MAX_OPEN_POSITIONS`.
+- **Sizing** is 5% of `available`, falling back to `total` with a warning only if the venue reports no available balance. Venue minimums are enforced on entries only; exits are never refused pre-submit (a stranded position is worse than a venue rejection).
+- **New adapter surface:** `supports_short` (default False — a venue must opt in), `get_price_increment` and `get_min_order_size` (both default None = unknown). Limits are rounded toward the touch: buys floor, sells ceil.
+- **Bugs found and fixed along the way:** `GatedAdapter` was still abstract (missing `get_touch` / `get_account_equity` / `get_step_size`), so `run_executor.py` would have crashed on start; `run_executor.py` never started the escalation loop, so unfilled exits would never escalate or HALT; the three existing real-Postgres integration test modules used plain `@pytest.fixture` for async fixtures and errored whenever `QISS_TEST_DSN` was set.
+- **CI** now runs the integration tests: a Postgres 16 service, all migrations applied, `QISS_TEST_DSN` set.
+- `boot.run_boot_reconcile` is netted as specified, but nothing calls it: `SignalExecutor.start()` runs its own reconcile, which is the live path.

@@ -145,6 +145,13 @@ async def run_boot_reconcile(
     db_trades = await hooks.load_nonterminal_trades()
     matched_symbols: set[str] = set()
     safe_to_proceed = True
+    # NETTED: the venue reports one position per symbol (on spot, the base-asset
+    # balance), so an OPEN trade is checked against the SUM of every DB trade's
+    # signed open_qty on its symbol, not against the symbol's total alone. Two
+    # open trades on one symbol no longer HALT each other.
+    net_by_symbol: Dict[str, Decimal] = {}
+    for t in db_trades:
+        net_by_symbol[t.symbol] = net_by_symbol.get(t.symbol, Decimal(0)) + t.open_qty
 
     for t in db_trades:
         matched_symbols.add(t.symbol)
@@ -152,6 +159,7 @@ async def run_boot_reconcile(
             await _resolve_trade(
                 t, adapter, hooks, alert, config,
                 positions_by_symbol, orders_by_client_id, fills_by_client_id,
+                net_by_symbol,
             )
         except Exception as e:  # never let one trade's resolution abort the rest
             # An exception DURING resolution is itself a halt-worthy unknown.
@@ -199,6 +207,7 @@ async def _resolve_trade(
     positions_by_symbol: Dict[str, VenuePosition],
     orders_by_client_id: Dict[str, VenueOrder],
     fills_by_client_id: Dict[str, List[Fill]],
+    net_by_symbol: Optional[Dict[str, Decimal]] = None,
 ) -> None:
     """Resolve ONE DB trade against the venue snapshot, per the agreed diff
     matrix. Each branch either advances the trade to a consistent state or
@@ -245,7 +254,8 @@ async def _resolve_trade(
 
     # ----- OPEN: do we still hold the position we think we do? -----
     if t.state == "OPEN":
-        if has_position and _position_matches(t, pos, config):
+        expected = (net_by_symbol or {}).get(t.symbol, t.open_qty)
+        if has_position and _position_matches(expected, pos, config):
             # Clean re-adoption. Resume-management: exit rule resumes governing.
             await hooks.resume_exit(t)
             log.info("boot: %s %s OPEN position re-adopted", t.symbol, t.side.value)
@@ -270,7 +280,7 @@ async def _resolve_trade(
             return
         # Position exists but size/side disagrees with our record. HALT — we do
         # not silently adopt a position we can't reconcile to our quantity.
-        reason = (f"open_position_mismatch db_open={t.open_qty} "
+        reason = (f"open_position_mismatch db_net={expected} "
                   f"venue={pos.qty if pos else None}")
         await hooks.set_state(t.trade_id, "HALTED", reason)
         await alert("trade_halted_on_boot",
@@ -316,10 +326,10 @@ async def _resolve_trade(
 # Small pure helpers. Kept here and side-effect-free so the diff logic above
 # reads as the matrix it is.
 # ---------------------------------------------------------------------------
-def _position_matches(t: DbTrade, pos: VenuePosition, cfg: BootConfig) -> bool:
-    """True if the venue position agrees with our open_qty in sign and size
-    (within epsilon)."""
-    return abs(pos.qty - t.open_qty) <= cfg.qty_match_epsilon
+def _position_matches(expected: Decimal, pos: VenuePosition, cfg: BootConfig) -> bool:
+    """True if the venue position agrees with the symbol's NETTED expected qty
+    (sum of our trades' signed open_qty) in sign and size, within epsilon."""
+    return abs(pos.qty - expected) <= cfg.qty_match_epsilon
 
 
 def _index_fills_by_order(

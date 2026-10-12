@@ -45,6 +45,7 @@ from typing import Awaitable, Callable, List, Optional, Set
 from execution.types import (
     AccountEquity,
     Fill,
+    MinOrderSize,
     OrderRequest,
     OrderResult,
     ReconcileResult,
@@ -75,8 +76,13 @@ class ExecutionAdapter(ABC):
     """
 
     # Subclasses MUST set these as class attributes.
-    venue: str = ""                    # 'ibkr' | 'binance'
-    supported_classes: Set[str] = set()  # {'equity','fx'} | {'crypto'}
+    venue: str = ""                    # e.g. 'coinbase'
+    supported_classes: Set[str] = set()  # e.g. {'crypto'}
+    # Can this venue/account hold a SHORT position? False by default: a venue
+    # must opt IN to shorting. When False the executor never sizes or sends a
+    # SHORT entry; it routes the signal to the shadow book instead (ADR-001:
+    # UK retail spot has no short side).
+    supports_short: bool = False
 
     # ----------------------------------------------------------------------
     # Session lifecycle
@@ -203,6 +209,24 @@ class ExecutionAdapter(ABC):
         quantity and relies on the adapter to express it in the symbol's
         precision at submit. Decimal, str-converted at the venue boundary.
         """
+
+    async def get_price_increment(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        """Return the venue's minimum PRICE increment (tick) for `symbol`, or None
+        if unknown (Coinbase: the product's quote_increment).
+
+        The executor quantizes every limit price to this, rounding TOWARD the
+        touch (buys floor, sells ceil), so a quantized limit never becomes more
+        aggressive than the cap allowed. Not abstract: the default None means
+        "unknown — send the limit as priced". Cached per symbol by adapters.
+        """
+        return None
+
+    async def get_min_order_size(self, symbol: str, asset_class: str) -> Optional[MinOrderSize]:
+        """Return the venue's minimum order size for `symbol` (base qty and/or
+        quote notional), or None if unknown. Used to reject an undersized ENTRY
+        before submit. Not abstract: the default None skips the check and leaves
+        the venue's own rejection as the backstop."""
+        return None
 
     # ----------------------------------------------------------------------
     # Order placement — preconditions: connect() returned, reconcile() diffed,

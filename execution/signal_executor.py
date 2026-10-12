@@ -61,12 +61,15 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Awaitable, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, FrozenSet, Optional
 
 from execution.adapter import ExecutionAdapter
 from execution.observability import Metrics, build_health_document
-from execution.pricing import CapConfig, price_marketable_limit, validate_touch
+from execution.pricing import (
+    CapConfig, price_marketable_limit, quantize_limit_price, validate_touch,
+)
 from execution import client_order_id as coid
 from execution.types import (
     Fill,
@@ -81,7 +84,22 @@ from execution.types import (
     qty_match_epsilon,
 )
 
+if TYPE_CHECKING:
+    from execution.shadow_book import ShadowBook
+
 log = logging.getLogger("executor.signal")
+
+# Non-terminal trade states. HALTED is non-terminal on purpose: a halted trade
+# may still hold capital at the venue, so it counts toward the open-position
+# cap and its quantity toward the symbol's netted reconcile.
+_LIVE_STATES = ("PENDING", "SUBMITTED", "OPEN", "CLOSING")
+_NON_TERMINAL_STATES = _LIVE_STATES + ("HALTED",)
+
+
+class OrphanPositionError(RuntimeError):
+    """Boot refused: the venue holds a non-dust balance the executor has no
+    trade for (and it isn't allowlisted). We do not model the account's state,
+    so we do not trade on it. A human reconciles, then restarts."""
 
 # How long to wait before retrying an exit whose book couldn't be priced (no or
 # crossed/invalid touch). Short, because an unpriceable protective exit is urgent:
@@ -267,6 +285,12 @@ class ExecutorHooks:
     quantize_exit_qty: Optional[
         Callable[[str, str, Decimal], Awaitable[Decimal]]] = None
 
+    # --- Alerting (optional) ---
+    # (kind, detail) -> raise a human-visible alert. Called on every HALT and on
+    # a refused boot. Best-effort: a failing alert is logged, never allowed to
+    # block the HALT itself. Wired to executor_alerts (migration 021).
+    alert: Optional[Callable[[str, dict], Awaitable[None]]] = None
+
     # --- Clock (injectable so escalation deadlines are testable) ---
     now_ms: Callable[[], int] = None   # defaults to wall clock in __post_init__
 
@@ -287,9 +311,33 @@ class SignalExecutor:
         *,
         locks: Optional[Dict[str, asyncio.Lock]] = None,
         metrics: Optional["Metrics"] = None,
+        shadow_book: Optional["ShadowBook"] = None,
+        max_open_positions: Optional[int] = None,
+        enter_max_age_ms: Optional[int] = None,
+        orphan_allowlist: FrozenSet[str] = frozenset(),
     ):
+        """
+        shadow_book: where SHORT signals go when the adapter cannot short
+            (adapter.supports_short is False). None => such signals are skipped.
+        max_open_positions: cap on non-terminal trades across all symbols,
+            checked before every ENTER. None => no cap.
+        enter_max_age_ms: an ENTER whose decided_at is older than this is
+            skipped (stale after downtime). EXITs are never age-gated. None =>
+            no age gate.
+        orphan_allowlist: base assets or symbols whose venue balances are
+            ignored by the boot orphan check.
+        """
         self.adapter = adapter
         self.hooks = hooks
+        self.shadow_book = shadow_book
+        self._max_open_positions = max_open_positions
+        self._enter_max_age_ms = enter_max_age_ms
+        self._orphan_allowlist = frozenset(orphan_allowlist)
+        # Serializes the open-position cap check with the trade insert that
+        # consumes the slot, across symbols (the per-symbol lock alone would let
+        # two symbols' ENTERs both pass the check). Always taken INSIDE a symbol
+        # lock, never the other way round.
+        self._entry_lock = asyncio.Lock()
         self._locks: Dict[str, asyncio.Lock] = (
             locks if locks is not None else defaultdict(asyncio.Lock)
         )
@@ -383,54 +431,51 @@ class SignalExecutor:
 
     async def _reconcile(self, snapshot: ReconcileResult, db_trades: list[OpenTrade]) -> None:
         """Diff venue truth against DB open trades. The executor — never the
-        adapter — decides. Un-resolvable discrepancies HALT the affected trade
+        adapter — decides. Un-resolvable discrepancies HALT the affected trades
         (a human looks) rather than guessing with real money.
 
+        NETTED PER SYMBOL. A venue reports ONE position per symbol (on spot it is
+        simply the base-asset balance), so the comparison is per symbol: the sum
+        of our non-terminal trades' signed open_qty against the venue's signed
+        qty, once. Comparing the venue's per-symbol qty against each trade
+        individually made two open trades on one symbol HALT each other.
+
         Resolutions:
-          * DB trade OPEN and venue has the matching position -> keep managing.
-          * DB trade OPEN but venue is FLAT for it -> it closed during the crash
-            window; HALT for review (we can't safely infer the exit price/fills
-            here — the recent_fills sweep below may explain it, else human).
-          * Venue position with no DB trade -> a position we don't recognize;
-            HALT-equivalent alert (do not adopt an unknown position silently).
-          * Working orders / recent fills attributed by parsing client_order_id.
+          * Netted qty matches (within one venue quantity increment) -> keep
+            managing every trade on the symbol.
+          * Mismatch (including "DB open but venue flat") -> HALT every live
+            trade on the symbol. Netting cannot say WHICH trade is wrong, so all
+            of them stop — consistent with never guessing with real money.
+          * Venue balance with no DB trade -> orphan: refuse boot unless it is
+            dust or allowlisted (OrphanPositionError, after alerting).
+          * Recent fills attributed by parsing the cv1 client_order_id.
         """
-        # Index venue positions by symbol (signed qty).
         venue_pos = {p.symbol: p for p in snapshot.positions}
 
+        by_symbol: Dict[str, list[OpenTrade]] = defaultdict(list)
         for t in db_trades:
             self._open[(t.strategy, t.position_key)] = t
-            pos = venue_pos.get(t.symbol)
-            if t.state in ("OPEN", "CLOSING"):
-                eps = qty_match_epsilon(t.asset_class)
-                venue_qty = pos.qty if pos is not None else Decimal(0)
-                if abs(venue_qty) <= eps:
-                    # DB says we hold it; venue says flat. Closed in the crash
-                    # window (or never really opened). Cannot safely resolve the
-                    # realized fills here -> HALT for review.
-                    await self._halt(t, "reconcile: DB open but venue flat")
-                elif abs(venue_qty - t.open_qty) > eps:
-                    # Venue holds a DIFFERENT size/sign than we think — a partial
-                    # close (or extra fill) during downtime we can't explain here.
-                    # HALT rather than silently manage a position we can't reconcile
-                    # to our quantity (previously this branch went undetected: we
-                    # only checked flat-vs-not and adopted any nonzero position).
-                    await self._halt(
-                        t, f"reconcile: position mismatch db={t.open_qty} venue={venue_qty}")
-                # else: venue confirms size AND sign; keep managing it.
+            by_symbol[t.symbol].append(t)
 
-        # Venue positions with no corresponding DB trade: flag, don't adopt. Use
-        # the crypto epsilon as a permissive floor for the unknown-symbol dust test
-        # (we have no trade to key asset_class on; a real orphan is a whole unit).
-        known_symbols = {t.symbol for t in db_trades}
-        for sym, p in venue_pos.items():
-            if abs(p.qty) > qty_match_epsilon("") and sym not in known_symbols:
-                log.error(
-                    "reconcile: venue holds %s qty=%s with no DB trade — manual review",
-                    sym, p.qty,
-                )
-                # No trade object to HALT; surfaced as a loud log for the operator.
-                # (A real deployment would also raise an alert / write an incident row.)
+        for sym, trades in by_symbol.items():
+            live = [t for t in trades if t.state in _LIVE_STATES]
+            if not live:
+                continue   # only HALTED trades: already parked for a human
+            # HALTED trades' quantity is still at the venue, so it is part of the
+            # expected net even though those trades are not re-checked.
+            expected = sum((t.open_qty for t in trades), Decimal(0))
+            pos = venue_pos.get(sym)
+            venue_qty = pos.qty if pos is not None else Decimal(0)
+            eps = await self._qty_epsilon(sym, trades[0].asset_class)
+            if abs(venue_qty - expected) <= eps:
+                continue   # venue confirms the symbol's net size AND sign
+            if abs(venue_qty) <= eps:
+                reason = f"reconcile: DB open but venue flat (symbol {sym} db_net={expected})"
+            else:
+                reason = (f"reconcile: symbol {sym} position mismatch "
+                          f"db_net={expected} venue={venue_qty}")
+            for t in live:
+                await self._halt(t, reason)
 
         # Recent venue fills we may have missed during the crash window. Attribute
         # each to its trade by parsing the cv1 client id (fills carry it, or it's
@@ -445,11 +490,86 @@ class SignalExecutor:
                 continue
             await self.hooks.persist_fill(_fill_row(f, trade_id=trade_id))
 
+        # Venue balances with no corresponding DB trade. Checked LAST so the fill
+        # sweep above still records what it can before a refused boot.
+        orphans = []
+        for sym, p in venue_pos.items():
+            if sym in by_symbol:
+                continue
+            if self._orphan_allowed(sym):
+                log.info("reconcile: venue holds allowlisted %s qty=%s — ignored", sym, p.qty)
+                continue
+            if await self._is_dust(sym, p.qty):
+                log.info("reconcile: venue holds dust %s qty=%s — ignored", sym, p.qty)
+                continue
+            orphans.append({"symbol": sym, "qty": str(p.qty)})
+        if orphans:
+            self._mincr("boot_refused_orphans")
+            detail = {"reason": "orphan venue balances with no DB trade",
+                      "orphans": orphans}
+            await self._alert("boot_refused", detail)
+            log.error("reconcile: ORPHAN balances %s — refusing to boot", orphans)
+            raise OrphanPositionError(
+                f"venue holds balances with no DB trade: {orphans}. Reconcile by "
+                f"hand (or allowlist them), then restart.")
+
+    async def _qty_epsilon(self, symbol: str, asset_class: str) -> Decimal:
+        """Tolerance for "venue qty matches ours": one venue quantity increment
+        (Coinbase base_increment, via get_step_size) — anything smaller is
+        unplaceable rounding. Falls back to the per-class epsilon when the venue
+        can't say."""
+        try:
+            step = await self.adapter.get_step_size(symbol, asset_class)
+        except Exception:
+            log.exception("get_step_size(%s) failed; using class epsilon", symbol)
+            step = None
+        return step if step is not None and step > 0 else qty_match_epsilon(asset_class)
+
+    def _orphan_allowed(self, symbol: str) -> bool:
+        """Allowlisted by full symbol, or by base asset (the part before '-' in
+        the Coinbase product id form, e.g. 'ETH' for 'ETH-USD')."""
+        return (symbol in self._orphan_allowlist
+                or symbol.split("-", 1)[0] in self._orphan_allowlist)
+
+    def _default_asset_class(self) -> str:
+        classes = getattr(self.adapter, "supported_classes", set()) or set()
+        return next(iter(classes)) if len(classes) == 1 else ""
+
+    async def _is_dust(self, symbol: str, qty: Decimal) -> bool:
+        """A balance too small to trade: below the venue's minimum base order
+        size when known (it could not be sold anyway), else within one quantity
+        increment."""
+        asset_class = self._default_asset_class()
+        try:
+            mins = await self.adapter.get_min_order_size(symbol, asset_class)
+        except Exception:
+            log.exception("get_min_order_size(%s) failed", symbol)
+            mins = None
+        if mins is not None and mins.base is not None and mins.base > 0:
+            return abs(qty) < mins.base
+        return abs(qty) <= await self._qty_epsilon(symbol, asset_class)
+
+    async def _alert(self, kind: str, detail: dict) -> None:
+        """Best-effort human alert. Never raises: an alert sink that is down
+        must not stop a HALT or mask the original error."""
+        if self.hooks.alert is None:
+            return
+        try:
+            await self.hooks.alert(kind, detail)
+        except Exception:
+            self._mincr("alerts_failed")
+            log.exception("alert %s failed to send: %s", kind, detail)
+
     async def _halt(self, t: OpenTrade, reason: str) -> None:
         t.state = "HALTED"
         self._mincr("trades_halted")
         await self.hooks.update_trade_state(t.trade_id, "HALTED", reason)
         log.error("trade %s HALTED: %s", t.trade_id, reason)
+        await self._alert("trade_halted", {
+            "trade_id": t.trade_id, "strategy": t.strategy,
+            "position_key": t.position_key, "symbol": t.symbol,
+            "side": t.side.value, "reason": reason,
+        })
 
     # ----------------------------------------------------------------------
     # Signal ingress — the SignalListener's handler
@@ -481,10 +601,35 @@ class SignalExecutor:
         position_key = row["position_key"]
         key = (strategy, position_key)
 
-        # Idempotency: already managing this position? A replayed ENTER is a
-        # no-op (the deterministic ids would dedupe at the DB/venue anyway).
-        if key in self._open:
+        # Idempotency: already managing this position (real or shadow)? A
+        # replayed ENTER is a no-op (the deterministic ids would dedupe at the
+        # DB/venue anyway).
+        if key in self._open or (
+                self.shadow_book is not None and self.shadow_book.holds(*key)):
             log.debug("ENTER for already-open position %s/%s — skip", strategy, position_key)
+            return
+
+        # Gate: stale ENTER (catch-up replay after downtime). Before the side
+        # gate, so the shadow book records only entries we would really take.
+        if self._enter_is_stale(row):
+            self._mincr("entries_skipped_stale")
+            log.warning("stale ENTER %s/%s (decided_at=%s) — skipped",
+                        strategy, position_key, row.get("decided_at"))
+            return
+
+        side = TradeSide.LONG if row["direction"] == "LONG" else TradeSide.SHORT
+
+        # Gate: side. A venue that cannot short never sizes or sees a SHORT; the
+        # signal goes to the shadow book (virtual fills) instead. Before the
+        # kill switch and the position cap: the shadow book takes no risk.
+        if side == TradeSide.SHORT and not getattr(self.adapter, "supports_short", False):
+            if self.shadow_book is not None:
+                self._mincr("entries_shadowed")
+                await self.shadow_book.on_enter(row)
+            else:
+                self._mincr("entries_short_unsupported")
+                log.warning("SHORT ENTER %s/%s: venue cannot short and no shadow "
+                            "book — skipped", strategy, position_key)
             return
 
         # Gate: kill_switch blocks NEW positions.
@@ -492,10 +637,48 @@ class SignalExecutor:
             log.info("kill_switch engaged — refusing ENTER %s/%s", strategy, position_key)
             return
 
+        async with self._entry_lock:
+            # Gate: open-position cap. Under the entry lock, and the slot is
+            # consumed (trade inserted into _open) before the lock is released.
+            if self._max_open_positions is not None:
+                n_open = sum(1 for t in self._open.values()
+                             if t.state in _NON_TERMINAL_STATES)
+                if n_open >= self._max_open_positions:
+                    self._mincr("entries_skipped_max_open")
+                    log.warning("max open positions (%d) reached — refusing ENTER %s/%s",
+                                self._max_open_positions, strategy, position_key)
+                    return
+            await self._open_position(row, key, side)
+
+    def _enter_is_stale(self, row: dict) -> bool:
+        """True if the ENTER's decided_at is older than enter_max_age_ms. A row
+        without decided_at is not judged stale (logged): refusing on missing
+        data would silently disable entries."""
+        if self._enter_max_age_ms is None:
+            return False
+        decided = row.get("decided_at")
+        if decided is None:
+            log.warning("ENTER %s has no decided_at — age gate not applied",
+                        row.get("signal_id"))
+            return False
+        if isinstance(decided, str):
+            decided = datetime.fromisoformat(decided.replace("Z", "+00:00"))
+        if decided.tzinfo is None:
+            decided = decided.replace(tzinfo=timezone.utc)
+        age_ms = self.hooks.now_ms() - int(decided.timestamp() * 1000)
+        return age_ms > self._enter_max_age_ms
+
+    async def _price_increment(self, symbol: str, asset_class: str) -> Optional[Decimal]:
+        try:
+            return await self.adapter.get_price_increment(symbol, asset_class)
+        except Exception:
+            log.exception("get_price_increment(%s) failed; limit sent unquantized", symbol)
+            return None
+
+    async def _open_position(self, row: dict, key, side: TradeSide) -> None:
+        strategy, position_key = key
         symbol = row["symbol"]
         asset_class = row["asset_class"]
-        side = TradeSide.LONG if row["direction"] == "LONG" else TradeSide.SHORT
-        chain_id = row["chain_id"]
         decision_price = row.get("decision_price")
 
         # Size the position (injected policy).
@@ -522,6 +705,27 @@ class SignalExecutor:
         limit, reference, cap_applied = price_marketable_limit(
             side, OrderIntent.ENTRY, touch.bid, touch.ask, cap,
         )
+        limit = quantize_limit_price(
+            limit, side, OrderIntent.ENTRY, await self._price_increment(symbol, asset_class))
+
+        # Venue minimums: refuse an undersized entry before submitting, rather
+        # than spending a round trip on a certain rejection.
+        try:
+            mins = await self.adapter.get_min_order_size(symbol, asset_class)
+        except Exception:
+            log.exception("get_min_order_size(%s) failed; venue is the backstop", symbol)
+            mins = None
+        if mins is not None:
+            if mins.base is not None and qty < mins.base:
+                self._mincr("entries_skipped_below_min")
+                log.warning("ENTER %s/%s qty %s below venue base minimum %s — no order",
+                            strategy, position_key, qty, mins.base)
+                return
+            if mins.quote is not None and qty * limit < mins.quote:
+                self._mincr("entries_skipped_below_min")
+                log.warning("ENTER %s/%s notional %s below venue quote minimum %s — no order",
+                            strategy, position_key, qty * limit, mins.quote)
+                return
 
         # Create the trade (new uuid) and its deterministic entry order id.
         trade_id = _new_trade_id()
@@ -585,6 +789,11 @@ class SignalExecutor:
         position_key = row["position_key"]
         key = (strategy, position_key)
         trade = self._open.get(key)
+        if trade is None and self.shadow_book is not None and self.shadow_book.holds(*key):
+            # A virtual (shadow) position: close it there. Never touches the venue.
+            self._mincr("exits_shadowed")
+            await self.shadow_book.on_exit(row)
+            return
         if trade is None:
             # EXIT for a position we don't hold. Per migration 004's note, this
             # is a detectable reconciliation gap, not a silent drop.
@@ -806,6 +1015,9 @@ class SignalExecutor:
         limit, reference, cap_applied = price_marketable_limit(
             trade.side, OrderIntent.EXIT, touch.bid, touch.ask, cap,
         )
+        limit = quantize_limit_price(
+            limit, trade.side, OrderIntent.EXIT,
+            await self._price_increment(symbol, asset_class))
 
         # Exit order gets its own deterministic id at THIS (strided) rung, so a
         # re-issue at a higher escalation — or a different tranche block — is a

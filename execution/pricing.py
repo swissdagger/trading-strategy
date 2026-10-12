@@ -8,7 +8,7 @@ float->Decimal boundary is crossed once, at CapConfig construction).
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Optional
 
 from execution.types import OrderIntent, TradeSide
@@ -100,3 +100,21 @@ def price_marketable_limit(
         limit = max(crossed, cap_edge)
     cap_applied = abs(limit - reference)
     return limit, reference, cap_applied
+
+def quantize_limit_price(
+    limit: Decimal,
+    side: TradeSide,
+    intent: OrderIntent,
+    increment: Optional[Decimal],
+) -> Decimal:
+    """Round a marketable limit to the venue's price increment, TOWARD the
+    touch: a BUY limit (at or above the ask) is floored, a SELL limit (at or
+    below the bid) is ceiled. Rounding toward the touch can only make the order
+    less aggressive, so the quantized price never breaches the cap that
+    price_marketable_limit applied. None or a non-positive increment returns the
+    limit unchanged."""
+    if increment is None or increment <= 0:
+        return limit
+    rounding = ROUND_FLOOR if is_buy(side, intent) else ROUND_CEILING
+    steps = (limit / increment).to_integral_value(rounding=rounding)
+    return (steps * increment).quantize(increment)
