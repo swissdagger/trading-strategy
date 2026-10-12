@@ -271,6 +271,24 @@ this passes): every (symbol, timeframe) logs `seeded ... with N bars`, with N
 near 5000 for 1m/3m/5m/15m/1h; a short count means the product's Coinbase
 history is shorter than one window (the rung warms partial and fills live).
 
+## 7b. Coinbase API key and portfolio (ADR-001 Phase 4)
+
+1. In Coinbase, create a **dedicated portfolio** for the bot and move only the
+   trading capital into it. Hold nothing else there.
+2. In the Coinbase Developer Platform, create an API key **on that portfolio**:
+   signature algorithm **ECDSA** (not Ed25519, which this API rejects);
+   permissions **View** and **Trade**; **no Transfer**.
+3. Put the key name, the PEM private key (one line, `\n` escapes) and the
+   portfolio UUID in `.env` (see `.env.example`).
+4. Run `python verify_coinbase_readonly.py`. It connects read-only and prints
+   the key's permissions, equity, balances, each product's tradability and
+   constraints, open orders and recent fills. It makes no writes. It must end
+   with `OK`.
+5. Start the executor in `trade_enabled.mode = 'off'` first: it connects the
+   real adapter read-only and runs the boot reconcile. Any balance outside the
+   traded universe refuses boot (orphan check) unless it is dust or listed in
+   `config.ORPHAN_BALANCE_ALLOWLIST`.
+
 ## 8. Operational concerns
 
 - **Kill switch** (`kill_switch` table): checked before every entry. `halt_new`

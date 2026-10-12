@@ -27,8 +27,14 @@ def test_venue_change_detection():
     assert endpoint_kind_for_mode(TradeMode.OFF) != endpoint_kind_for_mode(TradeMode.LIVE)
 
 
-@pytest.mark.parametrize("mode", list(TradeMode))
-def test_coinbase_builder_refuses_until_phase4(mode):
-    # The executor must refuse to start, not trade through a missing venue.
-    with pytest.raises(NotImplementedError, match="Phase 4"):
+@pytest.mark.parametrize("mode", [TradeMode.OFF, TradeMode.LIVE])
+def test_coinbase_builder_fails_fast_without_credentials(mode):
+    # No key configured: refuse at build time, never connect half-configured.
+    from execution.coinbase_client import CoinbaseAuthError
+    with pytest.raises(CoinbaseAuthError):
         build_coinbase_adapter({}, mode)
+
+
+def test_coinbase_paper_refuses_until_phase5():
+    with pytest.raises(NotImplementedError, match="Phase 5"):
+        build_coinbase_adapter({}, TradeMode.PAPER)

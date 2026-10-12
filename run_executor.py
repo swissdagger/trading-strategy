@@ -18,10 +18,12 @@ DB-backed; they are rewired below to the live adapter.
 Boot ordering (enforced by SignalExecutor.start()):
     connect() -> reconcile() -> diff DB vs venue -> start fill stream -> subscribe
 
-ADR-001 status: the only venue is Coinbase Advanced Trade spot, and its adapter
-lands in Phase 4 (live) / Phase 5 (paper). Until then build_coinbase_adapter
-raises NotImplementedError and this process exits 1 with that message — the
-executor refuses to start rather than trade through a missing venue.
+ADR-001 status: the venue is Coinbase Advanced Trade spot (Phase 4). Mode
+"live" trades through CoinbaseAdapter; mode "off" connects the real adapter
+READ-ONLY (reconcile, balances, fills; no write can reach the venue). Mode
+"paper" needs PaperCoinbaseAdapter (Phase 5) and refuses to start until then.
+connect() refuses a key that is not scoped to the bot portfolio, can transfer
+funds, or (live) cannot trade.
 
 Run it AFTER: migrations applied, the signal side is producing rows, and .env is
 populated.
@@ -48,6 +50,8 @@ from execution.gated_adapter import GatedAdapter
 from execution.trade_enable import TradeEnableState, TradeMode
 from execution.signal_listener import SignalListener
 from execution.signal_executor import OrphanPositionError, SignalExecutor
+from execution.coinbase_adapter import CoinbaseConnectError
+from execution.coinbase_client import CoinbaseAuthError
 from execution.persistence import (
     build_executor_hooks,
     make_load_executor_cursor,
@@ -181,8 +185,8 @@ async def main() -> None:
     # start(); any other boot failure alerts here.
     try:
         await executor.start()
-    except OrphanPositionError:
-        raise
+    except (OrphanPositionError, CoinbaseConnectError):
+        raise   # already explained (and, for orphans, alerted) at the source
     except Exception as e:
         try:
             await hooks.alert("executor_boot_failed", {"error": repr(e)})
@@ -242,6 +246,7 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (NotImplementedError, OrphanPositionError) as e:
+    except (NotImplementedError, OrphanPositionError, CoinbaseConnectError,
+            CoinbaseAuthError) as e:
         log.error("cannot start: %s", e)
         sys.exit(1)

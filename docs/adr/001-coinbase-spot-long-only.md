@@ -173,8 +173,8 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ### Phase 4 — `CoinbaseAdapter`
 
-- [ ] `execution/coinbase_client.py`: ES256 JWT per request (CDP key; `uri` claim) over `httpx.AsyncClient`.
-- [ ] `execution/coinbase_adapter.py` (`venue = "coinbase"`, `supported_classes = {"crypto"}`, `supports_short = False`):
+- [x] `execution/coinbase_client.py`: ES256 JWT per request (CDP key; `uri` claim) over `httpx.AsyncClient`.
+- [x] `execution/coinbase_adapter.py` (`venue = "coinbase"`, `supported_classes = {"crypto"}`, `supports_short = False`):
   - `connect()`: signed `GET /accounts`; refuse if the key sees more than the bot portfolio.
   - Products cache from `GET /products/{id}`: `base_increment`, `quote_increment`, `base_min_size`, `quote_min_size`, `status`.
   - `get_touch`: `GET /best_bid_ask`.
@@ -186,7 +186,7 @@ Each phase is independently mergeable and leaves the system runnable.
   - Fill stream: poll `GET /orders/historical/fills` at ~2 s, cursored; `trade_id` → `venue_exec_id`, commission → `fee`, `client_order_id` for attribution.
   - `reconcile`: positions + `GET /orders/historical/batch?order_status=OPEN` + recent fills.
 - [ ] Account: dedicated Coinbase portfolio for the bot; CDP key created on that portfolio; nothing else held in it.
-- [ ] Read-only verification against the real portfolio with `trade_enabled = off`.
+- [ ] Read-only verification against the real portfolio with `trade_enabled = off`. *(Script ready: `verify_coinbase_readonly.py`; needs the owner's key.)*
 
 ### Phase 5 — `PaperCoinbaseAdapter`
 
@@ -291,3 +291,16 @@ Each phase is independently mergeable and leaves the system runnable.
 - `transport='ws'` fails loudly at startup: there is no Coinbase websocket feed. `streaming_base.py` and `bar_aggregator.py` stay for one.
 - **Duplicate bars reaching Sumtyme — fixed in the chain machine.** `ServiceTwoChainMachine.on_bar` now drops a bar whose timestamp is not newer than the newest buffered bar for its timeframe (repeats logged at DEBUG, out-of-order at WARNING). This covers Kafka at-least-once replay after a signal-process restart as well as any feed/warmup overlap, and stops a replay from re-running the forecast and re-emitting chain events. It is a deliberate divergence from CausaView's copy of the machine (debt D9), requested by the owner.
 - **Rename and spec:** `four_chain` is now `confirmed_15m`; the rules are documented in `docs/strategies/confirmed_15m.md` from the code.
+
+### PR 5 (Phase 4, Coinbase adapter)
+
+- **Built from Coinbase's published OpenAPI spec** for the Advanced Trade REST API and its API-key authentication docs, and tested against a fake brokerage on that spec (it verifies every request's JWT signature and claims, and models order state, queued cancels, client-id idempotency and paginated fills). **Not yet run against the real portfolio:** that needs the owner's key; `verify_coinbase_readonly.py` is the read-only check (no writes).
+- **Key requirements, enforced by `connect()`:** ECDSA signature algorithm (Coinbase rejects Ed25519 keys for this API; the client refuses one with a clear message), bound to `COINBASE_PORTFOLIO_UUID` (`/key_permissions`), View + Trade (Trade only required in live), and **no Transfer permission** (a key that can move funds is refused). Every account the key sees must belong to the bot portfolio.
+- **Modes:** `live` → `CoinbaseAdapter`. `off` → the real adapter wrapped in `ReadOnlyAdapter`: connect, reconcile, balances, touches and fills work; submit/cancel/amend never reach the venue, independently of the mode gate. `paper` refuses to start until Phase 5. (An off→paper switch keeps the read-only adapter, so it can never place a real order.)
+- **Deviations from the plan, from the spec:**
+  - Limit prices round to the product's **`price_increment`** (falling back to `quote_increment`); it is the price tick. The two are equal on all ten traded products today.
+  - **Fills carry no `client_order_id`.** The fill poller looks up each unknown `order_id` once (cached) to recover our id, so fills streamed before the submit acknowledgement are still attributable, and so are fills seen after a restart. This closes most of debt D4's gap.
+  - `venue_exec_id` is the fill's **`entry_id`** (unique per fill entry), falling back to `trade_id`.
+  - A cancel is queued, not instant (`CANCEL_QUEUED`): `cancel_order` waits (up to ~2 s) for a terminal status and reports `filled_size`, so the executor never issues a replacement exit while the old order can still fill.
+  - Resubmitting a `client_order_id` returns the existing order (documented), which is the venue half of the executor's idempotency.
+  - A transport failure or 5xx after retries **raises** from `submit_order` (the order may exist; the executor resolves it at reconcile); a 4xx or `success: false` is a REJECTED result with Coinbase's reason.
