@@ -1,8 +1,10 @@
-# docker-compose.yml — the trading system's signal side.
+# docker-compose.yml — the whole trading system.
 #
-# Three services: Kafka (the message bus), the feed process (bars -> Kafka), and
-# the signal process (Kafka -> chains -> trade_signals). Postgres is NOT here —
-# it's managed Supabase, reached over the network via TRADING_DB_URL in .env.
+# Kafka (the message bus), warmup (one-shot history seed), the feed process
+# (Coinbase candles -> Kafka), the signal process (Kafka -> chains ->
+# trade_signals) and the executor (trade_signals -> paper/live orders).
+# Postgres is NOT here — it's managed Supabase, reached over the network via
+# TRADING_DB_URL in .env.
 #
 # Both Python services use the SAME image (built once) with different commands.
 # restart: unless-stopped so they survive crashes and VM reboots, matching the
@@ -89,6 +91,22 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+  # The executor: trade_signals -> paper (default) or live orders on Coinbase.
+  # Needs only the database and the Coinbase key (.env); not Kafka. Its mode is
+  # the trade_enabled row (migration 023 seeds 'paper' on a fresh DB).
+  # restart: unless-stopped is load-bearing: a paper<->live mode change blocks
+  # all writes and exits 3 so it restarts against the new venue, and a refused
+  # or failed boot waits EXECUTOR_BOOT_RETRY_S (default 300 s) before exiting, so
+  # the restart loop (and its alerts) runs at most every few minutes.
+  executor:
+    build: .
+    image: trading-system:latest
+    restart: unless-stopped
+    command: ["python", "run_executor.py"]
+    env_file: .env
+    depends_on:
+      warmup:
+        condition: service_completed_successfully
 
 volumes:
   kafka_data:

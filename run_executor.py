@@ -18,12 +18,13 @@ DB-backed; they are rewired below to the live adapter.
 Boot ordering (enforced by SignalExecutor.start()):
     connect() -> reconcile() -> diff DB vs venue -> start fill stream -> subscribe
 
-ADR-001 status: the venue is Coinbase Advanced Trade spot (Phase 4). Mode
-"live" trades through CoinbaseAdapter; mode "off" connects the real adapter
-READ-ONLY (reconcile, balances, fills; no write can reach the venue). Mode
-"paper" needs PaperCoinbaseAdapter (Phase 5) and refuses to start until then.
+ADR-001 status: the venue is Coinbase Advanced Trade spot.
+  * "paper" (and "off"): PaperCoinbaseAdapter — real touch, product rules and
+    fee tier from Coinbase through a READ-ONLY real adapter; fills simulated in
+    the paper ledger (migration 022). "off" places nothing at all.
+  * "live": CoinbaseAdapter — real orders.
 connect() refuses a key that is not scoped to the bot portfolio, can transfer
-funds, or (live) cannot trade.
+funds, or (live) cannot trade. All modes need the key (paper reads real data).
 
 Run it AFTER: migrations applied, the signal side is producing rows, and .env is
 populated.
@@ -38,6 +39,7 @@ import logging
 import os
 import signal as _signal
 import sys
+import time
 
 import asyncpg
 
@@ -47,6 +49,7 @@ from execution.adapter_factory import (
     endpoint_kind_for_mode,
 )
 from execution.gated_adapter import GatedAdapter
+from execution.read_only_adapter import ReadOnlyAdapter
 from execution.trade_enable import TradeEnableState, TradeMode
 from execution.signal_listener import SignalListener
 from execution.signal_executor import OrphanPositionError, SignalExecutor
@@ -55,6 +58,7 @@ from execution.coinbase_client import CoinbaseAuthError
 from execution.persistence import (
     build_executor_hooks,
     make_load_executor_cursor,
+    make_paper_ledger_hooks,
     make_save_executor_cursor,
     make_shadow_hooks,
 )
@@ -87,17 +91,49 @@ def _require_env(name: str) -> str:
     return val
 
 
-def build_raw_adapter(mode: TradeMode):
-    """Construct the mode-appropriate venue adapter (paper vs live endpoint)."""
+def build_raw_adapter(mode: TradeMode, pool):
+    """Construct the mode-appropriate venue adapter: the paper adapter (real
+    reads, simulated fills in the paper ledger) for off/paper, the real one for
+    live."""
     builder = _ADAPTER_BUILDERS.get(VENUE)
     if builder is None:
         raise RuntimeError(
             f"unknown EXECUTOR_VENUE={VENUE!r}; expected one of {list(_ADAPTER_BUILDERS)}"
         )
     venue_cfg = config.VENUE_ENDPOINTS[VENUE]
-    adapter, kind = builder(venue_cfg, mode)
+    adapter, kind = builder(
+        venue_cfg, mode,
+        paper_ledger=make_paper_ledger_hooks(pool),
+        paper_starting_cash=config.PAPER_STARTING_CASH,
+        fallback_fee_bps=config.SHADOW_TAKER_FEE_BPS,
+    )
     log.info("built %s adapter for mode=%s (endpoint=%s)", VENUE, mode.value, kind)
     return adapter
+
+
+def make_on_mode_change(current: dict, stop: asyncio.Event, restart_required: dict):
+    """The trade-mode callback. off<->paper: nothing (same paper adapter; the
+    GatedAdapter starts or stops allowing simulated orders). paper<->live: the
+    venue changes, and a hot swap is never safe — the executor's open trades
+    and attribution maps belong to the old venue and must be reconciled
+    against the new one at boot. (The previous swap only rebound
+    current["adapter"], so orders kept flowing to the OLD adapter: live ->
+    paper would have kept placing real orders.) So it blocks every write right
+    now, on both venues, and stops the process; the process manager restarts
+    it and boot reconciles against the new venue."""
+    async def on_mode_change(old: TradeMode, new: TradeMode) -> None:
+        if endpoint_kind_for_mode(old) == endpoint_kind_for_mode(new):
+            log.info("mode %s -> %s: same endpoint, no adapter change", old.value, new.value)
+            return
+        gated = current.get("gated")
+        if gated is not None and not isinstance(gated._inner, ReadOnlyAdapter):
+            gated._inner = ReadOnlyAdapter(gated._inner)
+        restart_required["flag"] = True
+        log.error("mode %s -> %s changes the venue: orders blocked; stopping so the "
+                  "executor restarts and reconciles against the new venue",
+                  old.value, new.value)
+        stop.set()
+    return on_mode_change
 
 
 async def main() -> None:
@@ -109,21 +145,13 @@ async def main() -> None:
     pool = await asyncpg.create_pool(dsn, statement_cache_size=0)
     log.info("db pool up")
 
-    # `current` holds the live raw adapter so the mode-change callback can swap
-    # it under the GatedAdapter without rebuilding the executor.
-    current: dict = {"adapter": None}
+    # `current["adapter"]` is the raw adapter for the startup mode; `gated` the
+    # GatedAdapter the executor uses. Neither is swapped at runtime (see below).
+    current: dict = {"adapter": None, "gated": None}
+    stop = asyncio.Event()
+    restart_required = {"flag": False}
 
-    async def on_mode_change(old: TradeMode, new: TradeMode) -> None:
-        # off<->paper: same (paper) venue, no rebuild. Anything to/from live
-        # changes the endpoint and needs a reconnect.
-        if endpoint_kind_for_mode(old) == endpoint_kind_for_mode(new):
-            log.info("mode %s -> %s: same endpoint, no adapter rebuild", old.value, new.value)
-            return
-        log.warning("mode %s -> %s: rebuilding adapter for new venue", old.value, new.value)
-        new_raw = build_raw_adapter(new)
-        await new_raw.connect()
-        current["adapter"] = new_raw
-        log.info("adapter swapped to %s endpoint", endpoint_kind_for_mode(new))
+    on_mode_change = make_on_mode_change(current, stop, restart_required)
 
     # Mode state: reads the trade_enabled row, LISTENs for changes, fires the
     # reconnect callback. Boots to config default ("off") until the row is read.
@@ -138,15 +166,15 @@ async def main() -> None:
 
     # Initial adapter for the startup mode, wrapped in the gate (off => orders
     # no-op, reads pass through). The executor only ever sees the gated wrapper.
-    current["adapter"] = build_raw_adapter(mode.mode())
+    current["adapter"] = build_raw_adapter(mode.mode(), pool)
     adapter = GatedAdapter(current["adapter"], mode)
+    current["gated"] = adapter
 
     # DB-backed hooks (execution/persistence.py). Two members — get_touch and
     # size_position — are NOT DB-backed by design: the touch is the venue's live
     # book and equity-based sizing reads the venue account. Both are wired to the
-    # adapter here, through a closure that follows the paper<->live adapter swap
-    # (current["adapter"] is rebound by on_mode_change), so a mode change doesn't
-    # leave them pointing at a dead connection.
+    # adapter here. (A venue change restarts the process instead of swapping
+    # adapters, so these always read the venue the executor trades on.)
     hooks = build_executor_hooks(pool)
 
     def _adapter() -> "object":
@@ -167,8 +195,13 @@ async def main() -> None:
 
     # Shadow book: SHORT signals the venue can't take (spot has no short side)
     # get virtual fills at the live touch instead (migration 019).
+    # Fee per virtual leg: the account's live taker fee tier (paper and live
+    # adapters both expose it), falling back to config.SHADOW_TAKER_FEE_BPS.
+    async def _fee_bps():
+        fn = getattr(current["adapter"], "get_taker_fee_bps", None)
+        return await fn() if fn is not None else None
     shadow = ShadowBook(make_shadow_hooks(pool, _get_touch),
-                        taker_fee_bps=config.SHADOW_TAKER_FEE_BPS)
+                        taker_fee_bps=config.SHADOW_TAKER_FEE_BPS, fee_bps_fn=_fee_bps)
     await shadow.start()
 
     executor = SignalExecutor(
@@ -209,8 +242,6 @@ async def main() -> None:
         on_cursor_advance=make_save_executor_cursor(pool),
     )
 
-    stop = asyncio.Event()
-
     def _request_stop(*_):
         log.info("shutdown signal received")
         stop.set()
@@ -240,13 +271,29 @@ async def main() -> None:
             pass
     await mode.stop()
     await pool.close()
+    if restart_required["flag"]:
+        log.warning("executor stopped for a venue change; exiting 3 so it restarts")
+        sys.exit(3)
     log.info("executor stopped cleanly")
+
+
+# A refused or failed boot waits this long before exiting, so a restart loop
+# under docker-compose (restart: unless-stopped) retries — and alerts — at most
+# every few minutes instead of every few seconds.
+BOOT_RETRY_S = float(os.getenv("EXECUTOR_BOOT_RETRY_S", "300"))
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except SystemExit:
+        raise
     except (NotImplementedError, OrphanPositionError, CoinbaseConnectError,
             CoinbaseAuthError) as e:
-        log.error("cannot start: %s", e)
+        log.error("cannot start: %s — retrying in %.0fs", e, BOOT_RETRY_S)
+        time.sleep(BOOT_RETRY_S)
+        sys.exit(1)
+    except Exception:
+        log.exception("executor failed — retrying in %.0fs", BOOT_RETRY_S)
+        time.sleep(BOOT_RETRY_S)
         sys.exit(1)

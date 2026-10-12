@@ -1,326 +1,348 @@
-# Trading System — Assembly & Runbook
+# Trading System — Operator Runbook
 
-> **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
-> The system is being re-architected for Coinbase Advanced Trade spot,
-> long-only, crypto-only. Done: Phases 0–1 (IBKR and Binance execution, the
-> legacy executor and the Polygon feeds deleted; `two_ladder` and
-> `prior_failure_scaleout` disabled), Phase 3 (executor hardening, shadow book
-> for shorts) and the Phase 2 feed switch (bars now come from Coinbase spot
-> candles; symbols are Coinbase product ids such as `BTC-USD`). The executor
-> will not start until the Coinbase adapter lands (Phase 4). Sections below
-> that describe IBKR, Binance or Polygon are out of date until the Phase 6
-> rewrite.
-
-A standalone, headless trading system forked from CausaView. It runs two parallel
-chain "ladders" (Set A / Set B) per symbol, applies a two-ladder entry/exit
-strategy, and **emits trade signals to a database**. A separate team's script
-consumes those signals and manages positions today; this project's **own**
-position manager is built but dark, to be switched on later.
-
-This document is the assembly reference: how the pieces fit, what runs as what
-process, what is wired vs. stubbed, and the exact remaining steps to first live
-signal. It is **not** a description of a finished, running system — see
-§7 (Status) for what is and isn't live-ready.
+How to deploy, run, watch and take live the Coinbase Advanced Trade spot,
+long-only system ([ADR-001](docs/adr/001-coinbase-spot-long-only.md)). The
+architecture, the layers and the `trade_signals` contract are in
+[README.md](README.md); this document is what an operator does.
 
 ---
 
-## 1. Layers
+## 1. Deployment
 
-Three separable layers plus the schema. Separability is the point: the signal
-layers run now; the position manager runs later, in its own process, dark until
-switched on.
+One server runs everything under `docker compose`:
 
-| Layer | Package | Turns… | …into | Status |
-|---|---|---|---|---|
-| Producer | `producer/` | market-data bars | tagged chain events | new layer done; chain machine is a seam (see §7) |
-| Strategy / consumer | `strategy/` | tagged chain events | trade signals (DB rows) | **complete & verified** |
-| Position manager | `execution/` | trade signals / chain events | real venue orders | spine done; adapters + assembly open |
-| Schema | `migrations/` | — | the trading DB | **ready to apply** |
+| Service | Restart | Role |
+|---|---|---|
+| `kafka` | always | single broker; `trading-bars` and `chain-events` topics |
+| `warmup` | once | seeds `warmup_bars` + `feed_cursors`, then exits 0 |
+| `feed` | unless-stopped | Coinbase public candles → `trading-bars` |
+| `signal` | unless-stopped | bars → Sumtyme chains → `confirmed_15m` → `trade_signals` |
+| `executor` | unless-stopped | `trade_signals` → paper or live orders |
+
+`feed`, `signal` and `executor` start only after `warmup` has completed.
+
+**Database.** A dedicated Postgres (Supabase project or plain Postgres), not
+shared with CausaView. Every service connects as a role that bypasses RLS (the
+service role or the owner); the trading tables are deny-all with no policies and
+there is no browser client.
+
+**Network.** Outbound HTTPS to `api.coinbase.com` (feed, warmup, executor) and to
+the Sumtyme API (signal). Nothing else.
+
+**First deployment, on a fresh database:**
+
+```bash
+for f in migrations/0*.sql; do psql "$TRADING_DB_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+cp .env.example .env              # fill in: DB URL, Sumtyme key, Coinbase key (§3)
+python verify_coinbase_readonly.py    # must end with OK; places nothing
+docker compose up -d --build
+```
+
+Migration 023 puts a fresh database in **paper** mode, so the first start
+trades the simulated account only. It never overrides a mode an operator has set.
+
+**Upgrades:** apply any new migration first, then `docker compose up -d --build`.
+The executor reconciles at every boot, so a restart is always safe.
 
 ---
 
-## 2. Project structure
+## 2. Signal series provenance
 
-```
-trading/
-├── migrations/                     # apply in order to a NEW Supabase project
-│   ├── 001_trade_lifecycle.sql     # trades, orders, fills, exit_state, caps, kill_switch
-│   ├── 002_signals_and_chains.sql  # signals + chains (research/audit) + FK from trades
-│   ├── 003_lockdown_rls.sql        # RLS deny-all for the public API (service_role bypasses)
-│   └── 004_trade_signals.sql       # the trade_signals cross-team contract table
-│
-├── producer/                       # bars -> tagged chain events  (the CausaView fork)
-│   ├── ladders.py                  # Set A / Set B as data; timeframe -> which set(s)
-│   ├── chain_machine.py            # ChainMachine INTERFACE (extraction seam for service_2)
-│   └── fanout_router.py            # routes each bar to every ladder containing its tf; tags events
-│
-├── strategy/                       # tagged chain events -> trade signals  (the deliverable)
-│   ├── chain_view.py               # TaggedChainEvent contract + per-set chain-state view
-│   ├── two_ladder_strategy.py      # four-step entry + OR-exit logic
-│   └── runtime.py                  # event ingress; ordering + per-symbol lock + open-position tracking
-│
-└── execution/                      # trade signals -> orders  (position manager; dark until switched on)
-    ├── types.py                    # OrderRequest/Result, Fill, VenuePosition, enums
-    ├── adapter.py                  # ExecutionAdapter ABC (one per venue)
-    ├── client_order_id.py          # deterministic client-order-id keystone
-    ├── boot.py                     # connect -> reconcile -> diff -> (proceed | HALT)
-    ├── executor.py                 # live entry path; per-symbol lock; marketable-limit pricing
-    ├── exit_manager.py             # OPEN->CLOSING->CLOSED; escalation ladder
-    └── signal_writer.py            # decisions -> trade_signals rows (used by BOTH signal + PM sides)
-```
+The bars every chain is computed from are **Coinbase spot candles** (public
+endpoint `/api/v3/brokerage/market/products/{product_id}/candles`). What an
+operator needs to know:
 
-Dependencies point downward only: `producer` and `strategy` both import the
-shared event contract from `strategy/chain_view.py`; `strategy/signal_writer`
-lives under `execution/` because both the signal process and the position manager
-emit/consume signals. There are no upward imports (the executor never imports the
-strategy).
+- **Not comparable with the old Binance series.** Sumtyme is deterministic on the
+  exact series it is given, and spot candles differ from perp klines bar by bar.
+  Chain ids, levels and timings differ, so the research population has to be
+  rebuilt on this series (ADR-001 debt D5).
+- **Symbols are Coinbase product ids** (`BTC-USD`) = `config.CRYPTO_BASES` ×
+  `config.QUOTE_CURRENCY`. Changing the quote currency changes every symbol and
+  needs a fresh database.
+- **Derived rungs.** 3m (and 4h/12h for the disabled PF ladder) are aggregated
+  from 1m (1h/6h). They are not Coinbase granularities.
+- **Gaps.** Coinbase returns no candle for an interval with no trades. The feed
+  passes the gaps through and never fabricates flat bars. Thin books gap a lot
+  at 1m (AAVE-USD: ~17% of minutes, mostly 21:00–01:00 UTC). Sumtyme runs in step
+  mode, so a gap is one step, not a run of missing bars.
+- **Latency.** Coinbase revises a closed candle for up to ~36 s (measured), so the
+  feed emits each bar 60 s after its window closes (`SETTLE_MS`). A bar reaches
+  the signal process ~60–90 s after its window ends. That is why
+  `ENTER_MAX_AGE_SECONDS` is 2 minutes.
+- **Outages.** On restart the feed catches up from its cursor, up to 100 h of 1m
+  bars. **After a longer outage, re-run warmup** (`docker compose run --rm warmup`)
+  before starting feed and signal.
+- **Warmup check.** Every (symbol, timeframe) logs `seeded ... with N bars`, with
+  N near 5000. A short count means the product's history is shorter than one
+  Sumtyme window: that rung warms partially and fills from live bars.
 
 ---
 
-## 3. Process topology — two now, three later
-
-**Do not assemble this as one process.** The layers have different lifecycles and
-(today) different deployment states. One process would chain the dark
-position-manager to the live signal path and break the "someone else executes for
-now" arrangement.
-
-### Today — two processes
-
-```
-┌─────────────────────────── SIGNAL PROCESS ───────────────────────────┐
-│  feeds (Polygon/Binance)                                             │
-│      │ closed bars                                                   │
-│      ▼                                                               │
-│  FanoutRouter ──tagged events──► (Kafka: chain-events)              │
-│      │ (also, in-process)                                            │
-│      ▼                                                               │
-│  StrategyRuntime ── ENTER/EXIT ──► trade_signals table              │
-│   (ChainView + two-ladder strategy + SignalWriter)                  │
-│                                                                      │
-│  Producer and strategy share ONE process: they're coupled by the    │
-│  per-symbol lock and the in-memory ChainView. Splitting them would  │
-│  mean serializing the view over a wire for no benefit.              │
-└──────────────────────────────────────────────────────────────────────┘
-                                   │ trade_signals (DB)
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │  OTHER TEAM'S SCRIPT          │
-                    │  (sizing + position mgmt)     │
-                    └──────────────────────────────┘
-```
-
-### Later — switch on the third process
-
-```
-┌──────────── POSITION-MANAGER PROCESS (dark today) ────────────┐
-│  boot.run_boot_reconcile()  → connect, reconcile, diff, HALT? │
-│      │ (only if safe_to_proceed)                              │
-│      ▼                                                         │
-│  Executor (entries) + ExitManager (exits + escalation ladder) │
-│      │                                                         │
-│      ▼  ExecutionAdapter → IB Gateway / Binance               │
-│  consumes: trade_signals table OR chain-events (see §5)       │
-│  separate process so its real-money blast radius is isolated  │
-│  — a crash here never touches signal production, and vice     │
-│  versa.                                                        │
-└───────────────────────────────────────────────────────────────┘
-```
-
-The **per-symbol lock map** matters only *within* a process. Across processes the
-coordination is the **database** (signal process writes `trade_signals`; position
-manager reads) and **Kafka** (both may consume chain-events). If the position
-manager ever runs in the SAME process as the signal side (not recommended), pass
-the same lock map into `FanoutRouter`, `StrategyRuntime`, `Executor`, and
-`ExitManager` so producer/consumer/execution work for one symbol can't interleave.
-
----
-
-## 4. Data flow & the stores
-
-```
-bars ─► FanoutRouter ─► tagged chain events ─► Kafka(chain-events)
-                                              └► StrategyRuntime (in-proc)
-                                                     │
-                       chains / signals (audit) ◄────┤ (producer persists)
-                                                     ▼
-                                              trade_signals  ◄── the contract
-                                                     │
-                            ┌────────────────────────┴───────────┐
-                            ▼                                     ▼
-                     other team's script              position-manager process
-                                                       (trades/orders/fills/exit_state)
-```
-
-- **`signals` / `chains`** (002): research + audit, written by the producer's
-  chain machines. `chains.chain_id` is the FK target for `trades`.
-- **`trade_signals`** (004): the cross-team product. Append-only ENTER/EXIT rows,
-  keyed by `position_key = (chain_id, side)`. Deterministic `signal_id` → replays
-  dedupe on both sides.
-- **`trades/orders/fills/exit_state/execution_caps/kill_switch`** (001): the
-  position manager's state. Untouched by the signal process.
-
----
-
-## 5. The one open coupling decision
-
-**When switched on, does the position manager consume `trade_signals` (DB) or
-chain-events (Kafka)?**
-
-- **trade_signals (recommended v1):** acts on the SAME distilled signals the other
-  team gets — one strategy, two executors, perfectly consistent. Inherits
-  DB-poll latency, which is fine while you're not latency-bound.
-- **chain-events (Kafka):** lower latency, but re-derives entry/exit decisions in
-  a SECOND place → the strategy logic now lives in two processes and can drift.
-
-Decide before building the position-manager assembly. The rest of the PM spine is
-agnostic to this choice; only its input adapter changes.
-
----
-
-## 6. Deployment
-
-- **New, separate Supabase project** (not a new schema in CausaView's project).
-  Isolation of blast radius, billing, credentials. Apply `001→002→003→004` in the
-  SQL editor as `service_role`. Services connect as `service_role` (or a direct
-  Postgres connection string) — never the anon key; there is no browser client.
-- **Separate server** from CausaView (already decided). The position-manager
-  process additionally needs **IB Gateway + IBC** (a JRE keepalive) co-located —
-  size the box for it; keep it off CausaView's 2-vCPU VM.
-- **Kafka** on the trading box (kept for the replayable audit log + multi-consumer
-  extensibility). Single broker; consumer groups per consumer.
-- Env: Polygon/Binance keys, Supabase service-role key + DB URL, Kafka bootstrap,
-  (later) IBKR credentials for the dedicated bot username.
-
----
-
-## 7. Status — what's wired vs. open  (READ BEFORE RUNNING)
-
-**Verified & complete**
-- Schema (all four migrations parse; apply in order).
-- Strategy/consumer path end-to-end: tagged event → view → four-step entry +
-  OR-exit → `trade_signals`. Integration-tested across all branches.
-- Producer fan-out + tagging: overlap bars fan to both ladders with correct
-  per-set levels; output matches the consumer contract.
-- Deterministic id keystones (client_order_id, signal_id) proven.
-- Position-manager spine: boot/reconcile diff matrix, executor entry path +
-  marketable-limit pricing, exit manager + escalation ladder.
-
-**Open — required for first LIVE signal**
-1. **Extract `service_2` chain machine behind `producer/chain_machine.ChainMachine`.**
-   The seam is built and tested with a fake. Drop the real INIT/PROPAGATE/TERMINATE
-   logic in via a `MachineFactory`; no router change needed. Preserve service_2's
-   invariants (per-symbol lock, `>=` buffer check, `asyncio.to_thread` Sumtyme
-   call, hydrate-on-restart).
-2. **Bar granularity / entitlement.** Feeds must produce the seven timeframes
-   `5s,10s,30s,1m,2m,5m,10m` (`producer.ladders.all_timeframes()`). Confirm the
-   Polygon plan exposes clean 5s/10s aggregates; decide the Binance-side source
-   for sub-minute crypto (klines bottom out at 1m). This is an operational/data
-   decision, not code.
-3. **`config.py::ASSET_CONFIGS`** must carry both ladders' timeframes per symbol
-   (and `TIMEFRAMES_BY_CLASS` equivalents) so the feeds actually fetch them.
-4. **Wire the signal process `main`:** feeds → FanoutRouter → StrategyRuntime,
-   with the real `MachineFactory`, the `SignalWriter` insert hook (idempotent
-   `ON CONFLICT (signal_id) DO NOTHING`), and the `RuntimeHooks` persistence.
-5. **Agree the `trade_signals` shape with the consuming team.** It's yours to
-   define but it's their read contract — hand it over, don't assume.
-
-**Open — required to SWITCH ON the position manager (later)**
-6. Concrete `BinanceAdapter` + `IBKRAdapter` behind `ExecutionAdapter`
-   (fill-attribution: attach `client_order_id` to `Fill` where the venue gives it).
-7. Position-manager `main`: boot → (if safe) executor + exit-manager tick loop +
-   fill stream, consuming per §5.
-8. Seed `execution_caps` (per asset_class, per intent) with cross/cap spread
-   multiples + escalation ladders. Hot-reloadable; tune in early live trading.
-
----
-
-## 7a. Signal series provenance (ADR-001 Phase 2)
-
-From Phase 2 the bars every chain is computed from are **Coinbase Advanced
-Trade spot candles** (public endpoint
-`/api/v3/brokerage/market/products/{product_id}/candles`), not Binance USDⓈ-M
-perpetual klines. Consequences an operator must know:
-
-- **Chains are not comparable across the switch.** Sumtyme is deterministic on
-  the exact series; spot candles differ from perp klines bar by bar (venue,
-  instrument, basis, and Coinbase omitting no-trade intervals), so chain ids,
-  levels and timings differ. The research population was built on the Binance
-  series and is to be redone on this one (ADR-001 debt D5).
-- **Fresh DB.** Canonical symbols changed (`BTCUSDT` → `BTC-USD`). Start from
-  an empty database: apply every migration, then run warmup. Nothing migrates
-  history across the switch; mixing old and new rows under different symbol
-  names would split every per-symbol view.
-- **Derived rungs.** 3m (and 4h/12h for the PF ladder) are not Coinbase
-  granularities; they are aggregated from 1m (1h/6h) with the shared
-  resampling rule.
-- **Gaps.** Coinbase returns no candle for an interval with no trades. The
-  feed passes such gaps through rather than fabricating flat bars. Thin books
-  gap a lot at 1m (AAVE-USD: ~17% of minutes, mostly 21:00–01:00 UTC).
-- **Latency.** Coinbase keeps revising a closed candle for up to ~36 s
-  (measured), so the feed waits 60 s after a window ends before emitting it
-  (`SETTLE_MS`). A 1m bar reaches the signal process ~60–90 s after its window
-  closes; a 15m bar likewise. A feed restart catches up from its cursor (up to
-  100 h of 1m); a longer outage needs a re-warmup.
-- **Quote currency** is `config.QUOTE_CURRENCY` (`USD`). It must match an order
-  book the account can trade; changing it changes every symbol (fresh DB again).
-- **Network:** the feed and warmup need outbound HTTPS to `api.coinbase.com`.
-  Binance (`fapi.binance.com`) is no longer contacted.
-
-**Verify after the first warmup** (the Binance feed files are deleted only after
-this passes): every (symbol, timeframe) logs `seeded ... with N bars`, with N
-near 5000 for 1m/3m/5m/15m/1h; a short count means the product's Coinbase
-history is shorter than one window (the rung warms partial and fills live).
-
-## 7b. Coinbase API key and portfolio (ADR-001 Phase 4)
+## 3. Coinbase key and portfolio
 
 1. In Coinbase, create a **dedicated portfolio** for the bot and move only the
    trading capital into it. Hold nothing else there.
 2. In the Coinbase Developer Platform, create an API key **on that portfolio**:
-   signature algorithm **ECDSA** (not Ed25519, which this API rejects);
-   permissions **View** and **Trade**; **no Transfer**.
-3. Put the key name, the PEM private key (one line, `\n` escapes) and the
-   portfolio UUID in `.env` (see `.env.example`).
-4. Run `python verify_coinbase_readonly.py`. It connects read-only and prints
-   the key's permissions, equity, balances, each product's tradability and
-   constraints, open orders and recent fills. It makes no writes. It must end
-   with `OK`.
-5. Start the executor in `trade_enabled.mode = 'off'` first: it connects the
-   real adapter read-only and runs the boot reconcile. Any balance outside the
-   traded universe refuses boot (orphan check) unless it is dust or listed in
-   `config.ORPHAN_BALANCE_ALLOWLIST`.
+   - signature algorithm **ECDSA** (this API rejects Ed25519);
+   - permissions **View** and **Trade**;
+   - **no Transfer**.
+3. Put the key name, the PEM private key (one line, with `\n` escapes) and the
+   portfolio UUID in `.env`.
+4. Run `python verify_coinbase_readonly.py`. It prints:
+   - the key's permissions and the fee tier;
+   - equity and balances;
+   - each product's tradability and limits;
+   - open orders and recent fills.
 
-## 8. Operational concerns
+   It makes no writes. It must end with `OK`.
 
-- **Kill switch** (`kill_switch` table): checked before every entry. `halt_new`
-  (default) stops opening, lets open positions run their exit rules; `flatten`
-  stops opening AND closes everything. A DB row — trip it faster than a redeploy.
-- **Boot reconcile** (PM process): connect → reconcile → diff DB vs venue.
-  Un-explained discrepancies → `HALTED` + alert; orphan positions → manual
-  (default) and refuse to start trading. Never auto-resolve what it can't explain.
-- **Escalation ladder** (exits): a capped protective exit that doesn't fill within
-  its window widens the cap rung by rung; the top rung **HALTs + alerts** rather
-  than market-ing out at an unbounded price. Loud-not-silent strand.
-- **Exit-references-a-position gap** (cross-team): an EXIT names a `position_key`
-  the consumer should have open. If their view disagrees, the row carries enough
-  to DETECT and log it — but how they HANDLE it is a coordination agreement, not
-  something the table fixes.
-- **Idempotency everywhere:** `signal_id` (signals), `client_order_id` (orders),
-  `venue_exec_id` (fills), `(chain_id, side)` unique (trades). Replays and
-  restarts dedupe at the DB, not just in memory.
-- **State-machine sync obligation:** the chain machine is copied from CausaView,
-  not shared as a library. Changes must be applied in both places — leave the
-  breadcrumb comment at both copies.
+`connect()` checks the same things at every executor boot. It refuses a key that:
+- is not bound to the configured portfolio;
+- can transfer funds;
+- cannot trade (live mode only).
+
+Paper mode needs the key too, because it reads the real touch, product rules and
+fee tier.
 
 ---
 
-## 9. First-signal checklist (condensed)
+## 4. Trade modes
 
-1. Create new Supabase project; apply `001→002→003→004` as `service_role`.
-2. Confirm 5s/10s bar availability; set `ASSET_CONFIGS` for both ladders.
-3. Extract `service_2` behind `ChainMachine`; provide a `MachineFactory`.
-4. Wire the signal-process `main` (feeds → router → runtime → signal writer).
-5. Agree `trade_signals` shape with the consuming team.
-6. Run the signal process; watch `trade_signals` populate; watch `chains`/`signals`
-   for audit. Position manager stays dark.
+`trade_enabled.mode` is the single switch. The executor LISTENs on it.
+
+| Mode | Adapter | Orders |
+|---|---|---|
+| `off` | paper | none; signals are consumed and ENTERs refused at the gate |
+| `paper` | `PaperCoinbaseAdapter` | simulated against the real book, in the paper ledger (`paper_*` tables) |
+| `live` | `CoinbaseAdapter` | **real** |
+
+```sql
+UPDATE trade_enabled SET mode = 'paper', reason = 'operator: <why>';
 ```
+
+- **off ↔ paper** takes effect immediately and keeps the same adapter.
+- **paper ↔ live** changes the venue, which is never hot-swapped. On the
+  notification the executor:
+  1. blocks every write on the old adapter;
+  2. stops;
+  3. exits with code **3**.
+
+  Compose restarts it, and boot reconciles against the new venue. The last log
+  line before the restart is `executor stopped for a venue change`.
+
+**The trade tables are shared by paper and live.** `trades`, `orders` and `fills`
+carry no mode column. Two consequences:
+
+- Drain paper positions before going live (§8 step 6). Otherwise boot finds DB
+  trades with no matching Coinbase balance and HALTs them.
+- Filter reviews by time: note the go-live timestamp.
+
+**Paper fill model** (pessimistic, deliberately):
+- A limit that crosses the touch fills **in full at its limit price**, not at the
+  touch.
+- A non-crossing limit rests and is re-checked against the touch on every poll.
+- The fee is the account's **real taker tier** (`/transaction_summary`), refreshed
+  every 6 h.
+- No queue position, no partial fills, no market impact.
+
+Paper results are therefore an upper bound on slippage cost, but say nothing
+about fill rates in thin books. Judge those only from small live trades.
+
+---
+
+## 5. Monitoring
+
+### Stage gates
+
+Each table fills from the one before it. The first empty one is where the
+pipeline stalls.
+
 ```
+warmup_bars → feed_cursors (advancing) → signals → chains → trade_signals
+    → trades / orders / fills (+ paper_fills in paper) and shadow_trades (shorts)
+```
+
+```sql
+SELECT symbol, timeframe, to_timestamp(cursor_ms / 1000) FROM feed_cursors ORDER BY 1, 2;
+SELECT max(timestamp) FROM signals;                       -- a few minutes old at most
+SELECT action, count(*), max(created_at) FROM trade_signals GROUP BY 1;
+SELECT state, count(*) FROM trades GROUP BY 1;
+```
+
+### Logs worth alerting on
+
+| Process | Line | Meaning |
+|---|---|---|
+| signal | `PROCESSING LAG` | bars are older than `LAG_WARN_S`: Sumtyme capacity is short of demand (§7) |
+| signal | `forecast TIMEOUT` | a bar was skipped. A burst means Sumtyme is down, degraded or over-subscribed |
+| executor | `stale ENTER ... skipped` | a replayed or late ENTER was older than `ENTER_MAX_AGE_SECONDS` |
+| executor | `persist_fill: ... no matching order` (ERROR) | a fill for a known trade could not be attributed. Investigate before the next boot |
+| executor | `cannot start` / `retrying in` | boot refused (§6.3) |
+
+### `executor_alerts`
+
+Every HALT and refused or failed boot inserts a row (`trade_halted`,
+`boot_refused`, `executor_boot_failed`) and fires `pg_notify('executor_alert')`.
+**Nothing in this repo delivers them to a human yet.** Delivery needs a notifier
+that LISTENs on `executor_alert`, sends the email (or page), and sets
+`delivered_at`. Until that exists, poll:
+
+```sql
+SELECT alert_id, kind, symbol, trade_id, detail, created_at
+  FROM executor_alerts WHERE delivered_at IS NULL ORDER BY created_at;
+```
+
+---
+
+## 6. Incidents
+
+### 6.1 Stop trading now
+
+```sql
+UPDATE kill_switch SET engaged = true, mode = 'halt_new',
+       reason = '<why>', engaged_by = '<you>', engaged_at = now();
+```
+
+- New ENTERs are blocked. The row is read on every order, with no cache.
+- Open positions keep their normal exits.
+- `flatten` is **not implemented** and behaves as `halt_new`. To flatten, close
+  the positions by hand in Coinbase (then see 6.2), or set `mode = 'off'`, which
+  stops all orders, exits included.
+
+Release it with `engaged = false`.
+
+### 6.2 A HALTED trade
+
+A HALTED trade is one the executor refuses to act on. Triggers:
+- boot reconcile found a DB/venue mismatch for the symbol;
+- an exit climbed the escalation ladder to the top without filling.
+
+The reason is in `trades.halt_reason` and in the alert's `detail`.
+
+1. Compare the DB with Coinbase:
+   ```sql
+   SELECT * FROM trades WHERE state = 'HALTED';
+   ```
+   against the portfolio balance and the open orders.
+2. Bring the venue to the state you want. Cancel stray orders; sell or keep the
+   position by hand.
+3. Make the DB match: set the trade `CLOSED` with the realized figures, or back
+   to `OPEN` if the position is real and should be managed. Clear `halt_reason`
+   in the same statement (a CHECK ties it to `HALTED`).
+4. Restart the executor so boot reconciles again:
+   `docker compose restart executor`.
+
+Never edit the DB to "un-HALT" without first checking the venue.
+
+### 6.3 Boot refused or crash-looping
+
+On a refused or failed boot, the executor logs the reason, waits
+`EXECUTOR_BOOT_RETRY_S` (default 300 s) and exits 1. Compose retries, so a broken
+boot alerts at most every few minutes. Common causes:
+
+- **Orphan balance.** The portfolio holds a non-dust asset outside the traded
+  universe with no DB trade explaining it. Sell or move it, or add the currency to
+  `config.ORPHAN_BALANCE_ALLOWLIST` if it is meant to sit there.
+- **Key check failed.** Wrong portfolio, Transfer permission, Ed25519 key, or
+  (live) no Trade permission. Fix the key and re-run
+  `verify_coinbase_readonly.py`.
+- **DB unreachable or migrations missing.** Apply the migrations.
+
+### 6.4 Reset the paper account
+
+Only in `off` or `paper`, with no open paper trades (drain as in §8 step 6, or
+accept that boot will HALT them):
+
+```sql
+TRUNCATE paper_fills, paper_orders, paper_balances;
+```
+
+The next executor start re-seeds `config.PAPER_STARTING_CASH`.
+
+### 6.5 Long outage
+
+| Outage | Action |
+|---|---|
+| executor, any length | restart. Missed EXITs replay from the persisted cursor; stale ENTERs are skipped |
+| feed, up to 100 h | restart. The feed catches up from `feed_cursors` |
+| feed, over 100 h | stop feed + signal, `docker compose run --rm warmup`, start them again |
+
+---
+
+## 7. Capacity
+
+Sumtyme `forecast_path` takes seconds per call, and it is the bottleneck.
+
+- **Throughput** ≈ `FORECAST_CONCURRENCY ÷ latency`.
+- **Demand** = `symbols × forecasting rungs × bars per second`. The 1m rung
+  dominates.
+
+If demand exceeds throughput, per-symbol queues fill and one oversubscribed
+symbol delays every other symbol's signals. Sustained `PROCESSING LAG` means
+cutting symbols or rungs (ADR-001 debt D12). Raising concurrency past what the
+API can serve only adds timeouts.
+
+---
+
+## 8. Paper review and the go-live gate
+
+`docs/paper_review.sql` holds the review queries:
+- realized P&L and fee drag per symbol;
+- fill price vs. touch (slippage in bps);
+- alerts and HALTs;
+- shadow-book results for shorts;
+- the paper account.
+
+```bash
+psql "$TRADING_DB_URL" -f docs/paper_review.sql
+```
+
+Go live only when every step passes, in order:
+
+1. **Green suite.** `pytest` passes, including the Postgres integration tests
+   (`QISS_TEST_DSN` set).
+2. **Read-only verify.** `verify_coinbase_readonly.py` ends `OK` against the
+   production key and portfolio.
+3. **Paper for N weeks** (agree N up front; at least two). The pipeline has run
+   continuously, with no unexplained gaps in `feed_cursors` and no sustained lag.
+4. **Review** the paper period:
+   - **Fee drag.** Net P&L after the real taker tier. A strategy that only wins
+     before fees does not go live.
+   - **Fill vs. touch.** Entry and exit slippage is within the caps in
+     `execution_caps`.
+   - **Reconcile.** Every alert in the period is explained, and there are no
+     `no matching order` fill errors.
+   - **Shadow book.** Read as context only: it is the short side the account
+     cannot trade.
+5. **Pre-flight.**
+   - Fund the bot portfolio with the intended capital only.
+   - Set `CRYPTO_BASES` to **one** symbol.
+   - Confirm that 5% of available balance exceeds the product's minimum order
+     size.
+6. **Drain paper.** Engage the kill switch (`halt_new`) and wait until
+   `SELECT count(*) FROM trades WHERE state NOT IN ('CLOSED','REJECTED')` is 0.
+   Note the timestamp.
+7. **Switch.** `UPDATE trade_enabled SET mode = 'live', reason = 'go-live'`,
+   watch the executor restart (exit 3) and reconcile cleanly, then release the
+   kill switch.
+8. **Watch the first live round trip end to end**: order → fill → `fills` row →
+   exit → CLOSED. Compare the realized fill with the paper model.
+9. **Widen** one symbol at a time, re-reviewing fee drag and fills after each.
+
+Going back to paper is the same switch in reverse: drain, set `mode = 'paper'`,
+and expect a restart.
+
+---
+
+## 9. Invariants worth knowing
+
+- **Idempotency** is enforced at the database, not only in memory: `signal_id`,
+  `client_order_id` (deterministic `cv1`, and Coinbase returns the existing order
+  for a repeated id), `venue_exec_id`, and a unique `(chain_id, side)` on trades.
+  Replays and restarts dedupe.
+- **Boot order:** connect → reconcile → diff → fill stream → subscribe. The
+  executor never takes a signal before it knows what it holds.
+- **Escalation:** an exit that does not fill widens its cap rung by rung. The top
+  rung HALTs and alerts rather than selling at an unbounded price.
+- **The chain machine is copied from CausaView**, not shared. It differs by the
+  monotonic bar guard; apply any change in both places.

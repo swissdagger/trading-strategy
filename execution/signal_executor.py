@@ -488,7 +488,8 @@ class SignalExecutor:
             if trade_id is None:
                 self._mincr("reconcile_fills_unattributable")
                 continue
-            await self.hooks.persist_fill(_fill_row(f, trade_id=trade_id))
+            cid, _ = self._resolve_fill(f)
+            await self.hooks.persist_fill(_fill_row(f, trade_id=trade_id, client_order_id=cid))
 
         # Venue balances with no corresponding DB trade. Checked LAST so the fill
         # sweep above still records what it can before a refused boot.
@@ -774,7 +775,7 @@ class SignalExecutor:
             return
         # Any synchronous fills advance the trade; async fills follow via stream.
         for f in result.fills:
-            await self._record_fill(trade, f)
+            await self._record_fill(trade, f, result.client_order_id)
         # State: OPEN if any fill, else SUBMITTED (working at venue).
         if trade.filled_qty > 0:
             trade.state = "OPEN"
@@ -950,7 +951,7 @@ class SignalExecutor:
         self._learn_venue_order_id(result)
         await self.hooks.advance_order_fill(cid, result.filled_qty, result.status.value)
         for f in result.fills:
-            await self._record_fill(trade, f)
+            await self._record_fill(trade, f, cid)
 
     async def _issue_exit(self, trade: OpenTrade, key, rung: int) -> None:
         """Price + submit an exit for the trade's REMAINING quantity at escalation
@@ -1067,7 +1068,7 @@ class SignalExecutor:
         # attribution: the fills in an OrderResult belong to the order we just
         # submitted, whose trade we know). _record_fill advances exit_filled_qty.
         for f in result.fills:
-            await self._record_fill(trade, f)
+            await self._record_fill(trade, f, result.client_order_id)
         await self._after_exit_fills(trade, key)
 
     async def _after_exit_fills(self, trade: OpenTrade, key) -> None:
@@ -1323,7 +1324,8 @@ class SignalExecutor:
             # finalized/popped). Persist against the real trade_id so a straggler
             # fill is still recorded for honest P&L; venue_exec_id dedupe protects
             # totals against re-delivery. Nothing to advance in memory.
-            await self.hooks.persist_fill(_fill_row(fill, trade_id=trade_id))
+            await self.hooks.persist_fill(_fill_row(fill, trade_id=trade_id,
+                                                    client_order_id=cid))
             self._mincr("fills_late_finalized")
             log.info("async fill %s on non-live trade %s — persisted",
                      fill.venue_exec_id, trade_id)
@@ -1332,7 +1334,7 @@ class SignalExecutor:
         # Attribute under the symbol lock so a stream fill can't interleave with
         # signal/escalation handling for the same symbol.
         async with self._lock(trade.symbol):
-            await self._record_fill(trade, fill)
+            await self._record_fill(trade, fill, cid)
             await self._maybe_complete_after_async_fill(trade, key)
 
     async def _maybe_complete_after_async_fill(self, trade: OpenTrade, key) -> None:
@@ -1347,7 +1349,8 @@ class SignalExecutor:
         if trade.state == "CLOSING":
             await self._after_exit_fills(trade, key)
 
-    async def _record_fill(self, trade: OpenTrade, fill: Fill) -> None:
+    async def _record_fill(self, trade: OpenTrade, fill: Fill,
+                           client_order_id: Optional[str] = None) -> None:
         """Record a synchronously-known fill against a specific trade and advance
         the right counter. Dedupes on venue_exec_id. ENTRY fills grow the held
         position (filled_qty); EXIT fills grow exit_filled_qty (how much of the
@@ -1362,7 +1365,8 @@ class SignalExecutor:
         state + entry/exit filled qty, so this is a targeted write despite reusing
         the full-row helper. Persist is gated by the dedup below, so a re-delivered
         fill neither double-counts nor rewrites."""
-        newly = await self.hooks.persist_fill(_fill_row(fill, trade_id=trade.trade_id))
+        newly = await self.hooks.persist_fill(
+            _fill_row(fill, trade_id=trade.trade_id, client_order_id=client_order_id))
         if not newly:
             self._mincr("fills_duplicate")
             return
@@ -1409,10 +1413,15 @@ def _order_row(order: OrderRequest, status: OrderStatus) -> dict:
     }
 
 
-def _fill_row(fill: Fill, trade_id: Optional[str]) -> dict:
+def _fill_row(fill: Fill, trade_id: Optional[str],
+              client_order_id: Optional[str] = None) -> dict:
+    """The fills row. client_order_id is how persistence finds the parent
+    order (orders.client_order_id is always written at submit; the venue's
+    order id is not known then), so every caller that knows it passes it."""
     return {
         "venue_exec_id": fill.venue_exec_id,
         "trade_id": trade_id,
+        "client_order_id": client_order_id or fill.client_order_id,
         "venue_order_id": fill.venue_order_id,
         "qty": fill.qty,
         "price": fill.price,

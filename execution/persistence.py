@@ -194,32 +194,49 @@ def make_persist_fill(pool: asyncpg.Pool):
     relies on this bool to avoid double-counting into filled_qty.
 
     The fill row must resolve to a real order_id and trade_id (both NOT NULL FKs
-    on `fills`). The executor passes trade_id explicitly; order_id is looked up
-    from venue_order_id (the fill carries the venue's order id, not our client
-    id). A fill whose order we cannot map (venue_order_id unknown) cannot satisfy
-    the FK — we skip it and return False, logging for the watchdog, rather than
-    raising and stalling the fill stream. reconcile's best-effort persist_fill
-    (trade_id=None) path hits this same skip.
+    on `fills`). The parent order is found by client_order_id — written on the
+    orders row at submit, and carried on every fill row the executor builds —
+    falling back to venue_order_id. (Looking up by venue_order_id alone, as
+    before, never matched: nothing wrote orders.venue_order_id, so EVERY fill was
+    skipped and reported as a duplicate, and the executor never advanced a
+    trade's filled quantity.) The venue's order id is recorded on the order row
+    the first time a fill reveals it.
+
+    A fill that cannot be mapped cannot satisfy the FK: we skip it and return
+    False. For a fill of a known trade that is a real fault (logged ERROR); for
+    the reconcile sweep's foreign fills it is expected.
 
     filled_at_ms (epoch ms) maps to the timestamptz filled_at via to_timestamp.
     """
     async def persist_fill(row: dict) -> bool:
+        cid = row.get("client_order_id")
         venue_order_id = row.get("venue_order_id")
         trade_id = row.get("trade_id")
         async with pool.acquire() as conn:
             order_id = None
-            if venue_order_id is not None:
+            if cid is not None:
+                order_id = await conn.fetchval(
+                    "SELECT order_id FROM orders WHERE client_order_id = $1", cid)
+            if order_id is None and venue_order_id is not None:
                 order_id = await conn.fetchval(
                     "SELECT order_id FROM orders WHERE venue_order_id = $1",
                     venue_order_id,
                 )
             if order_id is None or trade_id is None:
-                # Cannot satisfy the NOT NULL FKs. Not an error in the reconcile
-                # sweep (which passes trade_id=None deliberately); log and skip.
-                log.info("persist_fill: unmapped fill venue_exec_id=%s "
-                         "venue_order_id=%s trade_id=%s — skipped",
-                         row.get("venue_exec_id"), venue_order_id, trade_id)
+                if trade_id is not None:
+                    log.error("persist_fill: fill %s of trade %s has no matching order "
+                              "(client_order_id=%s venue_order_id=%s) — NOT recorded",
+                              row.get("venue_exec_id"), trade_id, cid, venue_order_id)
+                else:
+                    log.info("persist_fill: unattributed fill venue_exec_id=%s "
+                             "venue_order_id=%s — skipped",
+                             row.get("venue_exec_id"), venue_order_id)
                 return False
+            if venue_order_id is not None:
+                await conn.execute(
+                    "UPDATE orders SET venue_order_id = $2 "
+                    "WHERE order_id = $1 AND venue_order_id IS NULL",
+                    order_id, venue_order_id)
             # INSERT; ON CONFLICT on the venue_exec_id UNIQUE makes the dup a
             # no-op. xmax=0 trick: RETURNING tells us whether a row was inserted.
             inserted = await conn.fetchval(
@@ -422,8 +439,12 @@ def make_get_exit_cap(pool: asyncpg.Pool):
             cap_spread_mult=row["cap_spread_mult"],
             cap_abs_bps=row["cap_abs_bps"],
         )
-        # asyncpg returns JSONB as a parsed Python list here.
+        # asyncpg returns JSONB as TEXT unless a json codec is registered on
+        # the connection (none is, here), so parse it. (Iterating the raw
+        # string, as before, raised on every EXIT: no exit could be priced.)
         ladder_raw = row["escalation_ladder"] or []
+        if isinstance(ladder_raw, str):
+            ladder_raw = json.loads(ladder_raw)
         ladder = tuple(
             EscalationRung(
                 widen_to_spread_mult=Decimal(str(r["widen_to_spread_mult"])),
@@ -666,6 +687,100 @@ def make_alert(pool: asyncpg.Pool):
                 json.dumps(detail, default=str),
             )
     return alert
+
+
+# ---------------------------------------------------------------------------
+# Paper ledger (migration 022) — the simulated account behind paper mode
+# ---------------------------------------------------------------------------
+
+def make_paper_ledger_hooks(pool: asyncpg.Pool):
+    """PaperLedgerHooks over paper_balances / paper_orders / paper_fills. A
+    fill's writes (fill row, order, balance deltas) run in one transaction."""
+    from datetime import datetime, timezone
+    from execution.paper_adapter import PaperLedgerHooks, PaperOrder, PaperState
+    from execution.types import Fill, OrderIntent
+
+    def _dt(ms: int):
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+    async def load(fills_since_ms: int) -> PaperState:
+        async with pool.acquire() as conn:
+            bals = await conn.fetch("SELECT currency, qty FROM paper_balances")
+            orders = await conn.fetch(
+                """SELECT client_order_id, venue_order_id, symbol, side, intent, qty,
+                          limit_price, status, filled_qty,
+                          (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms
+                     FROM paper_orders
+                    WHERE status = 'OPEN' OR created_at >= $1""",
+                _dt(fills_since_ms))
+            fills = await conn.fetch(
+                """SELECT fill_id, client_order_id, venue_order_id, intent, qty, price,
+                          fee, fee_currency,
+                          (EXTRACT(EPOCH FROM filled_at) * 1000)::bigint AS filled_ms
+                     FROM paper_fills WHERE filled_at >= $1 ORDER BY filled_at""",
+                _dt(fills_since_ms))
+        return PaperState(
+            balances={r["currency"]: r["qty"] for r in bals},
+            orders={r["client_order_id"]: PaperOrder(
+                client_order_id=r["client_order_id"], venue_order_id=r["venue_order_id"],
+                symbol=r["symbol"], side=r["side"], intent=r["intent"], qty=r["qty"],
+                limit_price=r["limit_price"], status=r["status"],
+                filled_qty=r["filled_qty"], created_ms=r["created_ms"]) for r in orders},
+            fills=[Fill(venue_exec_id=r["fill_id"], qty=r["qty"], price=r["price"],
+                        intent=OrderIntent(r["intent"]), filled_at_ms=r["filled_ms"],
+                        fee=r["fee"], fee_currency=r["fee_currency"],
+                        venue_order_id=r["venue_order_id"],
+                        client_order_id=r["client_order_id"]) for r in fills],
+        )
+
+    async def seed(balances) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT count(*) FROM paper_balances"):
+                    return
+                for cur, qty in balances.items():
+                    await conn.execute(
+                        "INSERT INTO paper_balances (currency, qty) VALUES ($1, $2)", cur, qty)
+
+    async def _upsert_order(conn, o) -> None:
+        await conn.execute(
+            """INSERT INTO paper_orders
+                   (client_order_id, venue_order_id, symbol, side, intent, qty,
+                    limit_price, status, filled_qty)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (client_order_id) DO UPDATE SET
+                   limit_price = EXCLUDED.limit_price,
+                   status      = EXCLUDED.status,
+                   filled_qty  = EXCLUDED.filled_qty,
+                   updated_at  = now()""",
+            o.client_order_id, o.venue_order_id, o.symbol, o.side, o.intent, o.qty,
+            o.limit_price, o.status, o.filled_qty)
+
+    async def save_order(o) -> None:
+        async with pool.acquire() as conn:
+            await _upsert_order(conn, o)
+
+    async def apply_fill(fill, symbol: str, o, deltas) -> None:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _upsert_order(conn, o)
+                await conn.execute(
+                    """INSERT INTO paper_fills
+                           (fill_id, client_order_id, venue_order_id, symbol, intent, qty,
+                            price, fee, fee_currency, filled_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                    fill.venue_exec_id, fill.client_order_id, fill.venue_order_id, symbol,
+                    fill.intent.value, fill.qty, fill.price, fill.fee, fill.fee_currency,
+                    _dt(fill.filled_at_ms))
+                for cur, d in deltas.items():
+                    await conn.execute(
+                        """INSERT INTO paper_balances (currency, qty) VALUES ($1, $2)
+                           ON CONFLICT (currency) DO UPDATE SET
+                               qty = paper_balances.qty + EXCLUDED.qty, updated_at = now()""",
+                        cur, d)
+
+    return PaperLedgerHooks(load=load, seed=seed, save_order=save_order,
+                            apply_fill=apply_fill)
 
 
 # ---------------------------------------------------------------------------

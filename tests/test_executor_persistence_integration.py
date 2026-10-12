@@ -4,6 +4,7 @@ real Postgres with all migrations applied: shadow_trades, executor_cursor and
 executor_alerts, through the same make_* factories run_executor wires in.
 """
 import asyncio
+import uuid
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -109,3 +110,139 @@ async def test_alert_row_and_notify(pool):
     assert r["kind"] == "trade_halted"
     assert r["trade_id"] == "t-1" and r["symbol"] == "BTC-USD"
     assert r["delivered_at"] is None
+
+
+# --------------------------------------------------------------------
+# Paper ledger (migration 022)
+# --------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def paper_pool():
+    p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
+    await p.execute("TRUNCATE paper_fills, paper_orders, paper_balances")
+    yield p
+    await p.close()
+
+
+@pytest.mark.asyncio
+async def test_paper_account_persists_and_resumes(paper_pool):
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_paper_adapter import FakeMarket, order
+    from execution.paper_adapter import PaperCoinbaseAdapter
+    from execution.persistence import make_paper_ledger_hooks
+
+    market = FakeMarket()
+    def adapter():
+        return PaperCoinbaseAdapter(market, make_paper_ledger_hooks(paper_pool),
+                                    starting_cash=Decimal("10000"))
+    a = adapter()
+    await a.connect()
+    filled = order(qty="0.05", limit="100020")
+    resting = order(qty="0.01", limit="99000")
+    r = await a.submit_order(filled)
+    await a.submit_order(resting)
+    assert r.status.value == "FILLED"
+
+    bal = {row["currency"]: row["qty"] for row in
+           await paper_pool.fetch("SELECT currency, qty FROM paper_balances")}
+    assert bal["BTC"] == Decimal("0.05")
+    assert bal["USD"] == a.state.balances["USD"]
+    assert await paper_pool.fetchval("SELECT count(*) FROM paper_fills") == 1
+
+    b = adapter()                                     # restart
+    await b.connect()
+    assert b.state.balances == a.state.balances
+    assert b.state.orders[resting.client_order_id].status == "OPEN"
+    assert [f.client_order_id for f in b.state.fills] == [filled.client_order_id]
+    market.books["BTC-USD"] = (Decimal("98990"), Decimal("98995"))
+    got = []
+    async def cb(f): got.append(f)
+    assert await b.check_resting_once(cb) == 1
+    status = await paper_pool.fetchval(
+        "SELECT status FROM paper_orders WHERE client_order_id = $1", resting.client_order_id)
+    assert status == "FILLED"
+
+
+@pytest.mark.asyncio
+async def test_paper_fill_writes_are_atomic(paper_pool):
+    from execution.paper_adapter import PaperOrder
+    from execution.persistence import make_paper_ledger_hooks
+    from execution.types import Fill, OrderIntent
+
+    h = make_paper_ledger_hooks(paper_pool)
+    await h.seed({"USD": Decimal("1000")})
+    await h.seed({"USD": Decimal("5")})               # second seed is a no-op
+    o = PaperOrder("cid-1", "paper-1", "BTC-USD", "BUY", "ENTRY", Decimal("0.001"),
+                   Decimal("100000"), "OPEN")
+    await h.save_order(o)
+    fill = Fill(venue_exec_id="f-1", qty=Decimal("0.001"), price=Decimal("100000"),
+                intent=OrderIntent.ENTRY, filled_at_ms=1_791_000_000_000,
+                fee=Decimal("0.6"), fee_currency="USD", venue_order_id="paper-1",
+                client_order_id="cid-1")
+    deltas = {"USD": Decimal("-100.6"), "BTC": Decimal("0.001")}
+    filled = PaperOrder(**{**o.__dict__, "status": "FILLED", "filled_qty": Decimal("0.001")})
+    await h.apply_fill(fill, "BTC-USD", filled, deltas)
+    with pytest.raises(asyncpg.UniqueViolationError):          # same fill id again
+        await h.apply_fill(fill, "BTC-USD", filled, deltas)
+    bal = {r["currency"]: r["qty"] for r in
+           await paper_pool.fetch("SELECT currency, qty FROM paper_balances")}
+    assert bal == {"USD": Decimal("899.4"), "BTC": Decimal("0.001")}   # applied once
+
+
+@pytest.mark.asyncio
+async def test_paper_round_trip_through_real_persistence_and_review_queries(paper_pool):
+    """The executor's real Postgres persistence + the paper adapter on the DB
+    ledger + a fake market: ENTER then EXIT, then the RUNBOOK's paper-review
+    queries return the round trip's numbers."""
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_paper_adapter import FakeMarket
+    from execution.paper_adapter import PaperCoinbaseAdapter
+    from execution.persistence import build_executor_hooks, make_paper_ledger_hooks
+    from execution.signal_executor import SignalExecutor
+
+    pool = paper_pool
+    await pool.execute("TRUNCATE fills, orders, exit_state, trades, chains CASCADE")
+    await pool.execute("""INSERT INTO execution_caps
+        (asset_class, intent, cross_spread_mult, cap_spread_mult, cap_abs_bps, escalation_ladder, enabled)
+        VALUES ('crypto','ENTRY',1.0,2.0,20,'[]',true),
+               ('crypto','EXIT',1.5,3.0,50,'[{"widen_to_spread_mult":4.0,"window_seconds":10}]',true)
+        ON CONFLICT (asset_class, intent) DO NOTHING""")
+    await pool.execute("UPDATE kill_switch SET engaged = false")
+    chain_id = str(uuid.uuid4())
+    await pool.execute(
+        """INSERT INTO chains (chain_id, symbol, asset_class, direction, origin_time,
+                               active_timeframes) VALUES ($1, 'BTC-USD', 'crypto', 1, now(), '{1m}')""",
+        chain_id)
+
+    market = FakeMarket()
+    adapter = PaperCoinbaseAdapter(market, make_paper_ledger_hooks(pool),
+                                   starting_cash=Decimal("10000"))
+    hooks = build_executor_hooks(pool)
+    hooks.get_touch = adapter.get_touch
+    async def size(symbol, ac, side, dp): return Decimal("0.05")
+    hooks.size_position = size
+    ex = SignalExecutor(adapter, hooks)
+    await ex.start()
+
+    base = {"position_key": f"{chain_id}:L", "chain_id": chain_id, "direction": "LONG",
+            "symbol": "BTC-USD", "asset_class": "crypto", "strategy": "confirmed_15m",
+            "trigger_level": 4, "decision_price": 100005.0}
+    await ex.handle_signal({**base, "signal_id": "s-enter", "action": "ENTER",
+                            "exit_reason": None})
+    market.books["BTC-USD"] = (Decimal("101000"), Decimal("101010"))
+    await ex.handle_signal({**base, "signal_id": "s-exit", "action": "EXIT",
+                            "exit_reason": "TARGET"})
+
+    t = await pool.fetchrow("SELECT state, entry_filled_qty, exit_filled_qty FROM trades")
+    assert t["state"] == "CLOSED"
+    assert t["entry_filled_qty"] == t["exit_filled_qty"] == Decimal("0.05")
+    assert await pool.fetchval("SELECT count(*) FROM fills") == 2
+
+    q = os.path.join(os.path.dirname(__file__), "..", "docs", "paper_review.sql")
+    sql = open(q).read().split(";")[0]                  # the P&L / fee-drag query
+    row = await pool.fetchrow(sql)
+    assert row["symbol"] == "BTC-USD" and row["trades"] == 1
+    assert row["gross_pnl"] > 0 and row["fees"] > 0
+    assert row["net_pnl"] == row["gross_pnl"] - row["fees"]

@@ -190,16 +190,16 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ### Phase 5 — `PaperCoinbaseAdapter`
 
-- [ ] Wraps a `CoinbaseAdapter` for reads (touch, products, fee tier from `GET /transaction_summary`); simulates writes: immediate full fill at `limit_price`, real taker fee.
-- [ ] Migration 022 `paper_ledger` (cash, positions) + `paper_fills` (renumbered: 021 is `executor_alerts`); paper reconcile exercises the real boot path.
-- [ ] `supports_short = False` so shadow shorts behave identically in paper and live.
-- [ ] Factory: `off` / `paper` → paper adapter; `live` → real adapter (unchanged mapping).
+- [x] Wraps a `CoinbaseAdapter` for reads (touch, products, fee tier from `GET /transaction_summary`); simulates writes: immediate full fill at `limit_price`, real taker fee.
+- [x] Migration 022 `paper_ledger` (cash, positions) + `paper_fills` (renumbered: 021 is `executor_alerts`); paper reconcile exercises the real boot path.
+- [x] `supports_short = False` so shadow shorts behave identically in paper and live.
+- [x] Factory: `off` / `paper` → paper adapter; `live` → real adapter (unchanged mapping).
 
 ### Phase 6 — Ops and go-live
 
-- [ ] Add `executor` service to `docker-compose.yml`; seed `trade_enabled.mode = 'paper'`.
-- [ ] Rewrite `README.md` §1 and `RUNBOOK.md` for the Coinbase topology.
-- [ ] Go-live gate: green suite → read-only connect in `off` → paper N weeks → review (fee drag, fill-vs-touch, reconcile stability, shadow-short stats) → `live` on one symbol at minimum size → widen.
+- [x] Add `executor` service to `docker-compose.yml`; seed `trade_enabled.mode = 'paper'`.
+- [x] Rewrite `README.md` §1 and `RUNBOOK.md` for the Coinbase topology.
+- [x] Go-live gate: green suite → read-only connect in `off` → paper N weeks → review (fee drag, fill-vs-touch, reconcile stability, shadow-short stats) → `live` on one symbol at minimum size → widen.
 
 ---
 
@@ -304,3 +304,18 @@ Each phase is independently mergeable and leaves the system runnable.
   - A cancel is queued, not instant (`CANCEL_QUEUED`): `cancel_order` waits (up to ~2 s) for a terminal status and reports `filled_size`, so the executor never issues a replacement exit while the old order can still fill.
   - Resubmitting a `client_order_id` returns the existing order (documented), which is the venue half of the executor's idempotency.
   - A transport failure or 5xx after retries **raises** from `submit_order` (the order may exist; the executor resolves it at reconcile); a 4xx or `success: false` is a REJECTED result with Coinbase's reason.
+
+### PR 6 (Phases 5–6, paper trading and ops)
+
+- **Paper fill model:** a limit that crosses the real touch fills **in full at its limit price** (not the touch), so paper slippage is the cap actually used, an upper bound; a non-crossing limit rests and is re-checked against the touch every poll (`fill_poll_s`). No queue position, partials or impact, so paper says nothing about fill rates in thin books. Fees use the account's real taker tier (`GET /transaction_summary`, cached 6 h, falling back to `SHADOW_TAKER_FEE_BPS`); the shadow book now uses the same tier per entry.
+- **Ledger** (migration 022): `paper_balances`, `paper_orders` (keyed by `client_order_id`, so a repeat returns the same order, as on Coinbase), `paper_fills`. A fill's writes are one transaction. Seeded with `config.PAPER_STARTING_CASH` on first start; a restart resumes the same account and boot reconcile runs against it.
+- **Factory:** `off` and `paper` → `PaperCoinbaseAdapter` over the real adapter wrapped in `ReadOnlyAdapter` (reads are real, and a real write is structurally impossible); `live` → `CoinbaseAdapter`.
+- **Mode-change fix:** the old hot swap rebound only the launcher's adapter reference while `GatedAdapter` kept the old one, so live → paper would have kept placing **real** orders. A paper ↔ live change now wraps the gated adapter's inner adapter in `ReadOnlyAdapter` at once, stops the executor and exits 3; compose restarts it and boot reconciles against the new venue. off ↔ paper is a no-op (same adapter).
+- **Paper seed** (migration 023): mode becomes `paper` only while `trade_enabled` still carries its initial reason and mode `off`, so it never overrides an operator.
+- **Critical persistence bugs found by the new real-Postgres round-trip test** (paper entry → fill → exit through the real hooks, then the review queries):
+  - `persist_fill` looked fills up by `orders.venue_order_id`, which nothing ever wrote, so **every fill was skipped as a duplicate** — no `fills` rows, no realized P&L, in paper or live. It now resolves by `client_order_id` first (the executor passes it), back-fills `orders.venue_order_id`, and logs ERROR for a known trade's fill it cannot map.
+  - `get_exit_cap` received the JSONB escalation ladder as text (asyncpg has no JSON codec on the pool), so **every EXIT raised `TypeError`**. It now decodes it.
+- **Ops:** `executor` service in `docker-compose.yml` (after warmup, `restart: unless-stopped`). A refused or failed boot sleeps `EXECUTOR_BOOT_RETRY_S` (300 s) before exiting 1, so a restart loop alerts at most every few minutes. `README.md` and `RUNBOOK.md` rewritten for the Coinbase topology; `RUNBOOK.md` §8 is the go-live gate; review queries in `docs/paper_review.sql`.
+- **Shared trade tables:** `trades`/`orders`/`fills` carry no mode, so paper positions must be drained before going live (else boot HALTs them) and reviews filter by the go-live time. Documented in the runbook; a `mode` column is a candidate if this proves error-prone.
+- **Still open:** alert *delivery* (a notifier that LISTENs on `executor_alert`), `kill_switch` `flatten` (behaves as `halt_new`), and the paper run itself.
+
