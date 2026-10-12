@@ -23,6 +23,9 @@ GRAN_S = {"ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900,
           "SIX_HOUR": 21600, "ONE_DAY": 86400}
 
 T0 = 1_760_000_040          # a 3-minute-aligned unix second (1760000040 % 180 == 0)
+# A moment by which the minute ending at T0 has settled (the feed waits
+# SETTLE_MS after a window ends before trusting its candle).
+SETTLED = T0 + SETTLE_MS // 1000 + 1
 
 
 def ohlc(t):
@@ -109,7 +112,7 @@ def test_native_symbol_is_the_product_id():
 
 @pytest.mark.asyncio
 async def test_history_pages_back_to_points_needed_closed_only():
-    now = T0 + 25                                      # mid-minute: a forming candle exists
+    now = SETTLED                                      # mid-minute: a forming candle exists
     fake = FakeCoinbase(now_s=now)
     pts = await make_feed(fake).fetch_history("BTC-USD", "1m", 1000)
     assert len(pts) == 1000
@@ -127,7 +130,7 @@ async def test_history_pages_back_to_points_needed_closed_only():
 
 @pytest.mark.asyncio
 async def test_history_stops_at_product_listing():
-    fake = FakeCoinbase(now_s=T0, listed_from_s=T0 - 500 * 60)
+    fake = FakeCoinbase(now_s=SETTLED, listed_from_s=T0 - 500 * 60)
     pts = await make_feed(fake).fetch_history("BTC-USD", "1m", 5000)
     assert len(pts) == 500
     assert pts[0].timestamp == (T0 - 500 * 60) * 1000
@@ -203,7 +206,7 @@ async def test_live_native_waits_for_settle_then_emits_once():
 
 @pytest.mark.asyncio
 async def test_live_catches_up_missed_windows_in_order():
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 240) * 1000}
     batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
@@ -214,7 +217,7 @@ async def test_live_catches_up_missed_windows_in_order():
 async def test_live_derived_waits_for_its_last_base_candle():
     # 3m window [T0-180, T0) has ended, but its last minute (T0-60) has not
     # been published yet: emitting now would lose that minute for good.
-    fake = FakeCoinbase(now_s=T0 + 10, missing={T0 - 60})
+    fake = FakeCoinbase(now_s=SETTLED, missing={T0 - 60})
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 180) * 1000}
     assert await feed.poll_once(["BTC-USD"], "3m", cursors) == []
@@ -225,7 +228,7 @@ async def test_live_derived_waits_for_its_last_base_candle():
 
 @pytest.mark.asyncio
 async def test_live_derived_emits_after_grace_when_last_minute_had_no_trades():
-    fake = FakeCoinbase(now_s=T0 + 10, missing={T0 - 60})
+    fake = FakeCoinbase(now_s=SETTLED, missing={T0 - 60})
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 180) * 1000}
     assert await feed.poll_once(["BTC-USD"], "3m", cursors) == []
@@ -237,7 +240,7 @@ async def test_live_derived_emits_after_grace_when_last_minute_had_no_trades():
 
 @pytest.mark.asyncio
 async def test_live_polls_each_symbol():
-    fake = FakeCoinbase(now_s=T0 + 10, products=("BTC-USD", "ETH-USD"))
+    fake = FakeCoinbase(now_s=SETTLED, products=("BTC-USD", "ETH-USD"))
     feed = make_feed(fake, symbols=("BTC-USD", "ETH-USD"))
     cursors = {"BTC-USD": (T0 - 60) * 1000, "ETH-USD": (T0 - 60) * 1000}
     batch = await feed.poll_once(["BTC-USD", "ETH-USD"], "1m", cursors)
@@ -251,7 +254,7 @@ async def test_live_polls_each_symbol():
 @pytest.mark.asyncio
 async def test_live_catches_up_from_a_cursor_older_than_the_lookback():
     # Cursor 40 minutes behind: a fixed lookback would have skipped ~34 bars.
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 40 * 60) * 1000}
     batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
@@ -262,7 +265,7 @@ async def test_live_catches_up_from_a_cursor_older_than_the_lookback():
 
 @pytest.mark.asyncio
 async def test_live_catch_up_pages_forward_within_the_request_cap():
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 700 * 60) * 1000}       # 700 minutes: three pages
     batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
@@ -273,7 +276,7 @@ async def test_live_catch_up_pages_forward_within_the_request_cap():
 
 @pytest.mark.asyncio
 async def test_live_derived_catch_up_from_stale_cursor():
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 30 * 60) * 1000}
     batch = await feed.poll_once(["BTC-USD"], "3m", cursors)
@@ -283,7 +286,7 @@ async def test_live_derived_catch_up_from_stale_cursor():
 @pytest.mark.asyncio
 async def test_live_catch_up_is_clamped_for_very_old_cursors():
     from feeds.coinbase_spot import MAX_CATCHUP_PAGES, _PAGE_CANDLES
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake)
     cursors = {"BTC-USD": (T0 - 30 * 86_400) * 1000}    # a month behind
     batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
@@ -313,7 +316,7 @@ def test_cold_stream_starts_at_the_last_closed_window():
 
 @pytest.mark.asyncio
 async def test_start_live_does_not_reemit_warmups_newest_bar():
-    fake = FakeCoinbase(now_s=T0 + 10)
+    fake = FakeCoinbase(now_s=SETTLED)
     feed = make_feed(fake, timeframes=("1m",))
     warm_newest = (T0 - 180) * 1000
     got = []

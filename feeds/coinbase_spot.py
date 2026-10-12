@@ -242,13 +242,16 @@ class CoinbaseSpotFeed(AssetFeed):
                             now_ms: int, *, final: bool) -> List[dict]:
         """Target-timeframe bars that are complete as of now_ms, ascending.
 
-        final=True (history): any window whose end has passed is complete.
-        final=False (live): additionally apply the settle delay and, for a
-        derived window, require its last base candle (or a grace period)."""
+        Both modes require a window to have ended at least SETTLE_MS ago:
+        Coinbase keeps revising a closed candle for a while after its window
+        ends, so a candle read sooner may not be final — in history that would
+        seed a wrong newest bar. final=False (live) additionally requires a
+        derived window's last base candle (or a grace period), since live
+        reads the newest windows as they close."""
         base_tf = base_timeframe(timeframe)
         base_ms = timeframe_to_ms(base_tf)
         tf_ms = timeframe_to_ms(timeframe)
-        settle = 0 if final else SETTLE_MS
+        settle = SETTLE_MS
 
         base = [base_by_t[t] for t in sorted(base_by_t)
                 if t + base_ms + settle <= now_ms]   # drop the forming candle
