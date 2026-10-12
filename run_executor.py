@@ -1,40 +1,33 @@
 """
 run_executor.py — process entrypoint for the execution side.
 
-This is the standalone launcher the repo was missing: the signal side ships in
-docker-compose.yml (kafka + warmup + feed + signal), but the executor had no
-`__main__`. This wires the pieces exactly as IB_ADAPTER_WIRING.md and
-SIGNAL_LISTENER_WIRING.md describe:
+The signal side ships in docker-compose.yml (kafka + warmup + feed + signal);
+this is the executor's standalone launcher. Wiring:
 
     SignalListener (LISTEN/NOTIFY on trade_signals)
         -> executor.handle_signal(row)          # idempotent on signal_id
     SignalExecutor
         -> GatedAdapter(raw_adapter, TradeEnableState)   # off => orders no-op
-            -> IBKRAdapter | BinanceAdapter (paper 4002 / live 4001 by mode)
+            -> venue adapter for EXECUTOR_VENUE (paper vs live by mode)
+
+Persistence: ExecutorHooks come from execution/persistence.build_executor_hooks
+(make_* factories over the asyncpg pool, against the 001 trade-lifecycle schema
+and later migrations). get_touch and size_position are deliberately NOT
+DB-backed; they are rewired below to the live adapter.
 
 Boot ordering (enforced by SignalExecutor.start()):
     connect() -> reconcile() -> diff DB vs venue -> start fill stream -> subscribe
 
-Run it AFTER: migrations 001..013 applied, the signal side is producing rows,
-IB Gateway (or Binance testnet reachability) is up, and .env is populated.
+ADR-001 status: the only venue is Coinbase Advanced Trade spot, and its adapter
+lands in Phase 4 (live) / Phase 5 (paper). Until then build_coinbase_adapter
+raises NotImplementedError and this process exits 1 with that message — the
+executor refuses to start rather than trade through a missing venue.
+
+Run it AFTER: migrations applied, the signal side is producing rows, and .env is
+populated.
 
     python run_executor.py            # boots in whatever mode the DB row says
                                       # (config default "off" until you flip it)
-
-================================  READ THIS  ================================
-ONE THING IS NOT WIRED, because it does not exist in the repo yet: the concrete
-ExecutorHooks / BootHooks implementations (the ~13 persistence + market-read
-callables SignalExecutor and boot.run_boot_reconcile depend on). The producer
-side has producer/persistence.py with make_* factories over an asyncpg pool;
-the execution side needs the equivalent against the 001 trade-lifecycle schema
-(trades, orders, fills) plus the market-read helpers.
-
-`build_executor_hooks()` below is the single seam where that plugs in. It raises
-NotImplementedError today with a checklist of every callable and the table each
-touches. Implement those (ideally in a new execution/persistence.py of make_*
-factories, mirroring producer/persistence.py), point this function at them, and
-the process is complete. Everything else here is real and runnable.
-============================================================================
 """
 from __future__ import annotations
 
@@ -48,8 +41,7 @@ import asyncpg
 
 import config
 from execution.adapter_factory import (
-    build_ibkr_adapter,
-    build_binance_adapter,
+    build_coinbase_adapter,
     endpoint_kind_for_mode,
 )
 from execution.gated_adapter import GatedAdapter
@@ -67,14 +59,13 @@ log = logging.getLogger("executor.main")
 
 
 # --- which venue this executor drives ---------------------------------------
-# IBKR for equity/fx, Binance for crypto. One executor process drives one venue;
-# run two processes (with different VENUE) if you trade both. Override with
-# EXECUTOR_VENUE=binance.
-VENUE = os.getenv("EXECUTOR_VENUE", "ibkr").lower()
+# One executor process drives one venue. ADR-001: Coinbase Advanced Trade spot
+# is the only venue; EXECUTOR_VENUE is kept so a future equities venue is a new
+# builder entry, not a launcher rewrite.
+VENUE = os.getenv("EXECUTOR_VENUE", "coinbase").lower()
 
 _ADAPTER_BUILDERS = {
-    "ibkr": build_ibkr_adapter,
-    "binance": build_binance_adapter,
+    "coinbase": build_coinbase_adapter,
 }
 
 
@@ -109,8 +100,7 @@ async def main() -> None:
     log.info("db pool up")
 
     # `current` holds the live raw adapter so the mode-change callback can swap
-    # it under the GatedAdapter without rebuilding the executor. Mirrors the
-    # pattern in IB_ADAPTER_WIRING.md.
+    # it under the GatedAdapter without rebuilding the executor.
     current: dict = {"adapter": None}
 
     async def on_mode_change(old: TradeMode, new: TradeMode) -> None:

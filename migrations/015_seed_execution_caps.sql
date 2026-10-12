@@ -34,8 +34,11 @@
 -- position is worse than paying a little more to get flat).
 --
 -- COVERAGE: one ENTRY and one EXIT row per asset class the executor will trade.
--- Seeds crypto + equity (the classes enabled in config.py); fx is included
--- commented-out, matching config's own posture — uncomment when you enable fx.
+-- ADR-001: crypto only (Coinbase Advanced Trade spot). equity and fx are kept
+-- commented-out as reference values for when equities return. Edited in place
+-- rather than superseded because ADR-001 Phase 2 starts from a fresh DB; on an
+-- existing DB that already holds equity rows, they are inert (no equity symbols
+-- are configured) and can be deleted by hand.
 --
 -- Idempotent: ON CONFLICT (asset_class, intent) DO UPDATE, so replaying this
 -- migration re-asserts the seed values without erroring on an existing row.
@@ -48,25 +51,25 @@ INSERT INTO execution_caps
     (asset_class, intent, cross_spread_mult, cap_spread_mult, cap_abs_bps,
      escalation_ladder, enabled)
 VALUES
-    -- ---- crypto (Binance) ---------------------------------------------------
+    -- ---- crypto (Coinbase spot) ---------------------------------------------
     -- Crypto spreads are usually tight on majors but blow out fast in volatility,
     -- so the absolute bps backstop matters here.
     ('crypto', 'ENTRY', 1.0, 2.0, 20, '[]'::jsonb, true),
     ('crypto', 'EXIT',  1.5, 3.0, 50,
         '[{"widen_to_spread_mult": 4.0, "window_seconds": 10},
           {"widen_to_spread_mult": 6.0, "window_seconds": 15}]'::jsonb,
-        true),
-
-    -- ---- equity (IBKR) ------------------------------------------------------
-    -- Liquid US equities are often one tick wide; the spread-multiple approach
-    -- keeps entries tight there while still self-scaling on wider names.
-    ('equity', 'ENTRY', 1.0, 2.0, 15, '[]'::jsonb, true),
-    ('equity', 'EXIT',  1.5, 3.0, 40,
-        '[{"widen_to_spread_mult": 4.0, "window_seconds": 15},
-          {"widen_to_spread_mult": 6.0, "window_seconds": 20}]'::jsonb,
         true)
 
-    -- ---- fx (IBKR) — uncomment when fx is enabled in config.py --------------
+    -- ---- equity — uncomment when equities are enabled in config.py ---------
+    -- Liquid US equities are often one tick wide; the spread-multiple approach
+    -- keeps entries tight there while still self-scaling on wider names.
+    -- ,('equity', 'ENTRY', 1.0, 2.0, 15, '[]'::jsonb, true),
+    -- ('equity', 'EXIT',  1.5, 3.0, 40,
+    --     '[{"widen_to_spread_mult": 4.0, "window_seconds": 15},
+    --       {"widen_to_spread_mult": 6.0, "window_seconds": 20}]'::jsonb,
+    --     true)
+
+    -- ---- fx — uncomment when fx is enabled in config.py ---------------------
     -- ,('fx', 'ENTRY', 1.0, 2.0, 8, '[]'::jsonb, true),
     -- ('fx', 'EXIT',  1.5, 3.0, 25,
     --     '[{"widen_to_spread_mult": 4.0, "window_seconds": 15},

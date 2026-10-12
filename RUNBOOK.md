@@ -1,5 +1,13 @@
 # Trading System — Assembly & Runbook
 
+> **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
+> The system is being re-architected for Coinbase Advanced Trade spot,
+> long-only, crypto-only. Phases 0–1 are done: IBKR and Binance execution, the
+> legacy executor, and the Polygon equity/fx/options feeds are deleted;
+> `two_ladder` and `prior_failure_scaleout` are disabled. The executor will not
+> start until the Coinbase adapter lands (Phase 4). Sections below that describe
+> IBKR, Binance execution or Polygon are out of date until the Phase 6 rewrite.
+
 A standalone, headless trading system forked from CausaView. It runs two parallel
 chain "ladders" (Set A / Set B) per symbol, applies a two-ladder entry/exit
 strategy, and **emits trade signals to a database**. A separate team's script

@@ -1,10 +1,10 @@
 """
 feeds/streaming_base.py — the resilient websocket supervisor.
 
-This is the shared machinery every websocket feed sits on, the streaming
-counterpart to feeds/polygon_aggs.py (which is the shared REST machinery).
-polygon_ws.py and binance_ws.py are thin subclasses that fill in the
-source-specific bits; all the resilience lives here, once.
+This is the shared machinery every websocket feed sits on. binance_ws.py is
+a thin subclass that fills in the source-specific bits (the Polygon ws feeds
+that also sat on it were deleted in ADR-001 Phase 1). All the resilience
+lives here, once.
 
 ## What "resilient" means concretely
 

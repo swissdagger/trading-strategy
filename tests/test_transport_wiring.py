@@ -78,19 +78,18 @@ def stub_feeds(monkeypatch):
             self.name = f"stub_ws_{asset_class}"
             self.backfill_feed = backfill_feed
 
-    def fake_build_rest(asset_class, symbols, timeframes, key):
+    def fake_build_rest(asset_class, symbols, timeframes):
         f = StubRest(asset_class)
         built["rest"].append(f)
         return f
 
-    def fake_build_ws(asset_class, backfill_feed, key):
+    def fake_build_ws(asset_class, backfill_feed):
         f = StubWS(asset_class, backfill_feed)
         built["ws"].append(f)
         return f
 
     monkeypatch.setattr(feed_process, "_build_rest_feed", fake_build_rest)
     monkeypatch.setattr(feed_process, "_build_ws_feed", fake_build_ws)
-    monkeypatch.setenv("POLYGON_API_KEY", "test-key")
     return feed_process, built, StubRest, StubWS
 
 

@@ -6,7 +6,7 @@ SignalListener (which pushes trade_signals rows) and an ExecutionAdapter (which
 places orders at a venue), and it owns the dangerous middle: turning a strategy
 DECISION into a managed, reconciled, real-money POSITION.
 
-Distinct from the legacy Kafka executor (execution/_legacy_executor.py), which
+Replaces the legacy Kafka executor (deleted in ADR-001 Phase 1), which
 consumed chain events and re-derived strategy. This one consumes the DISTILLED
 trade_signals — the single source of truth both this project and the other team
 read — so there is no strategy drift. One signal, one durable intent, one

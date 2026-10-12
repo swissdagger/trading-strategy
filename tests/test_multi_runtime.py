@@ -53,7 +53,8 @@ class ScriptedExit:
     def __init__(self):
         self.exit_keys = set()
         self.evaluated = []
-    async def maybe_emit_exit(self, *, symbol, asset_class, chain_prime_id, trade_direction, decided_at):
+    async def maybe_emit_exit(self, *, symbol, asset_class, chain_prime_id, trade_direction, decided_at,
+                              decision_price=None):
         base = f"{chain_prime_id}:{'L' if trade_direction == 1 else 'S'}"
         self.evaluated.append(base)
         if base in self.exit_keys:
@@ -78,7 +79,7 @@ class MemHooks(RuntimeHooks):
         self.store.pop(key, None)
 
 
-def _strategy(name, entry, exit_, symbols, ladders=("A",)):
+def _strategy(name, entry, exit_, symbols, ladders=("FC",)):
     return Strategy(name=name, entry=entry, exit=exit_, symbols=symbols, ladders=list(ladders))
 
 
