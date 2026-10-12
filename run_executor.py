@@ -47,8 +47,14 @@ from execution.adapter_factory import (
 from execution.gated_adapter import GatedAdapter
 from execution.trade_enable import TradeEnableState, TradeMode
 from execution.signal_listener import SignalListener
-from execution.signal_executor import SignalExecutor
-from execution.persistence import build_executor_hooks
+from execution.signal_executor import OrphanPositionError, SignalExecutor
+from execution.persistence import (
+    build_executor_hooks,
+    make_load_executor_cursor,
+    make_save_executor_cursor,
+    make_shadow_hooks,
+)
+from execution.shadow_book import ShadowBook
 from execution.sizing import make_size_position
 
 logging.basicConfig(
@@ -155,21 +161,48 @@ async def main() -> None:
     hooks.size_position = make_size_position(_adapter)
     log.info("get_touch and size_position (5%% equity) wired to venue adapter")
 
-    executor = SignalExecutor(adapter, hooks)
+    # Shadow book: SHORT signals the venue can't take (spot has no short side)
+    # get virtual fills at the live touch instead (migration 019).
+    shadow = ShadowBook(make_shadow_hooks(pool, _get_touch),
+                        taker_fee_bps=config.SHADOW_TAKER_FEE_BPS)
+    await shadow.start()
+
+    executor = SignalExecutor(
+        adapter, hooks,
+        shadow_book=shadow,
+        max_open_positions=config.MAX_OPEN_POSITIONS,
+        enter_max_age_ms=config.ENTER_MAX_AGE_SECONDS * 1000,
+        orphan_allowlist=config.ORPHAN_BALANCE_ALLOWLIST,
+    )
 
     # Boot ordering invariant: connect -> reconcile -> diff -> fill stream.
-    # Raises if a trading session can't be confirmed; we stay down rather than
-    # trade blind.
-    await executor.start()
+    # Raises if a trading session can't be confirmed or the venue holds orphan
+    # balances; we stay down rather than trade blind. Orphans alert from inside
+    # start(); any other boot failure alerts here.
+    try:
+        await executor.start()
+    except OrphanPositionError:
+        raise
+    except Exception as e:
+        try:
+            await hooks.alert("executor_boot_failed", {"error": repr(e)})
+        except Exception:
+            log.exception("could not record executor_boot_failed alert")
+        raise
 
-    # Only NOW subscribe to signals. initial_cursor=None => act on signals from
-    # startup forward. Persist executor.hooks / listener.cursor if you want to
-    # resume-without-replay across restarts.
+    # Only NOW subscribe to signals. Resume from the persisted cursor
+    # (migration 020) so signals written while we were down — EXITs above all —
+    # are replayed; stale ENTERs are skipped by age inside the executor. No
+    # cursor yet (first ever run) => start from now.
+    initial_cursor = await make_load_executor_cursor(pool)()
+    log.info("listener resuming from %s",
+             initial_cursor.isoformat() if initial_cursor else "now (no persisted cursor)")
     listener = SignalListener(
         dsn=dsn,
         pool=pool,
         handler=executor.handle_signal,   # idempotent on row['signal_id']
-        initial_cursor=None,
+        initial_cursor=initial_cursor,
+        on_cursor_advance=make_save_executor_cursor(pool),
     )
 
     stop = asyncio.Event()
@@ -183,17 +216,24 @@ async def main() -> None:
         loop.add_signal_handler(sig, _request_stop)
 
     listener_task = asyncio.create_task(listener.run(), name="signal-listener")
+    # The escalation driver: widens unfilled exits rung by rung and HALTs at the
+    # top of the ladder. Without it, a working exit that never fills is never
+    # escalated.
+    escalation_task = asyncio.create_task(
+        executor.run_escalation_loop(), name="escalation-loop")
     log.info("executor live: listening for trade_signals")
 
     await stop.wait()
 
     # Graceful teardown.
     log.info("stopping...")
+    executor.stop()
     listener_task.cancel()
-    try:
-        await listener_task
-    except asyncio.CancelledError:
-        pass
+    for task in (listener_task, escalation_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await mode.stop()
     await pool.close()
     log.info("executor stopped cleanly")
@@ -202,6 +242,6 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except NotImplementedError as e:
+    except (NotImplementedError, OrphanPositionError) as e:
         log.error("cannot start: %s", e)
         sys.exit(1)

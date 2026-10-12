@@ -7,6 +7,25 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Throwaway CI container: trust auth, so no password exists to leak
+          # (or to trip secret scanners).
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      # Enables the real-Postgres integration tests (they skip without it).
+      QISS_TEST_DSN: postgresql://postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,5 +36,14 @@ jobs:
             requirements.txt
             requirements-dev.txt
       - run: pip install -r requirements-dev.txt
-      # Real-Postgres integration tests skip themselves without QISS_TEST_DSN.
+      - name: Apply migrations
+        run: |
+          # Supabase roles referenced by 003_lockdown_rls.sql.
+          for r in anon authenticated service_role; do
+            psql -v ON_ERROR_STOP=1 -q -c "DO \$\$BEGIN CREATE ROLE $r; EXCEPTION WHEN duplicate_object THEN NULL; END\$\$;"
+          done
+          for f in migrations/*.sql; do
+            echo "applying $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done
       - run: python -m pytest -q

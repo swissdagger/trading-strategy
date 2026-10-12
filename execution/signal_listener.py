@@ -95,6 +95,7 @@ class SignalListener:
         *,
         initial_cursor: Optional[datetime] = None,
         statement_cache_size: int = 0,
+        on_cursor_advance: Optional[Callable[[datetime], Awaitable[None]]] = None,
     ):
         """
         dsn:   connection string for the dedicated LISTEN connection (same
@@ -107,12 +108,18 @@ class SignalListener:
                the whole table.
         statement_cache_size: passed to the dedicated connect; 0 for pgbouncer/
                Supabase compatibility, matching the pool convention elsewhere.
+        on_cursor_advance: awaited with the new cursor each time it advances
+               (after a successful dispatch), so the caller can persist it and
+               resume there after a restart. A failure is logged and does not
+               affect delivery: the worst case is replaying a few signals the
+               handler already deduplicates.
         """
         self._dsn = dsn
         self._pool = pool
         self._handler = handler
         self._cursor: datetime = initial_cursor or datetime.now(timezone.utc)
         self._stmt_cache = statement_cache_size
+        self._on_cursor_advance = on_cursor_advance
 
         self._conn: Optional[asyncpg.Connection] = None
         self._running = False
@@ -309,6 +316,12 @@ class SignalListener:
         created_at = row["created_at"]
         if created_at is not None and created_at > self._cursor:
             self._cursor = created_at
+            if self._on_cursor_advance is not None:
+                try:
+                    await self._on_cursor_advance(created_at)
+                except Exception:
+                    log.exception("persisting listener cursor %s failed; will "
+                                  "retry on the next advance", created_at.isoformat())
 
     def _mark_seen(self, signal_id: str) -> None:
         self._recent[signal_id] = None
