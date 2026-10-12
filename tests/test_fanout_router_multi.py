@@ -28,6 +28,10 @@ class FakeEvent:
     direction: int
     propagation_level: int
     timestamp: str
+    # Mirror producer.chain_machine.ChainEvent: the router reads ce.price into
+    # decision_price, so the fake must carry it.
+    timeframe: str = "1m"
+    price: float | None = 100.0
 
 
 class FakeMachine:

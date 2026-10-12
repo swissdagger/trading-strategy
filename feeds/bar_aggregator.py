@@ -1,7 +1,7 @@
 """
 feeds/bar_aggregator.py — incremental (streaming) OHLC re-aggregation.
 
-The live-path counterpart to polygon_options._resample_to_timeframe.
+The live-path counterpart to feeds.resample._resample_to_timeframe.
 That helper is a BATCH re-bucketer: it takes a full list of fine-grained
 bars and returns every window at once. On a websocket we don't have the
 full list — bars arrive one at a time, forever — so we need the SAME
@@ -44,7 +44,7 @@ same is true minute-wise for crypto. So between two real source bars there
 may be empty windows. Whether those empty windows should be emitted as
 synthetic flat bars is asset-class dependent, and that decision already
 has ONE home: feeds.base.count_synthetic_for_gap (the arithmetic Service 2
-and contract_discovery share). We reuse it here so the live path fills gaps
+and every REST feed share). We reuse it here so the live path fills gaps
 exactly as the historical path does — see `_emit_gap_fill`. A caller that
 wants raw gaps (no synthetic fill) passes fill_gaps=False.
 

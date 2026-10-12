@@ -1,5 +1,13 @@
 # Trading Backend
 
+> **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
+> The system is being re-architected for Coinbase Advanced Trade spot,
+> long-only, crypto-only. Phases 0–1 are done: IBKR and Binance execution, the
+> legacy executor, and the Polygon equity/fx/options feeds are deleted;
+> `two_ladder` and `prior_failure_scaleout` are disabled. The executor will not
+> start until the Coinbase adapter lands (Phase 4). Sections below that describe
+> IBKR, Binance execution or Polygon are out of date until the Phase 6 rewrite.
+
 A headless, multi-strategy trading system. It ingests market-data bars, runs
 Sumtyme causal-chain state machines over a configurable timeframe ladder, applies
 one or more chain strategies, and emits **trade signals** to Postgres. A separate
@@ -141,15 +149,15 @@ separately — one process per venue (`EXECUTOR_VENUE=ibkr|binance`).
 
 ## 6. Configuration
 
-Environment (`.env`):
+Environment (`.env`; every variable is listed in `.env.example`):
 
 | Var | Required by | Purpose |
 |---|---|---|
 | `TRADING_DB_URL` | all | Postgres DSN; must bypass RLS (service role/owner) |
 | `SUMTYME_API_KEY` | signal | forecast API |
-| `POLYGON_API_KEY` | feed | equity/fx data |
 | `KAFKA_BOOTSTRAP` | all | defaults `localhost:9092`; compose sets `kafka:9092` |
-| `EXECUTOR_VENUE` | executor | `ibkr` (default) or `binance` |
+| `EXECUTOR_VENUE` | executor | `coinbase` (default; the only venue, ADR-001) |
+| `COINBASE_API_KEY_NAME`, `COINBASE_API_PRIVATE_KEY`, `COINBASE_PORTFOLIO_UUID` | executor | CDP key scoped to the bot portfolio (from Phase 4) |
 | `FORECAST_CONCURRENCY` | signal | in-flight Sumtyme calls (capacity ceiling) |
 | `SUMTYME_TIMEOUT_S`, `SYMBOL_QUEUE_MAX`, `LAG_WARN_S` | signal | backpressure + lag alarms |
 

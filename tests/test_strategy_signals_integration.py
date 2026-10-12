@@ -14,7 +14,7 @@ import asyncpg
 import pytest
 
 from execution.signal_writer import SignalWriter, SignalWriterHooks
-from execution.persistence import make_insert_signal
+from producer.persistence import make_insert_signal
 from execution.types import TradeSide
 
 DSN = os.environ.get("QISS_TEST_DSN")

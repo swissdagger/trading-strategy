@@ -5,7 +5,7 @@ Two things must hold:
 
 1. EQUIVALENCE: for any set of source bars, the streaming aggregator's
    emitted windows equal what the batch resampler
-   (polygon_options._resample_to_timeframe) produces for the closed
+   (feeds.resample._resample_to_timeframe) produces for the closed
    windows — same OHLC, same window starts. The streaming path must not
    invent a second, subtly-different bucketing rule.
 
@@ -14,8 +14,7 @@ Two things must hold:
    count_synthetic_for_gap.
 
 We reimplement the batch rule locally (identical arithmetic) as the oracle
-rather than importing polygon_options, which drags httpx and the whole
-feed. The rule is four lines; duplicating it in the test as an independent
+rather than importing feeds.resample. The rule is four lines; duplicating it in the test as an independent
 oracle is the point — if the aggregator and this oracle agree, the rule is
 right.
 """

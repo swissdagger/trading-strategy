@@ -330,14 +330,16 @@ def test_history_retains_terminated_chains():
     assert chains[0].peak_level == 1   # failed before 3m
 
 
-def test_history_evicts_stale():
+def test_history_evicts_oldest_over_count_cap():
+    # Retention is a per-symbol COUNT cap (no time window: four_chain's pattern
+    # span is unbounded). Over the cap, the oldest by first_seen goes.
     lad = ladder()
-    view = ChainHistoryView(lad, retention=timedelta(minutes=30))
-    feed(view, "BTCUSDT", "old", 1, 4, 0)      # t=0
-    feed(view, "BTCUSDT", "new", 1, 4, 45)     # t=45 -> evicts 'old' (>30m)
+    view = ChainHistoryView(lad, max_chains_per_symbol=2)
+    feed(view, "BTCUSDT", "old", 1, 4, 0)
+    feed(view, "BTCUSDT", "mid", 1, 4, 45)
+    feed(view, "BTCUSDT", "new", 1, 4, 90)
     ids = [c.chain_id for c in view.chains("BTCUSDT")]
-    assert "old" not in ids
-    assert "new" in ids
+    assert ids == ["mid", "new"]
 
 
 def test_failed_between_detects_opposing_failure():

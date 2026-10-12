@@ -21,7 +21,7 @@ import httpx
 from feeds.base import AssetFeed, LiveDataCallback, is_market_open
 from producer.bar import OHLCPoint
 from producer.bar import RateLimiter
-from feeds.polygon_options import _parse_timeframe, _resample_to_timeframe
+from feeds.resample import _parse_timeframe, _resample_to_timeframe
 
 logger = logging.getLogger(__name__)
 

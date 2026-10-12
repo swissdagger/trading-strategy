@@ -6,6 +6,7 @@ orchestration (boot sequence, ENTER/EXIT flows, gating, reconcile-HALT,
 idempotency) is tested without a venue or a DB. The pricing is the real
 price_marketable_limit; the fakes supply touch and caps.
 """
+import dataclasses
 from decimal import Decimal
 
 import pytest
@@ -27,7 +28,7 @@ from execution import client_order_id as coid
 # --------------------------------------------------------------------
 
 class FakeAdapter:
-    venue = "ibkr"
+    venue = "fake"
     supported_classes = {"equity"}
     def __init__(self):
         self.connected = False
@@ -50,11 +51,14 @@ class FakeAdapter:
         return self.reconcile_result.positions
     async def submit_order(self, order):
         self.submitted.append(order)
+        # A real venue echoes the client_order_id it was sent. Scripted results
+        # carry a placeholder id; stamp the order's real (cv1) id on them so the
+        # executor's venue_order_id -> client_order_id bridge resolves.
         if self._queue:
-            return self._queue.pop(0)
+            return self._echo(order, self._queue.pop(0))
         if self._next_result is not None:
             r, self._next_result = self._next_result, None
-            return r
+            return self._echo(order, r)
         # Default: filled in full synchronously.
         return OrderResult(
             client_order_id=order.client_order_id, status=OrderStatus.FILLED,
@@ -68,6 +72,9 @@ class FakeAdapter:
         return OrderResult(client_order_id=cid, status=OrderStatus.WORKING)
     def to_venue_symbol(self, s):
         return s
+    @staticmethod
+    def _echo(order, result):
+        return dataclasses.replace(result, client_order_id=order.client_order_id)
     def set_next_result(self, r):
         self._next_result = r
 
@@ -337,11 +344,17 @@ async def test_fill_dedup_by_venue_exec_id():
     hooks, state = make_hooks()
     ex = SignalExecutor(adapter, hooks)
     await ex.start()
-    f = Fill(venue_exec_id="dup-1", qty=Decimal("5"), price=Decimal("100"),
-             intent=OrderIntent.ENTRY, filled_at_ms=1)
+    adapter.set_next_result(OrderResult(
+        client_order_id="placeholder", status=OrderStatus.WORKING,
+        venue_order_id="VO-D", filled_qty=Decimal("0"), fills=[]))
+    await ex.handle_signal(enter_row())
+    trade = ex._open[("two_ladder", "chainX:L")]
+    f = Fill(venue_exec_id="dup-1", venue_order_id="VO-D", qty=Decimal("5"),
+             price=Decimal("100"), intent=OrderIntent.ENTRY, filled_at_ms=1)
     await ex._on_fill(f)
     await ex._on_fill(f)   # re-delivery
     assert len(state["fills"]) == 1   # deduped
+    assert trade.filled_qty == Decimal("5")   # counted once
 
 
 # --------------------------------------------------------------------
@@ -595,19 +608,22 @@ async def test_async_partial_exit_fill_then_remainder():
 
 
 @pytest.mark.asyncio
-async def test_async_fill_unattributable_persisted_not_dropped():
+async def test_async_fill_unattributable_counted_not_persisted():
+    from execution.observability import Metrics
     adapter = FakeAdapter()
     hooks, state = make_hooks()
-    ex = SignalExecutor(adapter, hooks)
+    metrics = Metrics()
+    ex = SignalExecutor(adapter, hooks, metrics=metrics)
     await ex.start()
     # A fill for an order we don't know (foreign/manual, or pre-start).
     await ex._on_fill(Fill(
         venue_exec_id="foreign-1", venue_order_id="UNKNOWN-ORDER",
         qty=Decimal("1"), price=Decimal("100"),
         intent=OrderIntent.ENTRY, filled_at_ms=5))
-    # Persisted (not dropped), but with no trade attribution.
-    assert "foreign-1" in state["fills"]
-    assert state["fills"]["foreign-1"]["trade_id"] is None
+    # fills.trade_id is NOT NULL, so it cannot be stored; it is counted and left
+    # for the reconcile sweep. Never guessed onto a trade.
+    assert "foreign-1" not in state["fills"]
+    assert metrics.snapshot()["counters"]["fills_unattributable"] == 1
 
 
 @pytest.mark.asyncio
