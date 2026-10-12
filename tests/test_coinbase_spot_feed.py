@@ -242,3 +242,51 @@ async def test_live_polls_each_symbol():
     cursors = {"BTC-USD": (T0 - 60) * 1000, "ETH-USD": (T0 - 60) * 1000}
     batch = await feed.poll_once(["BTC-USD", "ETH-USD"], "1m", cursors)
     assert sorted(p.symbol for p in batch) == ["BTC-USD", "ETH-USD"]
+
+
+# --------------------------------------------------------------------
+# Live catch-up from a stale cursor (restart / slow start)
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_live_catches_up_from_a_cursor_older_than_the_lookback():
+    # Cursor 40 minutes behind: a fixed lookback would have skipped ~34 bars.
+    fake = FakeCoinbase(now_s=T0 + 10)
+    feed = make_feed(fake)
+    cursors = {"BTC-USD": (T0 - 40 * 60) * 1000}
+    batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
+    ts = [p.timestamp // 1000 for p in batch]
+    assert ts == list(range(T0 - 40 * 60, T0, 60))
+    assert cursors["BTC-USD"] == T0 * 1000
+
+
+@pytest.mark.asyncio
+async def test_live_catch_up_pages_forward_within_the_request_cap():
+    fake = FakeCoinbase(now_s=T0 + 10)
+    feed = make_feed(fake)
+    cursors = {"BTC-USD": (T0 - 700 * 60) * 1000}       # 700 minutes: three pages
+    batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
+    assert len(batch) == 700
+    assert len(fake.requests) == 3
+    assert all((e - s) // 60 + 1 <= 350 for _, _, s, e in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_live_derived_catch_up_from_stale_cursor():
+    fake = FakeCoinbase(now_s=T0 + 10)
+    feed = make_feed(fake)
+    cursors = {"BTC-USD": (T0 - 30 * 60) * 1000}
+    batch = await feed.poll_once(["BTC-USD"], "3m", cursors)
+    assert [p.timestamp // 1000 for p in batch] == list(range(T0 - 30 * 60, T0, 180))
+
+
+@pytest.mark.asyncio
+async def test_live_catch_up_is_clamped_for_very_old_cursors():
+    from feeds.coinbase_spot import MAX_CATCHUP_PAGES, _PAGE_CANDLES
+    fake = FakeCoinbase(now_s=T0 + 10)
+    feed = make_feed(fake)
+    cursors = {"BTC-USD": (T0 - 30 * 86_400) * 1000}    # a month behind
+    batch = await feed.poll_once(["BTC-USD"], "1m", cursors)
+    assert len(fake.requests) <= MAX_CATCHUP_PAGES + 1
+    assert len(batch) <= MAX_CATCHUP_PAGES * _PAGE_CANDLES
+    assert batch and batch[-1].timestamp == (T0 - 60) * 1000

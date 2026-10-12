@@ -32,8 +32,10 @@ re-enabling PF needs no feed change.
 
 One REST poll loop per timeframe at ~tf/2 (8s floor, 600s ceiling), closed
 windows only, per-(symbol, tf) high-water cursor seeded from warmup's
-feed_cursors — the same shape as the Binance feed it replaces. A window is
-emitted only once it is provably complete:
+feed_cursors — the same shape as the Binance feed it replaces. Each poll reads
+from the cursor forward, so a restart or slow start catches up instead of
+skipping the windows in between. A window is emitted only once it is provably
+complete:
   * its end is at least SETTLE_MS in the past (Coinbase publishes a candle a
     moment after the minute closes), and
   * for a DERIVED window, its last constituent base candle is present — or one
@@ -87,9 +89,14 @@ _PAGE_CANDLES = 300
 # A closed candle is trusted only this long after its window ends.
 SETTLE_MS = 5_000
 
-# Live polls look back this many target windows per request: enough to cover
-# a missed poll or two without re-reading history.
+# Live polls always read at least this many recent target windows (so a
+# derived window's base candles are present), and otherwise read from the
+# cursor forward.
 _LIVE_LOOKBACK_WINDOWS = 6
+
+# How far a live poll will catch up from a stale cursor before clamping:
+# 20 pages x 300 base candles = 100 hours of 1m. Longer gaps need a re-warmup.
+MAX_CATCHUP_PAGES = 20
 
 
 def base_timeframe(tf: str) -> str:
@@ -264,19 +271,47 @@ class CoinbaseSpotFeed(AssetFeed):
                          low=b["l"], close=b["c"], timeframe=timeframe,
                          asset_class=self.asset_class)
 
-    async def recent_closed(self, symbol: str, timeframe: str) -> List[OHLCPoint]:
-        """The last few complete windows for (symbol, timeframe), by the live
-        completeness rule. One request."""
+    async def closed_since(self, symbol: str, timeframe: str,
+                           since_ms: int) -> List[OHLCPoint]:
+        """Every complete window starting at or after since_ms, by the live
+        completeness rule, oldest first.
+
+        Reads FROM THE CURSOR, not a fixed lookback: after a restart or a slow
+        start the cursor can be far behind, and a fixed lookback would silently
+        skip every window between the cursor and the lookback. Pages forward
+        (<= _PAGE_CANDLES base candles per request); a normal poll is one
+        request. A cursor more than MAX_CATCHUP_PAGES pages behind is clamped
+        to that much history (logged) — far longer gaps are a re-warmup."""
         base_tf = base_timeframe(timeframe)
+        base_ms = timeframe_to_ms(base_tf)
         tf_ms = timeframe_to_ms(timeframe)
         now = self._now_ms()
-        start_s = (now - _LIVE_LOOKBACK_WINDOWS * tf_ms) // 1000
-        page = await self._fetch_page(symbol, base_tf, start_s, now // 1000)
-        if not page:
-            return []
-        by_t = {r["t"]: r for r in page}
+        page_ms = _PAGE_CANDLES * base_ms
+        # Read at least the last few windows, so the derived-window rule has
+        # the base candles it needs even when the cursor is current.
+        start_ms = min(since_ms, now - _LIVE_LOOKBACK_WINDOWS * tf_ms)
+        earliest = now - MAX_CATCHUP_PAGES * page_ms
+        if start_ms < earliest:
+            logger.warning("%s %s: cursor %d is beyond the live catch-up window; "
+                           "reading only the last %d pages (re-run warmup to backfill)",
+                           symbol, timeframe, since_ms, MAX_CATCHUP_PAGES)
+            start_ms = earliest
+        # Align to the target window so the first window is read whole.
+        start_ms = start_ms // tf_ms * tf_ms
+        by_t: Dict[int, dict] = {}
+        page_start = start_ms
+        while page_start < now:
+            page_end = min(page_start + page_ms, now)
+            page = await self._fetch_page(symbol, base_tf, page_start // 1000,
+                                          page_end // 1000)
+            if page is None:
+                break   # error already logged; emit what is complete so far
+            for r in page:
+                by_t[r["t"]] = r
+            page_start = page_end
         return [self._point(symbol, timeframe, b)
-                for b in self._closed_target_bars(by_t, timeframe, now, final=False)]
+                for b in self._closed_target_bars(by_t, timeframe, now, final=False)
+                if b["t"] >= since_ms]
 
     # ------------------------------------------------------------------
     # LIVE (REST polling)
@@ -327,7 +362,7 @@ class CoinbaseSpotFeed(AssetFeed):
         tf_ms = timeframe_to_ms(tf)
         batch: List[OHLCPoint] = []
         for sym in symbols:
-            for p in await self.recent_closed(sym, tf):
+            for p in await self.closed_since(sym, tf, cursors[sym]):
                 if p.timestamp >= cursors[sym]:
                     batch.append(p)
                     cursors[sym] = p.timestamp + tf_ms
