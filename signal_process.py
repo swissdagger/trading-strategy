@@ -363,9 +363,9 @@ class SignalProcess:
         # strategy actually reads (compute-once, ownership-gated). The ownership
         # set is the (symbol, ladder) pairs enabled strategies declare; the router
         # intersects its timeframe-matched targets with it, so a symbol-scoped
-        # strategy (e.g. two_ladder on AAPL only, four_chain on BTCUSDT only)
-        # doesn't make the router compute A/B chains for BTCUSDT just because
-        # BTCUSDT emits a shared timeframe (1m). Snapshot the set once at startup
+        # strategy (e.g. two_ladder on AAPL only, four_chain on BTC-USD only)
+        # doesn't make the router compute A/B chains for BTC-USD just because
+        # BTC-USD emits a shared timeframe (1m). Snapshot the set once at startup
         # (strategies are fixed for the process lifetime). ---
         owned = self.strategies.owned_symbol_ladders()
         self.router = MultiLadderRouter(

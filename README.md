@@ -2,11 +2,14 @@
 
 > **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
 > The system is being re-architected for Coinbase Advanced Trade spot,
-> long-only, crypto-only. Phases 0–1 are done: IBKR and Binance execution, the
-> legacy executor, and the Polygon equity/fx/options feeds are deleted;
-> `two_ladder` and `prior_failure_scaleout` are disabled. The executor will not
-> start until the Coinbase adapter lands (Phase 4). Sections below that describe
-> IBKR, Binance execution or Polygon are out of date until the Phase 6 rewrite.
+> long-only, crypto-only. Done: Phases 0–1 (IBKR and Binance execution, the
+> legacy executor and the Polygon feeds deleted; `two_ladder` and
+> `prior_failure_scaleout` disabled), Phase 3 (executor hardening, shadow book
+> for shorts) and the Phase 2 feed switch (bars now come from Coinbase spot
+> candles; symbols are Coinbase product ids such as `BTC-USD`). The executor
+> will not start until the Coinbase adapter lands (Phase 4). Sections below
+> that describe IBKR, Binance or Polygon are out of date until the Phase 6
+> rewrite.
 
 A headless, multi-strategy trading system. It ingests market-data bars, runs
 Sumtyme causal-chain state machines over a configurable timeframe ladder, applies

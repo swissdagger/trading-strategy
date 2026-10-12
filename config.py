@@ -21,6 +21,16 @@ from __future__ import annotations
 import os
 
 
+# The traded universe: base assets, all quoted in QUOTE_CURRENCY. The product
+# id is f"{base}-{QUOTE_CURRENCY}" (BTC-USD). BNB and TRX were dropped in
+# ADR-001 Phase 1. Changing the quote (e.g. to GBP or USDC) changes every
+# symbol, so it means a fresh DB and a new warmup — and the account must be
+# able to trade that order book.
+CRYPTO_BASES = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "LTC", "NEAR", "AAVE",
+]
+QUOTE_CURRENCY = "USD"
+
 # Per-asset-class universe + the points/baseline the feeds and machine need.
 # 'symbols'    — the tracked universe for this class.
 # 'timeframes' — the bar granularities the feed must produce (= union of the
@@ -30,38 +40,28 @@ import os
 #   each ladder.
 ASSET_CONFIGS = {
     "crypto": {
-        # Binance USDⓈ-M symbol form until the feed moves to Coinbase candles
-        # (ADR-001 Phase 2), when the canonical form becomes the Coinbase
-        # product id (BTC-USD). BNBUSDT and TRXUSDT are dropped per ADR-001
-        # (not part of the Coinbase spot universe).
-        "symbols": [
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "DOGEUSDT",
-            "ADAUSDT",
-            "LINKUSDT",
-            "LTCUSDT",
-            "NEARUSDT",
-            "AAVEUSDT",
-        ],
+        # Coinbase product ids (ADR-001 Phase 2): the canonical symbol
+        # everywhere — Kafka, chains, trades, trade_signals. Built from
+        # CRYPTO_BASES and QUOTE_CURRENCY below.
+        "symbols": [],
         # four_chain's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
         # prior_failure_scaleout's PF rungs (30m..12h) are not fetched while it
         # is disabled; re-add them here (and re-run warmup) before enabling it.
         #
-        # Served by CONTINUOUS REST polling (BinanceFuturesFeed.start_live runs
-        # a per-timeframe poll loop at ~tf/2 cadence, closed-window-only,
-        # relaunched on error by feed_process). transport is 'rest' NOT 'ws':
-        # the Binance futures WEBSOCKET (fstream) is unreachable from cloud
-        # egress IPs — it connects but delivers zero frames. REST (fapi) is
-        # reachable and is all this ladder needs (no sub-minute rungs).
+        # Served by CONTINUOUS REST polling of Coinbase's public candles
+        # endpoint (CoinbaseSpotFeed.start_live: one poll loop per timeframe
+        # at ~tf/2, complete windows only, relaunched on error by
+        # feed_process). 3m has no Coinbase granularity and is derived from
+        # 1m. No websocket feed exists for Coinbase yet.
         "timeframes": ["1m", "3m", "5m", "15m", "1h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "rest",
     },
 }
+
+
+ASSET_CONFIGS["crypto"]["symbols"] = [f"{b}-{QUOTE_CURRENCY}" for b in CRYPTO_BASES]
 
 
 def all_tracked_symbols() -> list[str]:
@@ -76,7 +76,7 @@ def crypto_symbols() -> list[str]:
     """Every tracked CRYPTO symbol.
 
     four_chain runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
-    REST polling; see the crypto ASSET_CONFIGS note). Deriving the
+    REST polling of Coinbase candles; see the crypto ASSET_CONFIGS note). Deriving the
     strategy's universe from ASSET_CONFIGS here — rather than a second hardcoded
     list in STRATEGIES — keeps the traded set in lockstep with the FETCHED set:
     a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in four_chain, and a
@@ -281,7 +281,7 @@ EXTRA_LADDERS = {
 # Rungs whose short/unwarmed buffer is EXPECTED and acceptable, per ladder
 # (ladder name -> timeframes). Downgrades the machine's hydrate fill report
 # from WARNING to INFO for those rungs — logging only; an unwarmed rung is
-# inert either way. PF's 12h needs ~6.9y of venue history (BTCUSDT only), and
+# inert either way. PF's 12h needs ~6.9y of venue history (BTC-USD only), and
 # nothing in prior_failure_scaleout depends on it (schedule tops at 6h).
 LADDER_OPTIONAL_TIMEFRAMES = {
     "PF": ["12h"],

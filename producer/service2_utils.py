@@ -88,7 +88,7 @@ def prepare_dataframe_for_sumtyme(df: pd.DataFrame, timeframe: str):
     #  3. symbol/timeframe are constant across every row and redundant in step
     #     mode (the series is an ordered sequence of morphisms — Sumtyme is told
     #     which instrument and interval via the interval/interval_unit args). 5001
-    #     repeated copies of "BTCUSDT"/"1m"/"crypto" nearly DOUBLED the payload:
+    #     repeated copies of "BTC-USD"/"1m"/"crypto" nearly DOUBLED the payload:
     #     664KB -> 369KB per call once removed.
     #
     # Keep OHLC (the actual data) and nothing else. The step column is added below.

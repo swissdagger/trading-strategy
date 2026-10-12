@@ -154,10 +154,10 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ### Phase 2 — Feed → Coinbase candles
 
-- [ ] `feeds/coinbase_spot.py` implementing `AssetFeed`: `fetch_history` via public candles endpoint (paginated; granularities 1m/5m/15m/30m/1h/2h/6h/1d); `start_live` as REST polling at ~tf/2; native 5m/15m/1h, 3m derived from 1m via `bar_aggregator`.
-- [ ] Canonical symbol form becomes the Coinbase product id (`BTC-USD`) throughout (`universe.py`, chains, trades). Fresh DB; no migration of history.
-- [ ] Delete `feeds/binance_futures.py`, `feeds/binance_ws.py` and tests once the Coinbase feed is verified by a warmup run.
-- [ ] Record the series-provenance change in `RUNBOOK.md`.
+- [x] `feeds/coinbase_spot.py` implementing `AssetFeed`: `fetch_history` via public candles endpoint (paginated; granularities 1m/5m/15m/30m/1h/2h/6h/1d); `start_live` as REST polling at ~tf/2; native 5m/15m/1h, 3m derived from 1m via `bar_aggregator`.
+- [x] Canonical symbol form becomes the Coinbase product id (`BTC-USD`) throughout (`universe.py`, chains, trades). Fresh DB; no migration of history.
+- [ ] Delete `feeds/binance_futures.py`, `feeds/binance_ws.py` and tests once the Coinbase feed is verified by a warmup run. *(Pending: the build sandbox cannot reach `api.coinbase.com`; see PR 3 notes.)*
+- [x] Record the series-provenance change in `RUNBOOK.md`.
 - [ ] Rename the `four_chain` strategy, which has implemented the two-chain rules since 2026-08-13: registry key, `FourChainEntry`/`FourChainExit`, `four_chain_strategy.py` / `four_chain_adapter.py`, tests and config. Pick a name that cannot be confused with `two_ladder` (e.g. `confirmed_15m`). Done on the fresh DB because the name is stored in `trade_signals.strategy` / `trades.strategy`, hashed into `signal_id`, and part of the runtime's open-position keys: renaming on a live DB would strand open positions and mix old four-chain rows with two-chain rows under one label. Keep the `FC` ladder name, which is part of chain identity. Before renaming on any non-fresh DB, confirm no open positions are tracked under `four_chain`.
 - [ ] Commit the strategy spec (`trade_strategy_2.md`, cited by `strategy/four_chain_strategy.py`) under `docs/strategies/` and point the strategy docstring at it.
 
@@ -272,3 +272,12 @@ Each phase is independently mergeable and leaves the system runnable.
 - **Bugs found and fixed along the way:** `GatedAdapter` was still abstract (missing `get_touch` / `get_account_equity` / `get_step_size`), so `run_executor.py` would have crashed on start; `run_executor.py` never started the escalation loop, so unfilled exits would never escalate or HALT; the three existing real-Postgres integration test modules used plain `@pytest.fixture` for async fixtures and errored whenever `QISS_TEST_DSN` was set.
 - **CI** now runs the integration tests: a Postgres 16 service, all migrations applied, `QISS_TEST_DSN` set.
 - `boot.run_boot_reconcile` is netted as specified, but nothing calls it: `SignalExecutor.start()` runs its own reconcile, which is the live path.
+
+### PR 3 (Phase 2, feed)
+
+- **Not yet verified against the live API.** The build sandbox's network policy blocks `api.coinbase.com`, so the feed was written against Coinbase's documented public candles endpoint and tested offline against a fake that mirrors it (newest-first pages, string prices, forming candle included, no-trade intervals omitted, 350-candle cap). The first real warmup is the verification; until it passes, `feeds/binance_*` stay in the tree, unwired.
+- **Completeness rule (live):** a window is emitted only once its end is `SETTLE_MS` (5 s) in the past, and a derived window (3m from 1m) only once its last base candle is published, or one base interval of grace has passed (that minute had no trades). Without this, a 3m bar polled just after its window closed could miss its final minute and never be corrected, because the cursor moves past it.
+- **Derived rungs:** 3m from 1m for four_chain; 4h from 1h and 12h from 6h so the disabled PF ladder still has a feed. No synthetic gap-filling: Coinbase omits no-trade intervals, and they pass through as gaps, as the batch resampler always did.
+- **Symbols** are built from `config.CRYPTO_BASES` and `config.QUOTE_CURRENCY` (`USD`), so switching the quote (GBP, USDC) is a one-line change. Confirm the account can trade the `-USD` books before Phase 4; the signal series can come from the deepest book even if execution later uses another quote, but then signal and fill differ by that cross.
+- `transport='ws'` now fails loudly at startup: no Coinbase websocket feed exists, and the Binance ws feed wrapped a Binance REST engine.
+- Still open in Phase 2: the `four_chain` rename and committing `trade_strategy_2.md` (needs the file from the owner).

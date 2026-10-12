@@ -102,7 +102,7 @@ class Env:
         await self.ex.handle_signal({
             "signal_id": f"sig-enter-{pkey}", "position_key": pkey,
             "chain_id": pkey.split(":")[0], "direction": "LONG", "action": "ENTER",
-            "symbol": "BTCUSDT", "asset_class": "crypto",
+            "symbol": "BTC-USD", "asset_class": "crypto",
             "strategy": "prior_failure_scaleout", "trigger_level": 2,
             "decision_price": 100.0, "exit_reason": None, "fraction": 1.0,
             "decided_at": "t"})
@@ -112,7 +112,7 @@ class Env:
         await self.ex.handle_signal({
             "signal_id": f"sig-scale-{pkey}-{level}", "position_key": pkey,
             "chain_id": pkey.split(":")[0], "direction": "LONG", "action": "EXIT",
-            "symbol": "BTCUSDT", "asset_class": "crypto",
+            "symbol": "BTC-USD", "asset_class": "crypto",
             "strategy": "prior_failure_scaleout", "trigger_level": level,
             "decision_price": 100.0, "exit_reason": "SCALE", "fraction": fraction,
             "decided_at": "t"})
@@ -121,7 +121,7 @@ class Env:
         await self.ex.handle_signal({
             "signal_id": f"sig-{reason}-{pkey}", "position_key": pkey,
             "chain_id": pkey.split(":")[0], "direction": "LONG", "action": "EXIT",
-            "symbol": "BTCUSDT", "asset_class": "crypto",
+            "symbol": "BTC-USD", "asset_class": "crypto",
             "strategy": "prior_failure_scaleout", "trigger_level": None,
             "decision_price": 100.0, "exit_reason": reason, "fraction": fraction,
             "decided_at": "t"})
@@ -249,7 +249,7 @@ async def main():
     # fills advances the correct deficit.
     e = Env()
     t = OpenTrade(trade_id="0" * 32, strategy="prior_failure_scaleout",
-                  position_key="chainR:L", symbol="BTCUSDT", asset_class="crypto",
+                  position_key="chainR:L", symbol="BTC-USD", asset_class="crypto",
                   side=TradeSide.LONG, target_qty=Decimal(100),
                   filled_qty=Decimal(100), state="OPEN",
                   entry_client_order_id=coid.build("0" * 32, OrderIntent.ENTRY, 0),

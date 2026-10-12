@@ -2,8 +2,8 @@
 feed_process.py — Polls market data and publishes closed bars to Kafka.
 
 The PRODUCER of the trading-bars topic the signal process consumes. It reuses the
-existing, trusted AssetFeed implementations (BinanceFuturesFeed today; the
-Coinbase spot feed in ADR-001 Phase 2) — it does NOT reimplement polling, pagination, or rate
+existing, trusted AssetFeed implementations (CoinbaseSpotFeed since ADR-001
+Phase 2) — it does NOT reimplement polling, pagination, or rate
 limiting. Each feed's start_live(symbols, timeframes, cursors, callback) runs for
 the process lifetime and calls back with batches of closed OHLC bars; this process
 wires that callback to "publish each bar to Kafka trading-bars".
@@ -48,15 +48,16 @@ def _build_rest_feed(asset_class: str, symbols: list, timeframes: list):
     (it becomes the ws feed's backfill engine), so the two paths can't build
     the REST feed differently.
 
-    Crypto-only since ADR-001 Phase 1 (equity/fx Polygon feeds deleted). A
-    future equities feed adds its branch here.
+    Crypto-only since ADR-001 Phase 1 (equity/fx Polygon feeds deleted); the
+    crypto feed is Coinbase spot candles since Phase 2. A future equities feed
+    adds its branch here.
 
     Lazy imports keep the module loadable without every feed's deps present
     and avoid importing a feed for a class that has no symbols configured.
     """
     if asset_class == "crypto":
-        from feeds.binance_futures import BinanceFuturesFeed
-        return BinanceFuturesFeed(symbols, timeframes)
+        from feeds.coinbase_spot import CoinbaseSpotFeed
+        return CoinbaseSpotFeed(symbols, timeframes)
     return None
 
 
@@ -66,13 +67,9 @@ def _build_ws_feed(asset_class: str, backfill_feed):
     no ws feed (config.transport_for already rejects ws for such classes, so
     this is defence in depth, not the primary guard).
     """
-    if asset_class == "crypto":
-        # Binance ws needs no api_key (public market streams); the backfill
-        # sibling (BinanceFuturesFeed) is the outage-fetch engine, though it
-        # only covers 1m+ rungs — sub-minute rungs self-heal live. See
-        # binance_ws for the backfill-asymmetry note.
-        from feeds.binance_ws import BinanceFuturesWSFeed
-        return BinanceFuturesWSFeed(backfill_feed)
+    # No class has a websocket feed since ADR-001 Phase 2: the Binance ws feed
+    # wrapped a Binance REST backfill engine and does not apply to Coinbase.
+    # A Coinbase websocket feed would add its branch here.
     return None
 
 
