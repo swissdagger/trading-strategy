@@ -253,7 +253,7 @@ async def test_two_strategies_same_chain_two_trades():
     ex = SignalExecutor(adapter, hooks)
     await ex.start()
     await ex.handle_signal(enter_row(strategy="two_ladder"))
-    await ex.handle_signal(enter_row(strategy="four_chain"))
+    await ex.handle_signal(enter_row(strategy="confirmed_15m"))
     # Same chain, different strategies -> two distinct trades.
     assert len(state["trades"]) == 2
     assert len(adapter.submitted) == 2

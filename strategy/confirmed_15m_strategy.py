@@ -1,3 +1,10 @@
+"""
+strategy/confirmed_15m_strategy.py — the confirmed_15m entry/exit rules.
+
+Spec: docs/strategies/confirmed_15m.md (the rules as implemented here). The
+strategy was called four_chain until ADR-001 Phase 2; its current two-chain
+rules date from 2026-08-13, when it replaced the earlier four-chain pattern.
+"""
 from __future__ import annotations
 
 import logging
@@ -9,7 +16,7 @@ from execution.types import ExitReason, TradeSide
 from strategy.chain_history import ChainHistoryView, ChainLifecycle
 from strategy.ladder_registry import Ladder
 
-log = logging.getLogger("strategy.four_chain")
+log = logging.getLogger("strategy.confirmed_15m")
 
 _FUNNEL_SUMMARY_EVERY = 25
 
@@ -18,9 +25,10 @@ def _side(direction: int) -> TradeSide:
     return TradeSide.LONG if direction == 1 else TradeSide.SHORT
 
 
-class FourChainEntry:
-    """Entry logic strictly aligned with the requested trade_strategy_2.md rules.
-    (Class name retained as FourChainEntry to avoid refactoring)."""
+class Confirmed15mEntry:
+    """Entry: a chain propagating to 15m (Chain 2), preceded by an
+    initiation pattern (Chain 1 + an opposing failure between them) and a
+    closed same-direction chain that reached 1h. See the spec for details."""
 
     def __init__(self, view: ChainHistoryView, ladder: Ladder, writer: SignalWriter):
         self.view = view
@@ -87,7 +95,7 @@ class FourChainEntry:
         )
         
         log.info(
-            "four_chain ENTER %s dir=%d chain_2=%s chain_1=%s",
+            "confirmed_15m ENTER %s dir=%d chain_2=%s chain_1=%s",
             symbol, d, chain_id, chain_1.chain_id,
         )
         return pkey
@@ -124,7 +132,7 @@ class FourChainEntry:
 
     def _veto(self, symbol: str, stage: str) -> None:
         self._funnel[f"veto:{stage}"] += 1
-        log.debug("four_chain VETO %s at %s", symbol, stage)
+        log.debug("confirmed_15m VETO %s at %s", symbol, stage)
         triggers = self._funnel["trigger"]
         if triggers % _FUNNEL_SUMMARY_EVERY == 0:
             vetoes = {
@@ -133,15 +141,16 @@ class FourChainEntry:
                 if k.startswith("veto:")
             }
             log.info(
-                "four_chain FUNNEL: triggers=%d init_ok=%d entered=%d vetoes=%s",
+                "confirmed_15m FUNNEL: triggers=%d init_ok=%d entered=%d vetoes=%s",
                 triggers, self._funnel["init_pattern_ok"],
                 self._funnel["entered"], vetoes,
             )
         return None
 
 
-class FourChainExit:
-    """Exit logic tracking Chain 2."""
+class Confirmed15mExit:
+    """Exit for a position on Chain 2: TARGET when Chain 2 reaches 1h, STOP
+    when an open opposing chain reaches 5m."""
 
     def __init__(self, view: ChainHistoryView, ladder: Ladder, writer: SignalWriter):
         self.view = view
@@ -187,5 +196,5 @@ class FourChainExit:
             decided_at=decided_at,
             decision_price=decision_price,
         )
-        log.info("four_chain EXIT %s chain_2=%s reason=%s", symbol, chain_prime_id, reason.value)
+        log.info("confirmed_15m EXIT %s chain_2=%s reason=%s", symbol, chain_prime_id, reason.value)
         return pkey

@@ -1,25 +1,25 @@
 """
 write_path_probe_fc.py — Deterministic end-to-end probe of the trade_signals
-write path for the FOUR_CHAIN strategy.
+write path for the CONFIRMED_15M strategy.
 
-Companion to write_path_probe.py (which covers two_ladder). four_chain has a
+Companion to write_path_probe.py (which covers two_ladder). confirmed_15m has a
 completely different gate — a start-ordered initiation+confirmation pattern
 across the [1m,3m,5m,15m,1h] ladder — so this builds a synthetic chain sequence
-that legitimately satisfies it, driven through the REAL make_four_chain factory,
-the REAL FourChainEntry/Exit, the REAL MultiStrategyRuntime, writer, insert, and
+that legitimately satisfies it, driven through the REAL make_confirmed_15m factory,
+the REAL Confirmed15mEntry/Exit, the REAL MultiStrategyRuntime, writer, insert, and
 SignalListener. Nothing is hand-inserted; the actual gate fires.
 
-Why a separate four_chain probe matters (beyond "test the other strategy"):
-  * It exercises FourChainExitAdapter.maybe_emit_exit, whose MISSING
-    decision_price parameter made every four_chain exit raise TypeError — the
+Why a separate confirmed_15m probe matters (beyond "test the other strategy"):
+  * It exercises Confirmed15mExitAdapter.maybe_emit_exit, whose MISSING
+    decision_price parameter made every confirmed_15m exit raise TypeError — the
     patched adapter must accept and forward it. The two_ladder probe cannot
-    catch this; only the four_chain exit path does.
+    catch this; only the confirmed_15m exit path does.
   * It exercises the strategy column round-trip under a NON-default strategy
-    name ("four_chain"): the listener SELECT must carry it, and the handler must
+    name ("confirmed_15m"): the listener SELECT must carry it, and the handler must
     NOT fall back to "two_ladder". A regression here silently mislabels every
-    four_chain trade.
+    confirmed_15m trade.
 
-THE PATTERN (verbatim from four_chain_strategy's prose spec), by chain-START
+THE PATTERN (verbatim from confirmed_15m_strategy's prose spec), by chain-START
 time (first_seen == 1m initiation on this ladder):
 
   t=0   PRIME (dir +1) initiates, propagates up to 15m (level 4)
@@ -62,12 +62,12 @@ from strategy.chain_view import ChainView
 from strategy.ladder_registry import LadderRegistry
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks
 from strategy.registry import StrategyRegistry
-from strategy.four_chain_adapter import make_four_chain
+from strategy.confirmed_15m_adapter import make_confirmed_15m
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("write_path_probe_fc")
 
-STRATEGY_NAME = "four_chain"
+STRATEGY_NAME = "confirmed_15m"
 FC_LADDER = ["1m", "3m", "5m", "15m", "1h"]   # levels 1..5
 NOTIFY_CHANNEL = "trade_signal"
 
@@ -78,9 +78,9 @@ def _iso(base: datetime, seconds: int) -> str:
 
 def _event(*, chain_id: str, event_type: str, symbol: str, direction: int,
            level: int, ts: str, price: float) -> dict:
-    """Raw event in the router's published shape. four_chain reads via
+    """Raw event in the router's published shape. confirmed_15m reads via
     _RawEventView (raw dict), ignoring the A/B 'set' tag, but the runtime routes
-    on 'ladder'; we stamp ladder='FC' so this event is fanned to four_chain and
+    on 'ladder'; we stamp ladder='FC' so this event is fanned to confirmed_15m and
     is NOT folded into the two-ladder ChainView."""
     return {
         "ladder": "FC",
@@ -102,7 +102,7 @@ async def preflight(pool: asyncpg.Pool) -> None:
         "WHERE table_name = 'trade_signals'")}
     if "strategy" not in cols:
         raise SystemExit("PRECONDITION FAILED: trade_signals.strategy missing "
-                         "(migration 011) — four_chain rows would fail to insert")
+                         "(migration 011) — confirmed_15m rows would fail to insert")
     trig = await pool.fetchval(
         "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
         "WHERE c.relname = 'trade_signals' AND NOT t.tgisinternal")
@@ -128,8 +128,8 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
         handled: dict[str, dict] = {}
 
         async def handler(row: dict) -> None:
-            # The four_chain-specific assertion: the listener must carry the
-            # strategy column, and it must read "four_chain", NOT the
+            # The confirmed_15m-specific assertion: the listener must carry the
+            # strategy column, and it must read "confirmed_15m", NOT the
             # "two_ladder" fallback. This is the bug the two_ladder probe can't see.
             if row.get("strategy") != STRATEGY_NAME:
                 failures.append(
@@ -157,7 +157,7 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
         ladder_registry = ladders   # bind for the closure (factory kwarg is also 'ladders')
 
         def _fc_factory(*, name, symbols, ladders, params):
-            return make_four_chain(
+            return make_confirmed_15m(
                 name=name, symbols=symbols, ladders=ladders, params=params,
                 view_registry=ladder_registry, writer_factory=make_writer)
 
@@ -223,7 +223,7 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
             "SELECT * FROM trade_signals WHERE symbol=$1 AND action='ENTER'",
             symbol)
         if enter is None:
-            failures.append("ENTER missing after a fully-formed four_chain pattern")
+            failures.append("ENTER missing after a fully-formed confirmed_15m pattern")
         else:
             checks = {
                 "strategy": STRATEGY_NAME,
@@ -237,7 +237,7 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
                 got = enter[k]
                 if (float(got) if k == "decision_price" else got) != want:
                     failures.append(f"ENTER.{k}: expected {want!r}, got {got!r}")
-            log.info("PHASE 1 OK: four_chain ENTER %s (pkey=%s price=%s)",
+            log.info("PHASE 1 OK: confirmed_15m ENTER %s (pkey=%s price=%s)",
                      enter["signal_id"], enter["position_key"],
                      enter["decision_price"])
 
@@ -258,7 +258,7 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
             symbol)
         if exit_row is None:
             failures.append(
-                "EXIT missing after opposing chain hit 5m — the four_chain exit "
+                "EXIT missing after opposing chain hit 5m — the confirmed_15m exit "
                 "adapter likely rejected decision_price (the patched bug)")
         else:
             if exit_row["exit_reason"] != "STOP":
@@ -267,9 +267,9 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
                 failures.append(f"EXIT decision_price: expected 100.5, got "
                                 f"{exit_row['decision_price']!r}")
             if exit_row["strategy"] != STRATEGY_NAME:
-                failures.append(f"EXIT.strategy: expected four_chain, got "
+                failures.append(f"EXIT.strategy: expected confirmed_15m, got "
                                 f"{exit_row['strategy']!r}")
-            log.info("PHASE 3 OK: four_chain EXIT %s (reason=%s price=%s)",
+            log.info("PHASE 3 OK: confirmed_15m EXIT %s (reason=%s price=%s)",
                      exit_row["signal_id"], exit_row["exit_reason"],
                      exit_row["decision_price"])
 
@@ -282,12 +282,12 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
         if expected - set(notifies):
             failures.append(f"pg_notify missing for: {expected - set(notifies)}")
         else:
-            log.info("PHASE 2 OK: pg_notify observed for both four_chain signals")
+            log.info("PHASE 2 OK: pg_notify observed for both confirmed_15m signals")
         if expected - set(handled):
             failures.append(f"listener never dispatched: {expected - set(handled)}")
         else:
             log.info("PHASE 2 OK: SignalListener dispatched both "
-                     "(strategy column = four_chain, not the two_ladder fallback)")
+                     "(strategy column = confirmed_15m, not the two_ladder fallback)")
 
         listener_task.cancel()
         try:
@@ -305,14 +305,14 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
                          "DELETE FROM trade_signals WHERE symbol=$1", symbol))
 
         if failures:
-            print("\n=== FOUR_CHAIN WRITE-PATH PROBE: FAIL ===")
+            print("\n=== CONFIRMED_15M WRITE-PATH PROBE: FAIL ===")
             for f in failures:
                 print(f"  ✗ {f}")
             return 1
-        print("\n=== FOUR_CHAIN WRITE-PATH PROBE: PASS ===")
+        print("\n=== CONFIRMED_15M WRITE-PATH PROBE: PASS ===")
         print("  pattern gates -> insert -> commit -> NOTIFY -> listener -> "
               "handler: all verified (incl. exit adapter decision_price + "
-              "strategy=four_chain round-trip)")
+              "strategy=confirmed_15m round-trip)")
         return 0
     finally:
         await pool.close()

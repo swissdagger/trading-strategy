@@ -4,7 +4,7 @@ producer/fanout_router_multi.py — generalized bars-in, tagged-events-out route
 The multi-ladder generalization of producer/fanout_router.py. The original router
 is hardwired to the two-ladder ChainSet enum (A/B); this one keys machines by
 LADDER NAME from the LadderRegistry, so it can run ANY set of ladders — the
-two-ladder A/B AND the four-chain FC ladder [1m,3m,5m,15m,1h] — in one process,
+two-ladder A/B AND the confirmed_15m FC ladder [1m,3m,5m,15m,1h] — in one process,
 computing each ladder's chains once (compute-once: a ladder shared by strategies
 runs a single machine per symbol).
 
@@ -25,7 +25,7 @@ WHAT'S GENERALIZED:
     two-ladder ChainView (which consumes a ChainSet `set` tag), when the ladder
     name is a known ChainSet value ("A"/"B") we ALSO populate `set`; for other
     ladders `set` is left as the ladder name string. Consumers that key on the
-    ladder name (the four-chain adapter) read `ladder`; the two-ladder ChainView
+    ladder name (the confirmed_15m adapter) read `ladder`; the two-ladder ChainView
     reads `set` and only ever sees A/B events (its strategies only subscribe to
     A/B), so it is unaffected.
 
@@ -166,7 +166,7 @@ class MultiLadderRouter:
         and, for A/B ladders, `set` too (so the two-ladder ChainView's
         from_raw, which requires `set`, keeps working). For non-ChainSet ladders
         `set` is set to the ladder name so from_raw doesn't raise if a consumer
-        routes such an event through it — though the four-chain adapter reads the
+        routes such an event through it — though the confirmed_15m adapter reads the
         raw dict directly and doesn't require `set`."""
         set_tag = ladder_name  # for A/B this equals the ChainSet value ("A"/"B")
         return {

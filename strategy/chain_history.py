@@ -1,10 +1,10 @@
 """
-strategy/chain_history.py — a chain-history view for the four-chain
+strategy/chain_history.py — a chain-history view for the confirmed_15m
 confirmation strategy.
 
 The two-ladder ChainView tracks only CURRENTLY-ACTIVE chains and keeps just
 (direction, peak_level) — it forgets a chain the moment it terminates and never
-records timestamps. The four-chain confirmation strategy needs more:
+records timestamps. The confirmed_15m confirmation strategy needs more:
 
   * TERMINATED chains, because its initiation phase reasons about a chain that
     FAILED (an opposing 1m chain that terminated before reaching 3m);
@@ -21,7 +21,7 @@ coupling them would entangle two unrelated strategies.
 
 ## Retention: count cap only, no time-based eviction
 
-The four-chain pattern has NO specified span bound: chain_prime and chain_conf
+The confirmed_15m pattern has NO specified span bound: chain_prime and chain_conf
 can in principle be arbitrarily far apart, so a chain far in the past may still
 participate. We therefore do NOT age chains out by time — doing so would silently
 cap the pattern span at the retention window and drop valid signals. Memory is
@@ -32,7 +32,7 @@ In normal operation chain volume is far below the cap (order tens of chains per
 symbol per month), so the cap is a backstop against pathological growth, not a
 routine trim. If it ever bites in practice, raise the cap; if match cost ever
 becomes noticeable at high chain counts, the initiator search in the strategy is
-the place to optimize (see four_chain_strategy._match_pattern).
+the place to optimize (see confirmed_15m_strategy._match_pattern).
 
 ## FUTURE — chain-monitoring encapsulation (deferred, YAGNI)
 
@@ -48,7 +48,7 @@ nothing; if it needs a third variant, the three together will reveal the real
 shared base. The likely long-term shape is a `ChainMonitor` protocol
 (apply(event) + queries) with the runtime owning a SET of monitors and folding
 each event into all of them once — inverting today's "each strategy folds its
-own" (see four_chain_adapter's double-fold) into "runtime folds once per
+own" (see confirmed_15m_adapter's double-fold) into "runtime folds once per
 monitor, strategies subscribe". Deferred deliberately: doing it now would be
 premature generalization from N=2. Do NOT build it until a concrete third
 strategy forces the question.
@@ -154,7 +154,7 @@ class ChainHistoryView:
 
     def _enforce_cap(self, symbol: str) -> None:
         """Bound memory by a per-symbol COUNT cap only (no time-based eviction).
-        The four-chain pattern span is unbounded, so a chain arbitrarily far in
+        The confirmed_15m pattern span is unbounded, so a chain arbitrarily far in
         the past can still participate; we never age chains out by time. If a
         symbol exceeds the cap, drop the oldest by first_seen as a safety net.
         Expected chain volume is far below the cap in normal operation; this is
@@ -268,7 +268,7 @@ class ChainHistoryView:
         and started at or before `before_start`, ordered by START time
         (first_seen), oldest-first.
 
-        The four-chain pattern orders chain_prime and chain_init by chain start,
+        The confirmed_15m pattern orders chain_prime and chain_init by chain start,
         not by when they reached 15m, so ordering keys on first_seen. On this
         ladder first_seen is the true 1m-start (chains always start at 1m and
         propagation never skips). The caller picks the pair whose starts bracket

@@ -44,7 +44,7 @@ ASSET_CONFIGS = {
         # everywhere — Kafka, chains, trades, trade_signals. Built from
         # CRYPTO_BASES and QUOTE_CURRENCY below.
         "symbols": [],
-        # four_chain's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
+        # confirmed_15m's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
         # prior_failure_scaleout's PF rungs (30m..12h) are not fetched while it
         # is disabled; re-add them here (and re-run warmup) before enabling it.
         #
@@ -75,11 +75,11 @@ def all_tracked_symbols() -> list[str]:
 def crypto_symbols() -> list[str]:
     """Every tracked CRYPTO symbol.
 
-    four_chain runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
+    confirmed_15m runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
     REST polling of Coinbase candles; see the crypto ASSET_CONFIGS note). Deriving the
     strategy's universe from ASSET_CONFIGS here — rather than a second hardcoded
     list in STRATEGIES — keeps the traded set in lockstep with the FETCHED set:
-    a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in four_chain, and a
+    a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in confirmed_15m, and a
     symbol can never be traded without also being fed.
     """
     return list(ASSET_CONFIGS.get("crypto", {}).get("symbols", []))
@@ -185,19 +185,19 @@ SHADOW_TAKER_FEE_BPS = 120
 # computed once. Add a strategy: register its factory + add an entry here.
 # ---------------------------------------------------------------------------
 STRATEGIES = {
-    "four_chain": {
+    "confirmed_15m": {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
         # Crypto-only: resolved just below the dict to the current crypto
         # universe so new crypto symbols auto-join.
         "symbols": [],                # set to crypto_symbols() below
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
-        # No time-based retention (four_chain's pattern span is unbounded); the
+        # No time-based retention (confirmed_15m's pattern span is unbounded); the
         # ChainHistoryView is bounded only by a per-symbol count cap. Override it
         # here with 'max_chains_per_symbol' if a symbol ever approaches the
         # default; omitted => the view's default cap.
         "params": {},
     },
-    # prior_failure_scaleout — the loose-gate sibling of four_chain (same
+    # prior_failure_scaleout — the loose-gate sibling of confirmed_15m (same
     # opposing-failure ingredient, no corroboration requirements; ~3x the
     # frequency for a similar edge per the research). Entry: a chain reaching
     # P2 with a recent prior opposing L1-only failure on the same symbol.
@@ -224,7 +224,7 @@ STRATEGIES = {
     "prior_failure_scaleout": {
         "enabled": False,
         # Crypto-only, resolved below to the current crypto universe
-        # (mirrors four_chain).
+        # (mirrors confirmed_15m).
         "symbols": [],
         "ladders": ["PF"],            # [1m..12h] below; entry P2=3m, schedule tops at P9=6h
         "params": {
@@ -263,13 +263,13 @@ STRATEGIES = {
 # no crypto source, and its code stays only because the built-in A/B ladders are
 # woven into the ladder registry (debt D1). The signal process still registers
 # its factory; with no STRATEGIES entry it is never instantiated.
-STRATEGIES["four_chain"]["symbols"] = crypto_symbols()
+STRATEGIES["confirmed_15m"]["symbols"] = crypto_symbols()
 STRATEGIES["prior_failure_scaleout"]["symbols"] = crypto_symbols()
 
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.
 EXTRA_LADDERS = {
-    "FC": ["1m", "3m", "5m", "15m", "1h"],   # four_chain strategy's ladder
+    "FC": ["1m", "3m", "5m", "15m", "1h"],   # confirmed_15m strategy's ladder
     # prior_failure_scaleout's ladder: the research's 10-level hierarchy.
     # Levels: 1m=P1 .. 6h=P9, 12h=P10. Entry at P2 (3m); the scale-out
     # schedule's last tranche is offset 7 = P9 = 6h, so 12h sits ABOVE the

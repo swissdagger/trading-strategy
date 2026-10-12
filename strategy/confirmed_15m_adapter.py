@@ -1,23 +1,23 @@
 """
-strategy/four_chain_adapter.py — bridges the strategy to the
+strategy/confirmed_15m_adapter.py — bridges the strategy to the
 registry's component protocol and feeds its private ChainHistoryView.
 
-The internal logic executes the 2-chain markdown rules, but the interface 
-retains the 'four_chain' naming convention to prevent upstream refactoring.
+Rules: docs/strategies/confirmed_15m.md. The adapter folds every event into
+the strategy's private ChainHistoryView before the entry check runs.
 """
 from __future__ import annotations
 
 from typing import Optional
 
 from strategy.chain_history import ChainHistoryView
-from strategy.four_chain_strategy import FourChainEntry, FourChainExit
+from strategy.confirmed_15m_strategy import Confirmed15mEntry, Confirmed15mExit
 
 
-class FourChainEntryAdapter:
+class Confirmed15mEntryAdapter:
     """EntryComponent for the registry. Folds each event into the shared
     ChainHistoryView, then runs the entry check."""
 
-    def __init__(self, view: ChainHistoryView, entry: FourChainEntry):
+    def __init__(self, view: ChainHistoryView, entry: Confirmed15mEntry):
         self._view = view
         self._entry = entry
 
@@ -42,11 +42,11 @@ class FourChainEntryAdapter:
         )
 
 
-class FourChainExitAdapter:
+class Confirmed15mExitAdapter:
     """ExitComponent for the registry. Does NOT fold the event; just evaluates 
     exit against the shared history view."""
 
-    def __init__(self, exit_: FourChainExit):
+    def __init__(self, exit_: Confirmed15mExit):
         self._exit = exit_
 
     async def maybe_emit_exit(
@@ -64,13 +64,13 @@ class FourChainExitAdapter:
         )
 
 
-def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_factory):
+def make_confirmed_15m(*, name, symbols, ladders, params, view_registry, writer_factory):
     """Strategy factory for the registry."""
     from strategy.registry import Strategy
 
     if len(ladders) != 1:
         raise ValueError(
-            f"four_chain strategy {name!r} must declare exactly one ladder, got {ladders}"
+            f"confirmed_15m strategy {name!r} must declare exactly one ladder, got {ladders}"
         )
     ladder = view_registry.get(ladders[0])
     cap = params.get("max_chains_per_symbol")
@@ -81,12 +81,12 @@ def make_four_chain(*, name, symbols, ladders, params, view_registry, writer_fac
     )
     writer = writer_factory(name)
 
-    entry = FourChainEntry(history, ladder, writer)
-    exit_ = FourChainExit(history, ladder, writer)
+    entry = Confirmed15mEntry(history, ladder, writer)
+    exit_ = Confirmed15mExit(history, ladder, writer)
     return Strategy(
         name=name,
-        entry=FourChainEntryAdapter(history, entry),
-        exit=FourChainExitAdapter(exit_),
+        entry=Confirmed15mEntryAdapter(history, entry),
+        exit=Confirmed15mExitAdapter(exit_),
         symbols=symbols,
         ladders=ladders,
     )

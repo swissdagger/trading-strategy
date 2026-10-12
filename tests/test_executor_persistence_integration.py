@@ -35,7 +35,7 @@ def _row(direction="SHORT", action="ENTER", reason=None, sid=None):
     pkey = f"chainX:{'L' if direction == 'LONG' else 'S'}"
     return {"signal_id": sid or f"sig-{pkey}-{action}", "position_key": pkey,
             "direction": direction, "action": action, "symbol": "BTC-USD",
-            "asset_class": "crypto", "strategy": "four_chain",
+            "asset_class": "crypto", "strategy": "confirmed_15m",
             "decision_price": 100.0, "exit_reason": reason}
 
 
@@ -53,7 +53,7 @@ async def test_shadow_round_trip_persists_and_reloads(pool):
     # A fresh book (restart) reloads the open position.
     book2 = ShadowBook(make_shadow_hooks(pool, get_touch), taker_fee_bps=Decimal("120"))
     await book2.start()
-    assert book2.holds("four_chain", "chainX:S")
+    assert book2.holds("confirmed_15m", "chainX:S")
 
     touch["t"] = Touch(Decimal("98"), Decimal("98.10"))
     await book2.on_exit(_row(action="EXIT", reason="TARGET"))

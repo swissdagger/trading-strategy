@@ -258,7 +258,7 @@ class StrategyRegistry:
         The router computes chains per (symbol, ladder), fanning a bar to EVERY
         ladder whose timeframes contain the bar's timeframe. That over-computes
         once a strategy is scoped to a SUBSET of symbols: e.g. two_ladder on AAPL
-        only and four_chain on BTC-USD only still share the 1m timeframe, so a
+        only and confirmed_15m on BTC-USD only still share the 1m timeframe, so a
         BTC-USD 1m bar would build A/B machines for BTC-USD that NO strategy reads
         (wasted Sumtyme forecasts + junk chains). This set is the ground truth of
         which (symbol, ladder) pairs are actually wanted; the router intersects
