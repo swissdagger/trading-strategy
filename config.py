@@ -155,10 +155,13 @@ VENUE_ENDPOINTS = {
 # Checked under a lock before every ENTER. Placeholder — tune in paper.
 MAX_OPEN_POSITIONS = 5
 
-# An ENTER signal older than this (decided_at -> now) is skipped, never acted
-# on: after downtime the catch-up sweep replays history and a stale entry would
-# buy at a price the strategy never saw. EXITs are ALWAYS honoured regardless of
-# age. Default 2 x the 1m baseline timeframe.
+# An ENTER signal written longer ago than this (trade_signals.created_at ->
+# now) is skipped, never acted on: after executor downtime the catch-up sweep
+# replays history and a stale entry would buy at a price the strategy never
+# saw. Measured from created_at (when the signal was written), NOT decided_at
+# (the triggering bar's window start, already 15+ minutes back for a 15m
+# trigger). EXITs are ALWAYS honoured regardless of age. Default 2 x the 1m
+# baseline timeframe.
 ENTER_MAX_AGE_SECONDS = 2 * 60
 
 # Venue balances the executor ignores when checking for orphans at boot: base

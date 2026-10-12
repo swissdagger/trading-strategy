@@ -36,8 +36,8 @@ feed_cursors — the same shape as the Binance feed it replaces. Each poll reads
 from the cursor forward, so a restart or slow start catches up instead of
 skipping the windows in between. A window is emitted only once it is provably
 complete:
-  * its end is at least SETTLE_MS in the past (Coinbase publishes a candle a
-    moment after the minute closes), and
+  * its end is at least SETTLE_MS (60 s) in the past — Coinbase keeps
+    revising a closed candle for up to ~36 s (measured), and
   * for a DERIVED window, its last constituent base candle is present — or one
     base interval of grace has passed (that minute had no trades). Otherwise a
     3m bar polled just after its window closed could miss its final minute and,
@@ -86,8 +86,13 @@ _SUPPORTED: Set[str] = set(_NATIVE) | set(_DERIVED)
 # inclusive start/end boundary can never push a page over the limit.
 _PAGE_CANDLES = 300
 
-# A closed candle is trusted only this long after its window ends.
-SETTLE_MS = 5_000
+# A closed candle is trusted only this long after its window ends. Coinbase
+# keeps revising a closed candle for a while (late trades): measured live over
+# 148 one-minute windows on the ten USD books, 39% were revised after close,
+# median 12 s, p90 25 s, max 36 s (thin books — ADA, LINK, DOGE — slowest;
+# BTC/ETH/SOL/XRP/LTC within ~7 s). A revised candle can never be corrected
+# once emitted (the cursor moves past it), so this errs long: one full 1m bar.
+SETTLE_MS = 60_000
 
 # Live polls always read at least this many recent target windows (so a
 # derived window's base candles are present), and otherwise read from the

@@ -254,7 +254,13 @@ perpetual klines. Consequences an operator must know:
   granularities; they are aggregated from 1m (1h/6h) with the shared
   resampling rule.
 - **Gaps.** Coinbase returns no candle for an interval with no trades. The
-  feed passes such gaps through rather than fabricating flat bars.
+  feed passes such gaps through rather than fabricating flat bars. Thin books
+  gap a lot at 1m (AAVE-USD: ~17% of minutes, mostly 21:00–01:00 UTC).
+- **Latency.** Coinbase keeps revising a closed candle for up to ~36 s
+  (measured), so the feed waits 60 s after a window ends before emitting it
+  (`SETTLE_MS`). A 1m bar reaches the signal process ~60–90 s after its window
+  closes; a 15m bar likewise. A feed restart catches up from its cursor (up to
+  100 h of 1m); a longer outage needs a re-warmup.
 - **Quote currency** is `config.QUOTE_CURRENCY` (`USD`). It must match an order
   book the account can trade; changing it changes every symbol (fresh DB again).
 - **Network:** the feed and warmup need outbound HTTPS to `api.coinbase.com`.
