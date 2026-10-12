@@ -158,6 +158,8 @@ Each phase is independently mergeable and leaves the system runnable.
 - [ ] Canonical symbol form becomes the Coinbase product id (`BTC-USD`) throughout (`universe.py`, chains, trades). Fresh DB; no migration of history.
 - [ ] Delete `feeds/binance_futures.py`, `feeds/binance_ws.py` and tests once the Coinbase feed is verified by a warmup run.
 - [ ] Record the series-provenance change in `RUNBOOK.md`.
+- [ ] Rename the `four_chain` strategy, which has implemented the two-chain rules since 2026-08-13: registry key, `FourChainEntry`/`FourChainExit`, `four_chain_strategy.py` / `four_chain_adapter.py`, tests and config. Pick a name that cannot be confused with `two_ladder` (e.g. `confirmed_15m`). Done on the fresh DB because the name is stored in `trade_signals.strategy` / `trades.strategy`, hashed into `signal_id`, and part of the runtime's open-position keys: renaming on a live DB would strand open positions and mix old four-chain rows with two-chain rows under one label. Keep the `FC` ladder name, which is part of chain identity. Before renaming on any non-fresh DB, confirm no open positions are tracked under `four_chain`.
+- [ ] Commit the strategy spec (`trade_strategy_2.md`, cited by `strategy/four_chain_strategy.py`) under `docs/strategies/` and point the strategy docstring at it.
 
 ### Phase 3 — Executor hardening (venue-independent; testable with existing fakes)
 
