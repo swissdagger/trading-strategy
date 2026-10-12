@@ -1,10 +1,10 @@
 """
 feeds/streaming_base.py — the resilient websocket supervisor.
 
-This is the shared machinery every websocket feed sits on. binance_ws.py is
-a thin subclass that fills in the source-specific bits (the Polygon ws feeds
-that also sat on it were deleted in ADR-001 Phase 1). All the resilience
-lives here, once.
+This is the shared machinery a websocket feed sits on. No feed uses it since
+ADR-001 (the Polygon and Binance ws feeds are deleted); it is kept, with its
+tests, for a future Coinbase websocket feed. All the resilience lives here,
+once.
 
 ## What "resilient" means concretely
 

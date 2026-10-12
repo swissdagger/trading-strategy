@@ -290,3 +290,37 @@ async def test_live_catch_up_is_clamped_for_very_old_cursors():
     assert len(fake.requests) <= MAX_CATCHUP_PAGES + 1
     assert len(batch) <= MAX_CATCHUP_PAGES * _PAGE_CANDLES
     assert batch and batch[-1].timestamp == (T0 - 60) * 1000
+
+
+# --------------------------------------------------------------------
+# Cursor handoff from warmup
+# --------------------------------------------------------------------
+
+def test_initial_cursor_starts_one_window_past_the_persisted_bar():
+    # feed_cursors holds warmup's NEWEST bar; re-emitting it would put a
+    # duplicate timestamp into the chain machine's buffer.
+    fake = FakeCoinbase(now_s=T0)
+    feed = make_feed(fake)
+    assert feed.initial_cursor({"BTC-USD": {"1m": 1_000_000}}, "BTC-USD", "1m") == 1_060_000
+    assert feed.initial_cursor({"BTC-USD": {"3m": 1_080_000}}, "BTC-USD", "3m") == 1_260_000
+
+
+def test_cold_stream_starts_at_the_last_closed_window():
+    fake = FakeCoinbase(now_s=T0 + 30)
+    feed = make_feed(fake)
+    assert feed.initial_cursor({}, "BTC-USD", "1m") == (T0 - 60) * 1000
+
+
+@pytest.mark.asyncio
+async def test_start_live_does_not_reemit_warmups_newest_bar():
+    fake = FakeCoinbase(now_s=T0 + 10)
+    feed = make_feed(fake, timeframes=("1m",))
+    warm_newest = (T0 - 180) * 1000
+    got = []
+    async def callback(batch):
+        got.extend(batch)
+        feed._running = False
+        raise asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await feed.start_live(["BTC-USD"], ["1m"], {"BTC-USD": {"1m": warm_newest}}, callback)
+    assert [p.timestamp // 1000 for p in got] == [T0 - 120, T0 - 60]

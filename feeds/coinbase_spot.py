@@ -325,13 +325,8 @@ class CoinbaseSpotFeed(AssetFeed):
         async def poll_one_tf(tf: str) -> None:
             tf_ms = timeframe_to_ms(tf)
             interval = min(max(tf_ms // 2000, 8), 600)
-            # Cursor = start of the next window we expect. Seeded from warmup;
-            # a cold rung starts at the most recent closed window.
-            cold = (self._now_ms() // tf_ms - 1) * tf_ms
-            cursors = {
-                sym: initial_cursors.get(sym, {}).get(tf) or cold
-                for sym in symbols
-            }
+            cursors = {sym: self.initial_cursor(initial_cursors, sym, tf)
+                       for sym in symbols}
             logger.info("[%s:%s] REST polling every %ss", self.name, tf, interval)
             while self._running:
                 try:
@@ -353,6 +348,22 @@ class CoinbaseSpotFeed(AssetFeed):
             for t in tasks:
                 if not t.done():
                     t.cancel()
+
+    def initial_cursor(self, initial_cursors: Dict[str, Dict[str, int]],
+                       symbol: str, tf: str) -> int:
+        """The live cursor (start of the next window to emit) for one stream.
+
+        initial_cursors holds the newest timestamp ALREADY persisted (warmup's
+        feed_cursors), and the AssetFeed contract is to emit only candles
+        strictly newer — so the cursor starts one window past it. Starting AT
+        it (as the Binance feed did) re-emitted warmup's newest bar, which the
+        chain machine appended to its buffer a second time. A stream with no
+        persisted cursor starts at the most recent closed window."""
+        tf_ms = timeframe_to_ms(tf)
+        seeded = initial_cursors.get(symbol, {}).get(tf)
+        if seeded is not None:
+            return seeded + tf_ms
+        return (self._now_ms() // tf_ms - 1) * tf_ms
 
     async def poll_once(self, symbols: List[str], tf: str,
                         cursors: Dict[str, int]) -> List[OHLCPoint]:
