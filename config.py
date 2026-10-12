@@ -133,8 +133,12 @@ TRADE_MODE_DEFAULT = "off"
 #
 # Credentials come from the environment, never literals (see .env.example):
 #   COINBASE_API_KEY_NAME     — CDP key name, organizations/{org}/apiKeys/{id}
-#   COINBASE_API_PRIVATE_KEY  — the key's EC private key (PEM, ES256)
+#   COINBASE_API_PRIVATE_KEY  — the key's EC private key (PEM, ES256). The key
+#                               must be created with the ECDSA algorithm:
+#                               Coinbase rejects Ed25519 keys for this API.
 #   COINBASE_PORTFOLIO_UUID   — the dedicated bot portfolio the key is scoped to
+# The key must have View (+ Trade for live) and must NOT have Transfer:
+# CoinbaseAdapter.connect() refuses a key that can move funds.
 VENUE_ENDPOINTS = {
     "coinbase": {
         "api_key_name": os.getenv("COINBASE_API_KEY_NAME", ""),
@@ -142,6 +146,8 @@ VENUE_ENDPOINTS = {
         "portfolio_uuid": os.getenv("COINBASE_PORTFOLIO_UUID", ""),
         "base_url": os.getenv(
             "COINBASE_BASE_URL", "https://api.coinbase.com/api/v3/brokerage"),
+        # Positions are "{BASE}-{QUOTE}" base-asset balances; equity is in this.
+        "quote_currency": QUOTE_CURRENCY,
     },
 }
 
