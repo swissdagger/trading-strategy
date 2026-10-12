@@ -60,7 +60,7 @@ _CHAINSET_LADDER_NAMES = {"A", "B"}
 
 class _RawEventView:
     """Thin attribute-access wrapper over a raw event dict, so a strategy
-    component that reads ev.symbol / ev.chain_id / etc. (like the four-chain
+    component that reads ev.symbol / ev.chain_id / etc. (like the confirmed_15m
     adapter) can consume a raw dict directly — no TaggedChainEvent construction
     needed for non-A/B ladders (TaggedChainEvent is A/B-specific)."""
     __slots__ = ("_raw",)
@@ -193,7 +193,7 @@ class MultiStrategyRuntime:
             so an FC-ladder event can't corrupt it.
           * Each strategy receives the event through its entry component. The
             two-ladder strategy reads a TaggedChainEvent + the shared ChainView;
-            the four-chain strategy's adapter folds its OWN history view and
+            the confirmed_15m strategy's adapter folds its OWN history view and
             reads the raw fields. So each strategy sees only what its ladder
             produces, and folding is per-monitor, not one global view.
 
@@ -211,7 +211,7 @@ class MultiStrategyRuntime:
 
         # 2. Entry: fan out to each enabled strategy trading this symbol. Each
         # strategy's entry component adapts the event to its own needs (the
-        # two-ladder one expects a TaggedChainEvent; the four-chain adapter reads
+        # two-ladder one expects a TaggedChainEvent; the confirmed_15m adapter reads
         # the raw dict and folds its own view). We pass the object each expects:
         # a TaggedChainEvent when we built one (A/B), else the raw dict.
         event_for_strategies = tagged if tagged is not None else _RawEventView(raw)
@@ -288,7 +288,7 @@ class MultiStrategyRuntime:
 
         decision_price is the price carried by the event driving this sweep, and
         is written to trade_signals.decision_price on any EXIT emitted. The exit
-        components already accepted this parameter (see FourChainExit) — the
+        components already accepted this parameter (see Confirmed15mExit) — the
         runtime simply never passed it, so it silently defaulted to None on every
         EXIT ever written. Optional, so a caller/test driving the runtime without
         a price keeps working."""

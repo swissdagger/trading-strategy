@@ -313,7 +313,7 @@ def make_load_chain_view_seed(pool):
                      active_timeframes rather than history[0] so this needs no
                      per-step data at all. A chain whose baseline tf belongs to
                      neither set's ladder baseline is skipped (defensive — it
-                     belongs to some other ladder, e.g. the four-chain FC ladder,
+                     belongs to some other ladder, e.g. the confirmed_15m FC ladder,
                      which the two-ladder ChainView must not adopt).
       * direction  — -1 | +1, straight from the column.
       * peak_level — propagation_levels, the highest level reached. ChainView
@@ -351,7 +351,7 @@ def make_load_chain_view_seed(pool):
             set_ = _SET_FOR_BASELINE.get(tfs[0])
             if set_ is None:
                 # Baseline tf isn't an A/B baseline — chain belongs to another
-                # ladder (e.g. four-chain). The two-ladder ChainView must not
+                # ladder (e.g. confirmed_15m). The two-ladder ChainView must not
                 # adopt it.
                 continue
             out.append({
@@ -477,7 +477,7 @@ def make_load_open_positions(pool):
             the sum is exact, and per-tranche signal_ids mean no row is ever
             double-counted).
 
-    For whole-exit strategies (two_ladder, four_chain) every exit is
+    For whole-exit strategies (two_ladder, confirmed_15m) every exit is
     non-SCALE, so this is behaviourally identical to the old rule. Re-entry
     on a (strategy, position_key) cannot occur — the deterministic ENTER
     signal_id admits one ENTER per key, ever — so the old latest-row ordering

@@ -422,16 +422,28 @@ def _at(ms_ago, now_ms=1_000_000):
 async def test_enter_older_than_max_age_is_skipped(age_ms, enters):
     ex, adapter = await booted(enter_max_age_ms=120_000)
     row = enter_row()
-    row["decided_at"] = _at(age_ms)
+    row["created_at"] = _at(age_ms)
     await ex.handle_signal(row)
     assert bool(adapter.submitted) is enters
 
 
 @pytest.mark.asyncio
-async def test_iso_string_decided_at_is_understood():
+async def test_old_decided_at_does_not_make_a_fresh_signal_stale():
+    # A 15m-triggered signal: decided_at is the bar's window start, 16 minutes
+    # back, but the row was written just now. It must be acted on.
     ex, adapter = await booted(enter_max_age_ms=120_000)
     row = enter_row()
-    row["decided_at"] = _at(600_000).isoformat()
+    row["decided_at"] = _at(16 * 60_000)
+    row["created_at"] = _at(1_000)
+    await ex.handle_signal(row)
+    assert len(adapter.submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_iso_string_created_at_is_understood():
+    ex, adapter = await booted(enter_max_age_ms=120_000)
+    row = enter_row()
+    row["created_at"] = _at(600_000).isoformat()
     await ex.handle_signal(row)
     assert adapter.submitted == []
 
@@ -441,7 +453,7 @@ async def test_stale_exit_is_still_honoured():
     ex, adapter = await booted(enter_max_age_ms=120_000)
     await ex.handle_signal(enter_row())
     row = exit_row()
-    row["decided_at"] = _at(3_600_000)
+    row["created_at"] = _at(3_600_000)
     await ex.handle_signal(row)
     assert [o.intent for o in adapter.submitted] == [OrderIntent.ENTRY, OrderIntent.EXIT]
 
@@ -450,7 +462,7 @@ async def test_stale_exit_is_still_honoured():
 async def test_stale_short_does_not_reach_the_shadow_book():
     ex, _, store = await shadow_executor(enter_max_age_ms=120_000)
     row = enter_row(direction="SHORT")
-    row["decided_at"] = _at(600_000)
+    row["created_at"] = _at(600_000)
     await ex.handle_signal(row)
     assert store.rows == {}
 

@@ -9,7 +9,7 @@ lag grows without bound — the observed multi-day stall (38k messages behind, r
 landing with created_at ~39h after their bar timestamp).
 
 The work is embarrassingly parallel ACROSS symbols and strictly serial WITHIN a
-symbol. AAPL's forecast has nothing to do with BTCUSDT's; but two AAPL bars must
+symbol. AAPL's forecast has nothing to do with BTC-USD's; but two AAPL bars must
 be processed in arrival order or the chain machine's timestamp-ordered
 propagation (next_sig["timestamp"] >= chain["last_timestamp"]) silently
 mis-propagates.

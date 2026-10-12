@@ -10,10 +10,10 @@ entry in ASSET_CONFIGS — no changes to Services 2 or 3.
 
 ADR-001 Phase 1: crypto-only. The Polygon equity/fx/options feeds and
 contract_discovery are deleted; base.py (incl. is_market_open and the
-exchange_calendars plumbing) is kept for future equities. The live crypto
-feed is BinanceFuturesFeed until the Coinbase spot feed lands (Phase 2).
+exchange_calendars plumbing) is kept for future equities. The crypto feed
+is CoinbaseSpotFeed (Phase 2); the Binance feeds are deleted.
 """
 from .base import AssetFeed, is_market_open
-from .binance_futures import BinanceFuturesFeed
+from .coinbase_spot import CoinbaseSpotFeed
 
-__all__ = ["AssetFeed", "is_market_open", "BinanceFuturesFeed"]
+__all__ = ["AssetFeed", "is_market_open", "CoinbaseSpotFeed"]

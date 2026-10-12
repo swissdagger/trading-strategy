@@ -1,8 +1,8 @@
 """
 feeds/resample.py — timeframe parsing and closed-window OHLC resampling.
 
-Shared by the REST feeds' history path (binance_futures today; coinbase_spot
-in Phase 2 of ADR-001). Moved here from the deleted feeds/polygon_options.py
+Used by the REST feeds' history path (coinbase_spot: derived rungs such as 3m
+from 1m). Moved here from the deleted feeds/polygon_options.py
 so a crypto feed no longer imports an options feed for two pure helpers.
 feeds/bar_aggregator.py is the live-path counterpart and applies the same
 bucketing rule incrementally.

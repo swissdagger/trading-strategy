@@ -2,11 +2,14 @@
 
 > **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
 > The system is being re-architected for Coinbase Advanced Trade spot,
-> long-only, crypto-only. Phases 0–1 are done: IBKR and Binance execution, the
-> legacy executor, and the Polygon equity/fx/options feeds are deleted;
-> `two_ladder` and `prior_failure_scaleout` are disabled. The executor will not
-> start until the Coinbase adapter lands (Phase 4). Sections below that describe
-> IBKR, Binance execution or Polygon are out of date until the Phase 6 rewrite.
+> long-only, crypto-only. Done: Phases 0–1 (IBKR and Binance execution, the
+> legacy executor and the Polygon feeds deleted; `two_ladder` and
+> `prior_failure_scaleout` disabled), Phase 3 (executor hardening, shadow book
+> for shorts) and the Phase 2 feed switch (bars now come from Coinbase spot
+> candles; symbols are Coinbase product ids such as `BTC-USD`). The executor
+> will not start until the Coinbase adapter lands (Phase 4). Sections below
+> that describe IBKR, Binance or Polygon are out of date until the Phase 6
+> rewrite.
 
 A headless, multi-strategy trading system. It ingests market-data bars, runs
 Sumtyme causal-chain state machines over a configurable timeframe ladder, applies
@@ -40,7 +43,7 @@ the other, and the executor's real-money blast radius stays isolated.
  │      ▼                                               │
  │  MultiStrategyRuntime                                │
  │    ├─ two_ladder  (Set A / Set B ladders)            │
- │    └─ four_chain  (FC ladder)                        │
+ │    └─ confirmed_15m  (FC ladder)                        │
  │      │  ENTER / EXIT decisions                       │
  │      ▼                                               │
  │  SignalWriter ──► trade_signals (DB)                 │
@@ -72,7 +75,7 @@ separate process because it touches real money.
 | Feeds | venue APIs | closed bars on Kafka | `feed_process.py`, `polygon_*.py`, `binance_*.py`, `bar_aggregator.py` |
 | Warmup | history | seeded buffers + cursors | `warmup_process.py`, `warmup_bars` table |
 | Producer | bars | tagged chain events | `service2_machine.py`, `fanout_router_multi.py`, `ladder_registry.py` |
-| Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `two_ladder_strategy.py`, `four_chain_*.py`, `signal_writer.py` |
+| Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `two_ladder_strategy.py`, `confirmed_15m_*.py`, `signal_writer.py` |
 | Execution | trade signals | venue orders | `signal_listener.py`, `signal_executor.py`, `sizing.py`, `gated_adapter.py`, adapters |
 | Schema | — | the trading DB | `migrations/001…015` |
 
@@ -93,11 +96,13 @@ per-strategy exception isolation so one failing strategy cannot stall the others
 prime exists and no opposing chains are active. Exits are OR'd: an opposing Set B
 chain reaching 2m is a STOP; the prime reaching the top of its ladder is a TARGET.
 
-**`four_chain`** — a start-ordered initiation + confirmation pattern on the FC
-ladder (`1m,3m,5m,15m,1h`). Requires two same-direction chains reaching 15m, two
-distinct opposing failures in the correct start windows, and a confirmer reaching
-3m after both — plus an independent open same-direction chain. Exits on an
-opposing chain reaching 5m.
+**`confirmed_15m`** (formerly `four_chain`) — on the FC ladder
+(`1m,3m,5m,15m,1h`). Enters when a chain propagates to 15m, provided an earlier
+same-direction chain reached 15m first with an opposing 1m failure starting
+between the two, and a finished same-direction chain that started earlier
+reached 1h. Exits with TARGET when the entry chain reaches 1h, or STOP when an
+open opposing chain reaches 5m. Full rules and open questions:
+[`docs/strategies/confirmed_15m.md`](docs/strategies/confirmed_15m.md).
 
 Positions are keyed `position_key = (chain_id, side)` and scoped by strategy, so
 two strategies can hold independent positions on the same chain.
@@ -113,7 +118,7 @@ consumer.
 |---|---|
 | `signal_id` | deterministic (`sig2` scheme); `ON CONFLICT DO NOTHING` |
 | `position_key` | `{chain_id}:{L\|S}` |
-| `strategy` | `two_ladder` \| `four_chain` — **required by consumers** |
+| `strategy` | `two_ladder` \| `confirmed_15m` — **required by consumers** |
 | `action` | `ENTER` \| `EXIT` |
 | `direction`, `symbol`, `asset_class` | |
 | `trigger_level`, `decision_price` | the level and price the strategy saw |
@@ -215,7 +220,7 @@ insert, NOTIFY and listener — nothing is hand-inserted:
 
 ```bash
 python write_path_probe.py    --i-understand-live-listeners   # two_ladder
-python write_path_probe_fc.py --i-understand-live-listeners   # four_chain
+python write_path_probe_fc.py --i-understand-live-listeners   # confirmed_15m
 ```
 
 Each one checks preconditions (migration 011's `strategy` column, 009's trigger,

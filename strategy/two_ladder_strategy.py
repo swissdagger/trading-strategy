@@ -182,7 +182,7 @@ class TwoLadderExit:
         decision_price is the price on the event driving this evaluation (supplied
         by the runtime's exit sweep) and is written to trade_signals. Defaults to
         None so a caller/test that doesn't supply one still works — matching
-        FourChainExit's signature, which is the ExitComponent protocol both
+        Confirmed15mExit's signature, which is the ExitComponent protocol both
         strategies implement."""
         reason = await self.evaluate(
             symbol=symbol, asset_class=asset_class, chain_prime_id=chain_prime_id,

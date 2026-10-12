@@ -1,6 +1,6 @@
 """
-Tests for the four_chain strategy (strategy/chain_history.py,
-four_chain_strategy.py). Despite the registry name, the rules are the TWO-chain
+Tests for the confirmed_15m strategy (strategy/chain_history.py,
+confirmed_15m_strategy.py). Despite the registry name, the rules are the TWO-chain
 pattern the strategy switched to on 2026-08-13:
 
 ENTRY, evaluated when a chain ("Chain 2", direction d) PROPAGATES to 15m:
@@ -23,19 +23,19 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from strategy.chain_history import ChainHistoryView, _parse_ts
-from strategy.four_chain_strategy import FourChainEntry, FourChainExit
+from strategy.confirmed_15m_strategy import Confirmed15mEntry, Confirmed15mExit
 from strategy.ladder_registry import LadderRegistry
 from execution.types import ExitReason, TradeSide
 
 
-FOUR_CHAIN_TF = ["1m", "3m", "5m", "15m", "1h"]   # levels 1..5
+CONFIRMED_15M_TF = ["1m", "3m", "5m", "15m", "1h"]   # levels 1..5
 L = {"1m": 1, "3m": 2, "5m": 3, "15m": 4, "1h": 5}
 SYM = "BTCUSDT"
 
 
 def ladder():
     reg = LadderRegistry()
-    return reg.register("FC", FOUR_CHAIN_TF)
+    return reg.register("FC", CONFIRMED_15M_TF)
 
 
 class FakeWriter:
@@ -44,7 +44,7 @@ class FakeWriter:
     def __init__(self):
         self.entries = []
         self.exits = []
-        self.strategy = "four_chain"
+        self.strategy = "confirmed_15m"
     async def emit_entry(self, *, chain_id, side, symbol, asset_class, decided_at,
                          decision_price=None, trigger_level=None):
         pkey = f"{chain_id}:{'L' if side == TradeSide.LONG else 'S'}"
@@ -93,12 +93,12 @@ def setup():
     lad = ladder()
     view = ChainHistoryView(lad)
     writer = FakeWriter()
-    return view, writer, FourChainEntry(view, lad, writer)
+    return view, writer, Confirmed15mEntry(view, lad, writer)
 
 
 async def fire(view, entry, chain_id, direction, level, minutes,
                event_type="chain_propagated", decision_price=100.0):
-    """Deliver one event the way FourChainEntryAdapter does: fold it into the
+    """Deliver one event the way Confirmed15mEntryAdapter does: fold it into the
     view FIRST, then run the entry check on it."""
     feed(view, chain_id, direction, level, minutes, event_type)
     return await entry.on_event(
@@ -317,7 +317,7 @@ def test_exit_target_on_full_propagation():
     lad = ladder()
     view = ChainHistoryView(lad)
     writer = FakeWriter()
-    exit_ = FourChainExit(view, lad, writer)
+    exit_ = Confirmed15mExit(view, lad, writer)
     # Prime chain c4 reaches 1h (level 5).
     feed(view, "c4", 1, 5, 20)   # 1h
     reason = exit_.evaluate(symbol="BTCUSDT", chain_prime_id="c4", trade_direction=1)
@@ -328,7 +328,7 @@ def test_exit_stop_on_opposing_5m():
     lad = ladder()
     view = ChainHistoryView(lad)
     writer = FakeWriter()
-    exit_ = FourChainExit(view, lad, writer)
+    exit_ = Confirmed15mExit(view, lad, writer)
     # An opposing chain reaches 5m (level 3).
     feed(view, "cx", -1, 3, 20)   # opposing at 5m
     reason = exit_.evaluate(symbol="BTCUSDT", chain_prime_id="c4", trade_direction=1)
@@ -338,7 +338,7 @@ def test_exit_stop_on_opposing_5m():
 def test_no_stop_when_opposing_5m_chain_already_terminated():
     lad = ladder()
     view = ChainHistoryView(lad)
-    exit_ = FourChainExit(view, lad, FakeWriter())
+    exit_ = Confirmed15mExit(view, lad, FakeWriter())
     climb(view, "cx", -1, 20, L["5m"], terminate_at=25)
     assert exit_.evaluate(symbol=SYM, chain_prime_id="c2", trade_direction=1) is None
 
@@ -347,7 +347,7 @@ def test_no_exit_when_neither_condition():
     lad = ladder()
     view = ChainHistoryView(lad)
     writer = FakeWriter()
-    exit_ = FourChainExit(view, lad, writer)
+    exit_ = Confirmed15mExit(view, lad, writer)
     # Prime only at 15m (not 1h); opposing only at 3m (not 5m).
     feed(view, "c4", 1, 4, 20)     # prime at 15m
     feed(view, "cx", -1, 2, 20)    # opposing at 3m only
@@ -360,7 +360,7 @@ async def test_exit_emits_signal():
     lad = ladder()
     view = ChainHistoryView(lad)
     writer = FakeWriter()
-    exit_ = FourChainExit(view, lad, writer)
+    exit_ = Confirmed15mExit(view, lad, writer)
     feed(view, "c4", 1, 5, 20)   # 1h -> TARGET
     pkey = await exit_.maybe_emit_exit(
         symbol="BTCUSDT", asset_class="crypto", chain_prime_id="c4",
@@ -386,7 +386,7 @@ def test_history_retains_terminated_chains():
 
 
 def test_history_evicts_oldest_over_count_cap():
-    # Retention is a per-symbol COUNT cap (no time window: four_chain's pattern
+    # Retention is a per-symbol COUNT cap (no time window: confirmed_15m's pattern
     # span is unbounded). Over the cap, the oldest by first_seen goes.
     lad = ladder()
     view = ChainHistoryView(lad, max_chains_per_symbol=2)

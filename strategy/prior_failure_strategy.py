@@ -1,12 +1,12 @@
 """
 strategy/prior_failure_strategy.py — the prior-failure scale-out strategy.
 
-The loose-gate sibling of four_chain (spec: prior_failure_scaleout). Same key
+The loose-gate sibling of confirmed_15m (spec: prior_failure_scaleout). Same key
 ingredient — a recent opposing failure — with the corroboration requirements
 dropped: the research found the opposing-failure component does most of the
 work, so this trades ~3x the frequency for a similar edge. Runs on its own
 ladder (PF, [1m..12h], levels 1..10); entry at P2 (3m), scale-out schedule
-topping at P9 (6h). Do NOT modify four_chain — this is additive.
+topping at P9 (6h). Do NOT modify confirmed_15m — this is additive.
 
 ## Entry (spec §2)
 
@@ -122,7 +122,7 @@ class PriorFailureEntry:
         """Process one chain event (view already updated). Returns the
         position_key if an ENTER was emitted, else None.
 
-        The filter is `>= entry_level`, mirroring FourChainEntry: a deeper
+        The filter is `>= entry_level`, mirroring Confirmed15mEntry: a deeper
         event on the same chain re-checks the gate and re-emits, which the
         deterministic ENTER signal_id dedupes to ONE row — so a restart that
         missed the exact P2 event still catches the entry late (and the exit

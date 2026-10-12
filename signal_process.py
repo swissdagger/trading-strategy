@@ -75,7 +75,7 @@ from strategy.ladder_registry import default_registry
 from strategy.registry import StrategyRegistry, Strategy
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
 from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
-from strategy.four_chain_adapter import make_four_chain
+from strategy.confirmed_15m_adapter import make_confirmed_15m
 from strategy.prior_failure_adapter import make_prior_failure_scaleout
 
 log = logging.getLogger("signal_process")
@@ -338,13 +338,13 @@ class SignalProcess:
             ),
         )
         self.strategies.register_factory(
-            "four_chain",
-            lambda *, name, symbols, ladders, params: make_four_chain(
+            "confirmed_15m",
+            lambda *, name, symbols, ladders, params: make_confirmed_15m(
                 name=name, symbols=symbols, ladders=ladders, params=params,
                 view_registry=self.ladders, writer_factory=make_writer,
             ),
         )
-        # prior_failure_scaleout: same factory shape as four_chain (own
+        # prior_failure_scaleout: same factory shape as confirmed_15m (own
         # ChainHistoryView on its own ladder). Registered UNCONDITIONALLY —
         # the config's `enabled` flag decides instantiation, and the factory
         # validates the schedule-fits-ladder invariant loudly at build time.
@@ -363,9 +363,9 @@ class SignalProcess:
         # strategy actually reads (compute-once, ownership-gated). The ownership
         # set is the (symbol, ladder) pairs enabled strategies declare; the router
         # intersects its timeframe-matched targets with it, so a symbol-scoped
-        # strategy (e.g. two_ladder on AAPL only, four_chain on BTCUSDT only)
-        # doesn't make the router compute A/B chains for BTCUSDT just because
-        # BTCUSDT emits a shared timeframe (1m). Snapshot the set once at startup
+        # strategy (e.g. two_ladder on AAPL only, confirmed_15m on BTC-USD only)
+        # doesn't make the router compute A/B chains for BTC-USD just because
+        # BTC-USD emits a shared timeframe (1m). Snapshot the set once at startup
         # (strategies are fixed for the process lifetime). ---
         owned = self.strategies.owned_symbol_ladders()
         self.router = MultiLadderRouter(

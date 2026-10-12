@@ -2,7 +2,7 @@
 strategy/prior_failure_adapter.py — bridges prior_failure_scaleout to the
 registry's component protocol and feeds its private ChainHistoryView.
 
-Mirrors four_chain_adapter exactly (see its docstring for the pattern's
+Mirrors confirmed_15m_adapter exactly (see its docstring for the pattern's
 rationale): the strategy reads its OWN ChainHistoryView on its own ladder (PF),
 so the entry adapter folds every incoming event into that view before the
 entry check runs; the exit adapter does not fold (the entry adapter already
@@ -62,7 +62,7 @@ class PriorFailureExitAdapter:
     """ExitComponent for the registry. No fold (the entry adapter already did);
     passes the sweep's arguments through, INCLUDING decision_price — the
     runtime supplies it on every sweep, so an adapter that doesn't accept it
-    turns every exit evaluation into a TypeError (the four_chain adapter had
+    turns every exit evaluation into a TypeError (the confirmed_15m adapter had
     exactly that bug)."""
 
     def __init__(self, exit_: PriorFailureScaleOutExit):
@@ -90,7 +90,7 @@ def make_prior_failure_scaleout(
     'prior_failure_scaleout'). Validates the full parameter set before
     building anything — every check below guards a silent-degradation mode:
 
-      * exactly one ladder (single-ladder strategy, like four_chain);
+      * exactly one ladder (single-ladder strategy, like confirmed_15m);
       * entry_level a valid level ON that ladder;
       * schedule offsets/fractions well-formed and summing to exactly 1.0
         (validate_schedule);

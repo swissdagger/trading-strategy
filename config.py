@@ -21,6 +21,16 @@ from __future__ import annotations
 import os
 
 
+# The traded universe: base assets, all quoted in QUOTE_CURRENCY. The product
+# id is f"{base}-{QUOTE_CURRENCY}" (BTC-USD). BNB and TRX were dropped in
+# ADR-001 Phase 1. Changing the quote (e.g. to GBP or USDC) changes every
+# symbol, so it means a fresh DB and a new warmup — and the account must be
+# able to trade that order book.
+CRYPTO_BASES = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LINK", "LTC", "NEAR", "AAVE",
+]
+QUOTE_CURRENCY = "USD"
+
 # Per-asset-class universe + the points/baseline the feeds and machine need.
 # 'symbols'    — the tracked universe for this class.
 # 'timeframes' — the bar granularities the feed must produce (= union of the
@@ -30,38 +40,28 @@ import os
 #   each ladder.
 ASSET_CONFIGS = {
     "crypto": {
-        # Binance USDⓈ-M symbol form until the feed moves to Coinbase candles
-        # (ADR-001 Phase 2), when the canonical form becomes the Coinbase
-        # product id (BTC-USD). BNBUSDT and TRXUSDT are dropped per ADR-001
-        # (not part of the Coinbase spot universe).
-        "symbols": [
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "DOGEUSDT",
-            "ADAUSDT",
-            "LINKUSDT",
-            "LTCUSDT",
-            "NEARUSDT",
-            "AAVEUSDT",
-        ],
-        # four_chain's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
+        # Coinbase product ids (ADR-001 Phase 2): the canonical symbol
+        # everywhere — Kafka, chains, trades, trade_signals. Built from
+        # CRYPTO_BASES and QUOTE_CURRENCY below.
+        "symbols": [],
+        # confirmed_15m's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
         # prior_failure_scaleout's PF rungs (30m..12h) are not fetched while it
         # is disabled; re-add them here (and re-run warmup) before enabling it.
         #
-        # Served by CONTINUOUS REST polling (BinanceFuturesFeed.start_live runs
-        # a per-timeframe poll loop at ~tf/2 cadence, closed-window-only,
-        # relaunched on error by feed_process). transport is 'rest' NOT 'ws':
-        # the Binance futures WEBSOCKET (fstream) is unreachable from cloud
-        # egress IPs — it connects but delivers zero frames. REST (fapi) is
-        # reachable and is all this ladder needs (no sub-minute rungs).
+        # Served by CONTINUOUS REST polling of Coinbase's public candles
+        # endpoint (CoinbaseSpotFeed.start_live: one poll loop per timeframe
+        # at ~tf/2, complete windows only, relaunched on error by
+        # feed_process). 3m has no Coinbase granularity and is derived from
+        # 1m. No websocket feed exists for Coinbase yet.
         "timeframes": ["1m", "3m", "5m", "15m", "1h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "rest",
     },
 }
+
+
+ASSET_CONFIGS["crypto"]["symbols"] = [f"{b}-{QUOTE_CURRENCY}" for b in CRYPTO_BASES]
 
 
 def all_tracked_symbols() -> list[str]:
@@ -75,11 +75,11 @@ def all_tracked_symbols() -> list[str]:
 def crypto_symbols() -> list[str]:
     """Every tracked CRYPTO symbol.
 
-    four_chain runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
-    REST polling; see the crypto ASSET_CONFIGS note). Deriving the
+    confirmed_15m runs only on crypto (its [1m,3m,5m,15m,1h] ladder is served by
+    REST polling of Coinbase candles; see the crypto ASSET_CONFIGS note). Deriving the
     strategy's universe from ASSET_CONFIGS here — rather than a second hardcoded
     list in STRATEGIES — keeps the traded set in lockstep with the FETCHED set:
-    a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in four_chain, and a
+    a coin added to ASSET_CONFIGS['crypto'] auto-enrolls in confirmed_15m, and a
     symbol can never be traded without also being fed.
     """
     return list(ASSET_CONFIGS.get("crypto", {}).get("symbols", []))
@@ -155,10 +155,13 @@ VENUE_ENDPOINTS = {
 # Checked under a lock before every ENTER. Placeholder — tune in paper.
 MAX_OPEN_POSITIONS = 5
 
-# An ENTER signal older than this (decided_at -> now) is skipped, never acted
-# on: after downtime the catch-up sweep replays history and a stale entry would
-# buy at a price the strategy never saw. EXITs are ALWAYS honoured regardless of
-# age. Default 2 x the 1m baseline timeframe.
+# An ENTER signal written longer ago than this (trade_signals.created_at ->
+# now) is skipped, never acted on: after executor downtime the catch-up sweep
+# replays history and a stale entry would buy at a price the strategy never
+# saw. Measured from created_at (when the signal was written), NOT decided_at
+# (the triggering bar's window start, already 15+ minutes back for a 15m
+# trigger). EXITs are ALWAYS honoured regardless of age. Default 2 x the 1m
+# baseline timeframe.
 ENTER_MAX_AGE_SECONDS = 2 * 60
 
 # Venue balances the executor ignores when checking for orphans at boot: base
@@ -182,19 +185,19 @@ SHADOW_TAKER_FEE_BPS = 120
 # computed once. Add a strategy: register its factory + add an entry here.
 # ---------------------------------------------------------------------------
 STRATEGIES = {
-    "four_chain": {
+    "confirmed_15m": {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
         # Crypto-only: resolved just below the dict to the current crypto
         # universe so new crypto symbols auto-join.
         "symbols": [],                # set to crypto_symbols() below
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
-        # No time-based retention (four_chain's pattern span is unbounded); the
+        # No time-based retention (confirmed_15m's pattern span is unbounded); the
         # ChainHistoryView is bounded only by a per-symbol count cap. Override it
         # here with 'max_chains_per_symbol' if a symbol ever approaches the
         # default; omitted => the view's default cap.
         "params": {},
     },
-    # prior_failure_scaleout — the loose-gate sibling of four_chain (same
+    # prior_failure_scaleout — the loose-gate sibling of confirmed_15m (same
     # opposing-failure ingredient, no corroboration requirements; ~3x the
     # frequency for a similar edge per the research). Entry: a chain reaching
     # P2 with a recent prior opposing L1-only failure on the same symbol.
@@ -221,7 +224,7 @@ STRATEGIES = {
     "prior_failure_scaleout": {
         "enabled": False,
         # Crypto-only, resolved below to the current crypto universe
-        # (mirrors four_chain).
+        # (mirrors confirmed_15m).
         "symbols": [],
         "ladders": ["PF"],            # [1m..12h] below; entry P2=3m, schedule tops at P9=6h
         "params": {
@@ -260,13 +263,13 @@ STRATEGIES = {
 # no crypto source, and its code stays only because the built-in A/B ladders are
 # woven into the ladder registry (debt D1). The signal process still registers
 # its factory; with no STRATEGIES entry it is never instantiated.
-STRATEGIES["four_chain"]["symbols"] = crypto_symbols()
+STRATEGIES["confirmed_15m"]["symbols"] = crypto_symbols()
 STRATEGIES["prior_failure_scaleout"]["symbols"] = crypto_symbols()
 
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.
 EXTRA_LADDERS = {
-    "FC": ["1m", "3m", "5m", "15m", "1h"],   # four_chain strategy's ladder
+    "FC": ["1m", "3m", "5m", "15m", "1h"],   # confirmed_15m strategy's ladder
     # prior_failure_scaleout's ladder: the research's 10-level hierarchy.
     # Levels: 1m=P1 .. 6h=P9, 12h=P10. Entry at P2 (3m); the scale-out
     # schedule's last tranche is offset 7 = P9 = 6h, so 12h sits ABOVE the
@@ -281,7 +284,7 @@ EXTRA_LADDERS = {
 # Rungs whose short/unwarmed buffer is EXPECTED and acceptable, per ladder
 # (ladder name -> timeframes). Downgrades the machine's hydrate fill report
 # from WARNING to INFO for those rungs — logging only; an unwarmed rung is
-# inert either way. PF's 12h needs ~6.9y of venue history (BTCUSDT only), and
+# inert either way. PF's 12h needs ~6.9y of venue history (BTC-USD only), and
 # nothing in prior_failure_scaleout depends on it (schedule tops at 6h).
 LADDER_OPTIONAL_TIMEFRAMES = {
     "PF": ["12h"],

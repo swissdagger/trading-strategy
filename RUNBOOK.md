@@ -2,11 +2,14 @@
 
 > **Migration in progress — [ADR-001](docs/adr/001-coinbase-spot-long-only.md).**
 > The system is being re-architected for Coinbase Advanced Trade spot,
-> long-only, crypto-only. Phases 0–1 are done: IBKR and Binance execution, the
-> legacy executor, and the Polygon equity/fx/options feeds are deleted;
-> `two_ladder` and `prior_failure_scaleout` are disabled. The executor will not
-> start until the Coinbase adapter lands (Phase 4). Sections below that describe
-> IBKR, Binance execution or Polygon are out of date until the Phase 6 rewrite.
+> long-only, crypto-only. Done: Phases 0–1 (IBKR and Binance execution, the
+> legacy executor and the Polygon feeds deleted; `two_ladder` and
+> `prior_failure_scaleout` disabled), Phase 3 (executor hardening, shadow book
+> for shorts) and the Phase 2 feed switch (bars now come from Coinbase spot
+> candles; symbols are Coinbase product ids such as `BTC-USD`). The executor
+> will not start until the Coinbase adapter lands (Phase 4). Sections below
+> that describe IBKR, Binance or Polygon are out of date until the Phase 6
+> rewrite.
 
 A standalone, headless trading system forked from CausaView. It runs two parallel
 chain "ladders" (Set A / Set B) per symbol, applies a two-ladder entry/exit
@@ -230,6 +233,43 @@ agnostic to this choice; only its input adapter changes.
    multiples + escalation ladders. Hot-reloadable; tune in early live trading.
 
 ---
+
+## 7a. Signal series provenance (ADR-001 Phase 2)
+
+From Phase 2 the bars every chain is computed from are **Coinbase Advanced
+Trade spot candles** (public endpoint
+`/api/v3/brokerage/market/products/{product_id}/candles`), not Binance USDⓈ-M
+perpetual klines. Consequences an operator must know:
+
+- **Chains are not comparable across the switch.** Sumtyme is deterministic on
+  the exact series; spot candles differ from perp klines bar by bar (venue,
+  instrument, basis, and Coinbase omitting no-trade intervals), so chain ids,
+  levels and timings differ. The research population was built on the Binance
+  series and is to be redone on this one (ADR-001 debt D5).
+- **Fresh DB.** Canonical symbols changed (`BTCUSDT` → `BTC-USD`). Start from
+  an empty database: apply every migration, then run warmup. Nothing migrates
+  history across the switch; mixing old and new rows under different symbol
+  names would split every per-symbol view.
+- **Derived rungs.** 3m (and 4h/12h for the PF ladder) are not Coinbase
+  granularities; they are aggregated from 1m (1h/6h) with the shared
+  resampling rule.
+- **Gaps.** Coinbase returns no candle for an interval with no trades. The
+  feed passes such gaps through rather than fabricating flat bars. Thin books
+  gap a lot at 1m (AAVE-USD: ~17% of minutes, mostly 21:00–01:00 UTC).
+- **Latency.** Coinbase keeps revising a closed candle for up to ~36 s
+  (measured), so the feed waits 60 s after a window ends before emitting it
+  (`SETTLE_MS`). A 1m bar reaches the signal process ~60–90 s after its window
+  closes; a 15m bar likewise. A feed restart catches up from its cursor (up to
+  100 h of 1m); a longer outage needs a re-warmup.
+- **Quote currency** is `config.QUOTE_CURRENCY` (`USD`). It must match an order
+  book the account can trade; changing it changes every symbol (fresh DB again).
+- **Network:** the feed and warmup need outbound HTTPS to `api.coinbase.com`.
+  Binance (`fapi.binance.com`) is no longer contacted.
+
+**Verify after the first warmup** (the Binance feed files are deleted only after
+this passes): every (symbol, timeframe) logs `seeded ... with N bars`, with N
+near 5000 for 1m/3m/5m/15m/1h; a short count means the product's Coinbase
+history is shorter than one window (the rung warms partial and fills live).
 
 ## 8. Operational concerns
 

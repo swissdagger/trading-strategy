@@ -154,12 +154,12 @@ Each phase is independently mergeable and leaves the system runnable.
 
 ### Phase 2 — Feed → Coinbase candles
 
-- [ ] `feeds/coinbase_spot.py` implementing `AssetFeed`: `fetch_history` via public candles endpoint (paginated; granularities 1m/5m/15m/30m/1h/2h/6h/1d); `start_live` as REST polling at ~tf/2; native 5m/15m/1h, 3m derived from 1m via `bar_aggregator`.
-- [ ] Canonical symbol form becomes the Coinbase product id (`BTC-USD`) throughout (`universe.py`, chains, trades). Fresh DB; no migration of history.
-- [ ] Delete `feeds/binance_futures.py`, `feeds/binance_ws.py` and tests once the Coinbase feed is verified by a warmup run.
-- [ ] Record the series-provenance change in `RUNBOOK.md`.
-- [ ] Rename the `four_chain` strategy, which has implemented the two-chain rules since 2026-08-13: registry key, `FourChainEntry`/`FourChainExit`, `four_chain_strategy.py` / `four_chain_adapter.py`, tests and config. Pick a name that cannot be confused with `two_ladder` (e.g. `confirmed_15m`). Done on the fresh DB because the name is stored in `trade_signals.strategy` / `trades.strategy`, hashed into `signal_id`, and part of the runtime's open-position keys: renaming on a live DB would strand open positions and mix old four-chain rows with two-chain rows under one label. Keep the `FC` ladder name, which is part of chain identity. Before renaming on any non-fresh DB, confirm no open positions are tracked under `four_chain`.
-- [ ] Commit the strategy spec (`trade_strategy_2.md`, cited by `strategy/four_chain_strategy.py`) under `docs/strategies/` and point the strategy docstring at it.
+- [x] `feeds/coinbase_spot.py` implementing `AssetFeed`: `fetch_history` via public candles endpoint (paginated; granularities 1m/5m/15m/30m/1h/2h/6h/1d); `start_live` as REST polling at ~tf/2; native 5m/15m/1h, 3m derived from 1m via `bar_aggregator`.
+- [x] Canonical symbol form becomes the Coinbase product id (`BTC-USD`) throughout (`universe.py`, chains, trades). Fresh DB; no migration of history.
+- [x] Delete `feeds/binance_futures.py`, `feeds/binance_ws.py` and tests once the Coinbase feed is verified by a warmup run.
+- [x] Record the series-provenance change in `RUNBOOK.md`.
+- [x] Rename the `four_chain` strategy to **`confirmed_15m`** (owner's choice; `two_ladder` was taken by the old A/B strategy and is the DB default for the strategy column): registry key, `Confirmed15mEntry`/`Confirmed15mExit`, `confirmed_15m_strategy.py` / `confirmed_15m_adapter.py`, tests, config. The `FC` ladder name is unchanged (part of chain identity). Takes effect with the Phase 2 fresh DB.
+- [x] Document the strategy rules: `docs/strategies/confirmed_15m.md`, written from the code (the original `trade_strategy_2.md` is not available), with a list of behaviours for the owner to confirm against the original intent.
 
 ### Phase 3 — Executor hardening (venue-independent; testable with existing fakes)
 
@@ -229,7 +229,7 @@ Each phase is independently mergeable and leaves the system runnable.
 | D6 | Flat 5%-of-available sizing, count-capped; no vol scaling, no correlation awareness | Adequate for paper and minimum-size live | Before scaling capital |
 | D7 | No entry TTL / cancel path | Dormant while entries are crossing limits | Required the moment post-only entries are tried |
 | D8 | Shadow book is an upper bound (touch fill, no impact) | Only short-side data available | Treat P&L as "at most this"; refine with a slippage model if it drives Option B |
-| D9 | `service2_machine.py` is a copy of CausaView's chain machine (sync obligation) | Unchanged by this ADR | Shared library extraction, if CausaView and this repo converge |
+| D9 | `service2_machine.py` is a copy of CausaView's chain machine (sync obligation) | Diverges by one change: the monotonic bar guard in `on_bar` (PR 3); port it to CausaView or keep it in mind when syncing | Shared library extraction, if CausaView and this repo converge |
 | D10 | Equities scaffolding (`is_market_open`, `exchange_calendars`, `asset_class` plumbing, by-class caps) | Deliberately retained | N/A — intentional |
 | D11 | Single-broker Kafka on one box; Supabase over the network; `statement_cache_size=0` pgbouncer convention | Operational, not architectural | Revisit with the capacity work |
 | D12 | Capacity sizing deferred (top-of-hour burst: ~70 simultaneous forecasts across 12 symbols × 6 rungs at `FORECAST_CONCURRENCY=6`) | Parked by decision | Benchmark `ForecastGate` p50/p95 before adding symbols or rungs |
@@ -272,3 +272,22 @@ Each phase is independently mergeable and leaves the system runnable.
 - **Bugs found and fixed along the way:** `GatedAdapter` was still abstract (missing `get_touch` / `get_account_equity` / `get_step_size`), so `run_executor.py` would have crashed on start; `run_executor.py` never started the escalation loop, so unfilled exits would never escalate or HALT; the three existing real-Postgres integration test modules used plain `@pytest.fixture` for async fixtures and errored whenever `QISS_TEST_DSN` was set.
 - **CI** now runs the integration tests: a Postgres 16 service, all migrations applied, `QISS_TEST_DSN` set.
 - `boot.run_boot_reconcile` is netted as specified, but nothing calls it: `SignalExecutor.start()` runs its own reconcile, which is the live path.
+
+### PR 3 (Phase 2, feed)
+
+- **Verified against the live API** (once `api.coinbase.com` was allowed):
+  - Response shape as documented: newest first, string prices, the forming candle included, an empty list before a product's listing. The request cap is on the time span: up to 350 intervals is accepted (the extra candle trimmed), wider spans return HTTP 400.
+  - **Real warmup** into a fresh DB with all migrations: 50/50 (symbol, timeframe) streams seeded with 5000 bars each, 50 feed cursors, 1,192 requests, no errors or rate limiting, 156 s. Every bar aligned to its timeframe with sane OHLC; BTC/ETH/SOL/XRP 1m have no gaps, so pagination drops nothing.
+  - **Gaps are real Coinbase data:** thin books omit no-trade minutes (AAVE-USD 1m: 827 missing minutes in ~4 days, concentrated 21:00–01:00 UTC; DOGE 426; LINK 259), confirmed by re-querying the API. Every product also lacks 1h candles 2026-05-08 02:00–06:00 UTC (a venue-wide outage).
+  - **Live polling run** (BTC-USD, AAVE-USD, 1m/3m, from cursors minutes stale): every window emitted in order, none skipped.
+- **Found and fixed by the live checks:**
+  - **Closed candles keep changing.** Over 148 one-minute windows on all ten books, 39% were revised after close (median 12 s, p90 25 s, max 36 s; thin books slowest, BTC/ETH/SOL/XRP/LTC within ~7 s). The settle delay went from 5 s to **60 s**, applied to history as well as live. Cost: a 1m bar reaches the signal process ~60–90 s after its window closes.
+  - **Stale-cursor gap:** live polls read a fixed 6-window lookback, so a feed started more than 6 windows after its cursor silently skipped the windows between. Polls now read from the cursor forward (clamped at 100 h of 1m; longer gaps need a re-warmup). The Binance feed had the same flaw.
+  - **Duplicate bar at startup:** the live cursor started AT warmup's newest bar instead of after it (contrary to the AssetFeed contract), so each stream's newest warmup bar was appended to the chain machine's buffer twice. Inherited from the Binance feed; fixed in the feed. The chain machine also gained its own guard (below).
+  - **Executor stale-ENTER gate (Phase 3 bug):** it measured age from `decided_at`, which is the triggering bar's window START — 15+ minutes back for a 15m trigger — so it would have skipped every four_chain entry. It now measures from `trade_signals.created_at` (when the signal was written), which is what "replayed after downtime" means.
+- **Completeness rule (live):** a window is emitted only once its end is `SETTLE_MS` (60 s) in the past, and a derived window (3m from 1m) only once its last base candle is published, or one base interval of grace has passed (that minute had no trades).
+- **Derived rungs:** 3m from 1m for four_chain; 4h from 1h and 12h from 6h so the disabled PF ladder still has a feed. No synthetic gap-filling.
+- **Symbols** are built from `config.CRYPTO_BASES` and `config.QUOTE_CURRENCY` (`USD`). All ten `-USD` products are `online` with trading enabled publicly; whether the account can trade them is confirmed in Phase 4 with a key.
+- `transport='ws'` fails loudly at startup: there is no Coinbase websocket feed. `streaming_base.py` and `bar_aggregator.py` stay for one.
+- **Duplicate bars reaching Sumtyme — fixed in the chain machine.** `ServiceTwoChainMachine.on_bar` now drops a bar whose timestamp is not newer than the newest buffered bar for its timeframe (repeats logged at DEBUG, out-of-order at WARNING). This covers Kafka at-least-once replay after a signal-process restart as well as any feed/warmup overlap, and stops a replay from re-running the forecast and re-emitting chain events. It is a deliberate divergence from CausaView's copy of the machine (debt D9), requested by the owner.
+- **Rename and spec:** `four_chain` is now `confirmed_15m`; the rules are documented in `docs/strategies/confirmed_15m.md` from the code.

@@ -321,9 +321,9 @@ class SignalExecutor:
             (adapter.supports_short is False). None => such signals are skipped.
         max_open_positions: cap on non-terminal trades across all symbols,
             checked before every ENTER. None => no cap.
-        enter_max_age_ms: an ENTER whose decided_at is older than this is
-            skipped (stale after downtime). EXITs are never age-gated. None =>
-            no age gate.
+        enter_max_age_ms: an ENTER whose row was written (created_at) longer
+            ago than this is skipped (replayed after downtime). EXITs are never
+            age-gated. None => no age gate.
         orphan_allowlist: base assets or symbols whose venue balances are
             ignored by the boot orphan check.
         """
@@ -613,8 +613,8 @@ class SignalExecutor:
         # gate, so the shadow book records only entries we would really take.
         if self._enter_is_stale(row):
             self._mincr("entries_skipped_stale")
-            log.warning("stale ENTER %s/%s (decided_at=%s) — skipped",
-                        strategy, position_key, row.get("decided_at"))
+            log.warning("stale ENTER %s/%s (written %s) — skipped",
+                        strategy, position_key, row.get("created_at"))
             return
 
         side = TradeSide.LONG if row["direction"] == "LONG" else TradeSide.SHORT
@@ -651,21 +651,27 @@ class SignalExecutor:
             await self._open_position(row, key, side)
 
     def _enter_is_stale(self, row: dict) -> bool:
-        """True if the ENTER's decided_at is older than enter_max_age_ms. A row
-        without decided_at is not judged stale (logged): refusing on missing
-        data would silently disable entries."""
+        """True if the ENTER signal was WRITTEN (trade_signals.created_at) more
+        than enter_max_age_ms ago — i.e. it piled up while the executor was
+        down and is being replayed by the catch-up sweep.
+
+        Deliberately not decided_at: that is MARKET time (the triggering bar's
+        window start), so a signal triggered on a 15m bar is already 15+
+        minutes "old" the moment it is written, and gating on it would skip
+        every such entry. A row without created_at is not judged stale
+        (logged): refusing on missing data would silently disable entries."""
         if self._enter_max_age_ms is None:
             return False
-        decided = row.get("decided_at")
-        if decided is None:
-            log.warning("ENTER %s has no decided_at — age gate not applied",
+        written = row.get("created_at")
+        if written is None:
+            log.warning("ENTER %s has no created_at — age gate not applied",
                         row.get("signal_id"))
             return False
-        if isinstance(decided, str):
-            decided = datetime.fromisoformat(decided.replace("Z", "+00:00"))
-        if decided.tzinfo is None:
-            decided = decided.replace(tzinfo=timezone.utc)
-        age_ms = self.hooks.now_ms() - int(decided.timestamp() * 1000)
+        if isinstance(written, str):
+            written = datetime.fromisoformat(written.replace("Z", "+00:00"))
+        if written.tzinfo is None:
+            written = written.replace(tzinfo=timezone.utc)
+        age_ms = self.hooks.now_ms() - int(written.timestamp() * 1000)
         return age_ms > self._enter_max_age_ms
 
     async def _price_increment(self, symbol: str, asset_class: str) -> Optional[Decimal]:

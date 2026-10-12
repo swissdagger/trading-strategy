@@ -391,7 +391,7 @@ class AssetFeed(ABC):
 
     # Subclasses MUST set these as class attributes.
     asset_class: str = ""   # 'fx' | 'crypto' | 'option' | 'equity' — matches types.ts AssetClass
-    name: str = ""          # 'polygon_forex' | 'polygon_options' | 'polygon_stocks' | 'binance_futures'
+    name: str = ""          # e.g. 'coinbase_spot'
 
     @abstractmethod
     async def fetch_history(

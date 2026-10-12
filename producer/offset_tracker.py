@@ -2,7 +2,7 @@
 producer/offset_tracker.py — safe commit point for out-of-order bar completion.
 
 WHY THIS EXISTS. With per-symbol workers, bars complete OUT OF ORDER: offset 105
-(BTCUSDT, no forecast, returns instantly) can finish long before offset 100
+(BTC-USD, no forecast, returns instantly) can finish long before offset 100
 (AAPL, mid-forecast). The consume loop must still commit a single monotonically
 advancing offset for the partition.
 

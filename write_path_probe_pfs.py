@@ -57,7 +57,7 @@ class Harness:
         registry.register("PF", PF_TIMEFRAMES)
         self.strategy = make_prior_failure_scaleout(
             name="prior_failure_scaleout",
-            symbols=["BTCUSDT"],
+            symbols=["BTC-USD"],
             ladders=["PF"],
             params={
                 "entry_level": 2,
@@ -73,7 +73,7 @@ class Harness:
         self.tracked: dict[str, SimpleNamespace] = {}   # pkey -> position
 
     async def event(self, chain_id: str, event_type: str, direction: int,
-                    level: int, minutes: float, symbol="BTCUSDT"):
+                    level: int, minutes: float, symbol="BTC-USD"):
         """Fold one event (entry adapter), track any ENTER, then run the exit
         sweep for every tracked position — the runtime's per-event order."""
         ev = SimpleNamespace(
