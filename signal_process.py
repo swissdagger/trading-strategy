@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from collections import defaultdict
 import logging
 import os
 import signal as os_signal
@@ -57,6 +58,7 @@ from producer.fanout_router_multi import MultiLadderRouter
 from producer.forecast_gate import ForecastGate, ForecastMemo
 from producer.offset_tracker import OffsetTracker
 from producer.symbol_workers import SymbolWorkerPool
+from config import require_env
 from feeds.base import timeframe_to_ms
 from ops.alerts import alert, install_alerting, start_heartbeat
 from producer.persistence import (
@@ -89,8 +91,8 @@ log = logging.getLogger("signal_process")
 # ---------------------------------------------------------------------------
 class Config:
     def __init__(self) -> None:
-        self.db_url = _require("TRADING_DB_URL")
-        self.sumtyme_key = _require("SUMTYME_API_KEY")
+        self.db_url = require_env("TRADING_DB_URL")
+        self.sumtyme_key = require_env("SUMTYME_API_KEY")
         self.kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
         # Dedicated bar topic on THIS system's Kafka — deliberately NOT named
         # 'raw-prices' so it can't be confused with CausaView's topic. The
@@ -170,13 +172,6 @@ class Config:
             os.environ.get("THREAD_POOL_SIZE", "16"))
 
 
-def _require(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise RuntimeError(f"missing required env var {name}")
-    return v
-
-
 # ---------------------------------------------------------------------------
 class SignalProcess:
     """Owns the assembled pipeline and its lifecycle."""
@@ -196,6 +191,15 @@ class SignalProcess:
         self.workers: Optional[SymbolWorkerPool] = None
         self.offsets = OffsetTracker()
         self._stop = asyncio.Event()
+        # Created here, not in start(), so stop() is safe after a start()
+        # that failed partway.
+        self._audit_task: Optional[asyncio.Task] = None
+        self._last_bar_monotonic = time.monotonic()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._prune_task: Optional[asyncio.Task] = None
+        self._health_server: Optional[HealthServer] = None
+        self._strategy_tickers: list = []
+        self._closes_feeds: dict = {}
 
     async def start(self) -> None:
         # --- DB pool to the NEW trading project ---
@@ -284,10 +288,11 @@ class SignalProcess:
         # Same one-per-process discipline as the gate, opposite job: the gate
         # bounds how many Sumtyme calls run; the memo eliminates the ones that
         # don't need to run at all. Sumtyme is deterministic, so when two
-        # ladders share a timeframe (FC and PF share 1m/3m/5m/15m/1h), the
-        # second machine's forecast of the same (symbol, timeframe, window) is
-        # a memo hit, not an API call — without this, adding PF would roughly
-        # DOUBLE crypto's Sumtyme demand for identical answers.
+        # ladders share a timeframe (FC and CN share 1m/3m/5m/15m/1h on
+        # BTC-USD), the second machine's forecast of the same (symbol,
+        # timeframe, window) is a memo hit, not an API call — without this,
+        # every shared rung would cost one Sumtyme call per ladder for
+        # identical answers.
         self.forecast_memo = ForecastMemo()
 
         # --- Audit surface: processed-through watermarks + chain integrity ---
@@ -306,11 +311,6 @@ class SignalProcess:
         # touches asyncio.
         self.audit_cache = AuditCache()
         self.metrics = Metrics()
-        self._audit_task: Optional[asyncio.Task] = None
-        self._last_bar_monotonic = time.monotonic()
-        self._heartbeat_task: Optional[asyncio.Task] = None
-        self._prune_task: Optional[asyncio.Task] = None
-        self._health_server: Optional[HealthServer] = None
 
         # --- Batched audit writer: research/audit writes OFF the hot path ---
         # Adopting the writer exactly as its docstring prescribes (it was built,
@@ -368,7 +368,6 @@ class SignalProcess:
         # same feeds that serve the ladders: Polygon for equities, Coinbase
         # for crypto. One closes source per class, built lazily on first use
         # so a config without that class never needs its key here.
-        self._closes_feeds: dict = {}
         self._vol_providers: dict = {}
         self._closes_sources: dict = {}
 
@@ -378,7 +377,7 @@ class SignalProcess:
                 syms = list(ASSET_CONFIGS.get(asset_class, {}).get("symbols", []))
                 if asset_class == "equity":
                     from feeds.polygon_stocks import PolygonStocksFeed
-                    feed = PolygonStocksFeed(_require("POLYGON_API_KEY"), syms, ["1m"])
+                    feed = PolygonStocksFeed(require_env("POLYGON_API_KEY"), syms, ["1m"])
                 elif asset_class == "crypto":
                     from feeds.coinbase_spot import CoinbaseSpotFeed
                     feed = CoinbaseSpotFeed(syms, ["1m"])
@@ -430,18 +429,23 @@ class SignalProcess:
         # emit a shared timeframe (1m). Snapshot the set once at startup
         # (strategies are fixed for the process lifetime). ---
         owned = self.strategies.owned_symbol_ladders()
+        # ONE per-symbol lock map for the router and the runtime: the router
+        # holds a symbol's lock while it publishes, and the runtime processes
+        # the published event under that same lock (process_raw_locked).
+        symbol_locks: dict = defaultdict(asyncio.Lock)
         self.router = MultiLadderRouter(
             registry=self.ladders,
             make_machine=self._make_factory(client),
             publish=self._publish,
             owns=lambda symbol, ladder: (symbol, ladder) in owned,
             persist_bar=make_persist_live_bar(self.pool),
+            locks=symbol_locks,
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(
             registry=self.strategies,
             hooks=self._runtime_hooks(),
-            locks=self.router._locks,   # SHARE the router's lock map
+            locks=symbol_locks,
         )
         await self.runtime.start()
 
@@ -449,7 +453,6 @@ class SignalProcess:
         # start(): restore open trades from trade_signals. tick(): the rule's
         # clock (stall exit, session-open drain), on a timer independent of
         # events — a symbol with no events still has to exit on time.
-        self._strategy_tickers: list[asyncio.Task] = []
         for strat in self.strategies.active():
             comp = strat.entry
             if hasattr(comp, "start"):
@@ -499,11 +502,8 @@ class SignalProcess:
         """Build the MachineFactory: (symbol, set) -> ServiceTwoChainMachine with
         real DB + Sumtyme hooks bound in.
 
-        NOTE: the dataframe helpers (prepare_df, to_interval, build_df) are part of
-        the extracted service_2 utilities. They must be supplied here from the
-        extracted module. Until that utils extraction lands, these three are the
-        remaining bind points — everything else is wired. They are pure functions
-        (no state), so extracting them is mechanical.
+        The dataframe helpers (prepare_df, to_interval, build_df) are the pure
+        functions extracted from service_2 into producer/service2_utils.py.
         """
         from config import LADDER_OPTIONAL_TIMEFRAMES
         from producer.service2_utils import (  # extracted service_2 helpers
@@ -522,8 +522,8 @@ class SignalProcess:
                 symbol=symbol, asset_class=asset_class,
                 ladder=timeframes,
                 # Part of the chain's deterministic identity, and the hydrate
-                # discriminator. NOT derivable from `timeframes` — FC and PF
-                # share the 1m baseline.
+                # discriminator. NOT derivable from `timeframes`: two ladders
+                # may share a baseline timeframe.
                 ladder_name=ladder_name,
                 forecast_fn=client.forecast_path,
                 prepare_df_fn=prepare_dataframe_for_sumtyme,
@@ -541,8 +541,8 @@ class SignalProcess:
                 persist_chain_propagate=self.audit_writer.persist_chain_propagate,
                 persist_chain_terminate=self.audit_writer.persist_chain_terminate,
                 # Filters on the ladder NAME (migration 026). The old baseline-
-                # timeframe discriminator conflated FC and PF, whose baselines are
-                # both 1m on the same crypto symbols: each machine adopted the
+                # timeframe discriminator conflated FC and the former PF ladder,
+                # both 1m-baseline on the same crypto symbols: each machine adopted the
                 # other's chains on restart and advanced them under its own level
                 # numbering.
                 load_active_chains=make_load_active_chains(
@@ -565,7 +565,7 @@ class SignalProcess:
                 # window forecast by one ladder's machine is a hit for another's.
                 forecast_memo=self.forecast_memo,
                 # Rungs whose short buffer is expected (config): downgrades the
-                # hydrate fill report to INFO for them (e.g. PF's 12h).
+                # hydrate fill report to INFO for them (e.g. DL's 6h).
                 optional_timeframes=set(
                     LADDER_OPTIONAL_TIMEFRAMES.get(ladder_name, [])),
                 # SHARED across every machine, like the gate and the memo:
@@ -645,7 +645,7 @@ class SignalProcess:
         consumers) AND feed the in-process multi-strategy runtime.
 
         The router produces RAW event dicts (carrying `ladder`). We forward the dict to Kafka and to the runtime. The runtime's
-        _process_raw_locked is called DIRECTLY (not on_raw_event) because the
+        process_raw_locked is called DIRECTLY (not on_raw_event) because the
         router already holds this symbol's lock — and the router and runtime
         SHARE one lock map, so re-acquiring would deadlock on the non-reentrant
         asyncio.Lock."""
@@ -656,7 +656,7 @@ class SignalProcess:
             log.exception("failed to publish tagged event to Kafka (continuing)")
 
         # Feed the runtime under the lock the router already holds.
-        await self.runtime._process_raw_locked(raw)
+        await self.runtime.process_raw_locked(raw)
 
     async def run(self) -> None:
         """Consume bars and dispatch them to PER-SYMBOL ORDERED WORKERS.
@@ -664,7 +664,7 @@ class SignalProcess:
         THE CONCURRENCY SHAPE (read this before changing it). Bars used to be
         awaited strictly sequentially here, which was load-bearing: the router
         takes the per-symbol lock, the runtime SHARES that lock map, and _publish
-        calls runtime._process_raw_locked() assuming the router already holds the
+        calls runtime.process_raw_locked() assuming the router already holds the
         symbol's lock. The old docstring warned that a blanket create_task per bar
         would let two bars for the SAME symbol run at once — contending for the
         lock, reaching the strategies out of order, and silently breaking the
@@ -841,7 +841,7 @@ class SignalProcess:
             self._prune_task.cancel()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
-        for t in getattr(self, "_strategy_tickers", []):
+        for t in self._strategy_tickers:
             t.cancel()
 
         if self.workers is not None:
@@ -860,13 +860,13 @@ class SignalProcess:
         if self.audit_writer is not None:
             await self.audit_writer.stop()    # flushes; needs the pool alive
 
-        for feed in getattr(self, "_closes_feeds", {}).values():
+        for feed in self._closes_feeds.values():
             close = getattr(feed, "aclose", None)
             if close is not None:
                 try:
                     await close()
                 except Exception:
-                    pass
+                    log.warning("closing a 1m closes feed failed", exc_info=True)
 
         if self.pool is not None:
             await self.pool.close()

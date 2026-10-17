@@ -172,7 +172,7 @@ async def test_shared_lock_map():
 @pytest.mark.asyncio
 async def test_router_runtime_shared_lock_no_deadlock():
     """The router holds the symbol lock in on_bar and calls the runtime's
-    _process_raw_locked via publish; the runtime must NOT re-acquire the shared
+    process_raw_locked via publish; the runtime must NOT re-acquire the shared
     lock (which would deadlock). Proves the shared-lock contract end-to-end."""
     from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks
     from strategy.registry import Strategy, StrategyRegistry
@@ -199,7 +199,7 @@ async def test_router_runtime_shared_lock_no_deadlock():
     runtime = MultiStrategyRuntime(sreg, hooks, locks=shared)
 
     async def publish(raw):
-        await runtime._process_raw_locked(raw)   # router holds the lock here
+        await runtime.process_raw_locked(raw)   # router holds the lock here
 
     router = MultiLadderRouter(reg, lambda s, l, t: FakeMachine(s, l, t), publish, locks=shared)
 

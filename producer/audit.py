@@ -13,11 +13,12 @@ independently of whether anything fired.
 The audit document exists for a DIFFERENT reader: a downstream team deciding
 whether to trust trade_signals. Their confusion is specific and reasonable — the
 chains table contains rows that look like duplicates. Some are, some are not, and
-the difference is invisible without knowing that FC and PF are separate ladders
-sharing a 1m baseline. So the document does not just assert health; it publishes
-the counts that let someone verify the claim themselves:
+the difference is invisible without knowing that each ladder on a symbol runs its
+own chain machine (FC and CN on BTC-USD, DL and ED on equities), so two ladders
+can initiate at the same bar. So the document does not just assert health; it
+publishes the counts that let someone verify the claim themselves:
 
-  * legitimate FC/PF pairs, named as such, with the ladders that produced them
+  * live chains per ladder, and legitimate cross-ladder pairs, named as such
   * true duplicates, which must be zero because uq_chains_active_initiation
     makes them unwritable — a non-zero here means the index is missing
   * chains whose recorded shape contradicts their own ladder (the corruption
@@ -44,6 +45,7 @@ failure the endpoint must report, so the server must not share it.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
@@ -51,8 +53,8 @@ from typing import Callable, Dict, Optional, Tuple
 log = logging.getLogger("producer.audit")
 
 # A watermark older than this means a machine has stopped consuming. Sized for
-# the COARSEST rung in a ladder: PF's 12h bar legitimately updates twice a day,
-# so a blanket bound would flap. The verdict is computed per timeframe against
+# the COARSEST rung in a ladder: DL's 6h bar legitimately updates four times a
+# day, so a blanket bound would flap. The verdict is computed per timeframe against
 # its own cadence — see build_signal_health_document.
 STALENESS_MULTIPLE = 3.0
 
@@ -211,35 +213,55 @@ def build_signal_health_document(*, booted: bool, watermarks: list,
 # The DB-derived integrity view.
 # ---------------------------------------------------------------------------
 
-_FC = "ARRAY['1m','3m','5m','15m','1h']"
-_PF = "ARRAY['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h']"
+def _shape_predicate(ladders: Dict[str, list]) -> str:
+    """SQL that is true for a chain whose rungs are not a prefix of its own
+    configured ladder (config.EXTRA_LADDERS). Names and timeframes come from
+    config, not input; they are still checked before being inlined."""
+    terms = []
+    for name, tfs in sorted(ladders.items()):
+        if not re.fullmatch(r"[A-Za-z0-9_]+", name) or not all(
+                re.fullmatch(r"[0-9]+[smhd]", tf) for tf in tfs):
+            raise ValueError(f"unexpected ladder spec {name!r}: {tfs!r}")
+        arr = "ARRAY[" + ",".join(f"'{tf}'" for tf in tfs) + "]"
+        terms.append(f"(ladder = '{name}' AND active_timeframes "
+                     f"<> ({arr})[1:cardinality(active_timeframes)])")
+    return "\n           OR ".join(terms) or "false"
 
-# One round trip. Every count is a claim an auditor can re-derive from `chains`
-# with the same predicate, which is the point — the endpoint publishes evidence,
-# not reassurance.
-_AUDIT_SQL = f"""
+
+def _audit_sql(ladders: Dict[str, list]) -> str:
+    """One round trip. Every count is a claim an auditor can re-derive from
+    `chains` with the same predicate, which is the point — the endpoint
+    publishes evidence, not reassurance. A chain on a ladder no longer
+    configured is counted (active_unconfigured_ladder): no machine will ever
+    advance or terminate it."""
+    names = ",".join(f"'{n}'" for n in sorted(ladders)) or "NULL"
+    return f"""
 SELECT
     count(*)                                                    AS active_chains,
-    count(*) FILTER (WHERE ladder = 'FC')                       AS active_fc,
-    count(*) FILTER (WHERE ladder = 'PF')                       AS active_pf,
+    count(*) FILTER (WHERE ladder IS NULL OR ladder NOT IN ({names}))
+                                                                AS active_unconfigured_ladder,
     count(*) FILTER (WHERE chain_id LIKE 'chain1.%%')           AS deterministic_ids,
     count(*) FILTER (WHERE chain_id NOT LIKE 'chain1.%%')       AS legacy_uuid_ids,
     count(*) FILTER (
         WHERE propagation_levels <> cardinality(active_timeframes)
-           OR (ladder = 'FC' AND (propagation_levels > 5
-               OR active_timeframes
-                  <> ({_FC})[1:cardinality(active_timeframes)]))
-           OR (ladder = 'PF' AND active_timeframes
-                  <> ({_PF})[1:cardinality(active_timeframes)])
+           OR {_shape_predicate(ladders)}
     )                                                           AS shape_violations
 FROM chains
 WHERE active
 """
 
-# Two live chains at one origin on DIFFERENT ladders: expected and correct. One
-# 1m signal initiates on both FC and PF, and the two are distinct chains with
-# distinct level numbering that diverge at level 5. This is the count the
-# downstream team is reading as "duplicates".
+
+_BY_LADDER_SQL = """
+SELECT coalesce(ladder, '?') AS ladder, count(*) AS n
+FROM chains
+WHERE active
+GROUP BY 1
+"""
+
+# Two live chains at one origin on DIFFERENT ladders: expected and correct. Each
+# ladder on a symbol runs its own machine, so two can initiate at the same bar
+# open; they are distinct chains with their own level numbering. This is the
+# count the downstream team is reading as "duplicates".
 _PAIRS_SQL = """
 SELECT count(*) AS legitimate_cross_ladder_pairs
 FROM (
@@ -273,7 +295,8 @@ WHERE tablename = 'chains' AND indexname = 'uq_chains_active_initiation'
 
 
 def make_chain_audit_refresher(pool, cache: AuditCache,
-                               interval_seconds: float = 60.0):
+                               interval_seconds: float = 60.0,
+                               ladders: Optional[Dict[str, list]] = None):
     """Async task: recompute the integrity view on a fixed interval.
 
     Not per-request. A scraping loop must not be able to put load on the DB, and
@@ -283,23 +306,34 @@ def make_chain_audit_refresher(pool, cache: AuditCache,
     """
     import asyncio
 
+    if ladders is None:
+        from config import EXTRA_LADDERS as ladders
+    audit_sql = _audit_sql(ladders)
+
     async def refresh_once() -> dict:
         async with pool.acquire() as conn:
-            main = await conn.fetchrow(_AUDIT_SQL)
+            main = await conn.fetchrow(audit_sql)
+            by_ladder = await conn.fetch(_BY_LADDER_SQL)
             pairs = await conn.fetchrow(_PAIRS_SQL)
             dupes = await conn.fetchrow(_DUPES_SQL)
             idx = await conn.fetchrow(_INDEX_SQL)
         doc = {k: int(v) for k, v in dict(main).items()}
+        doc["active_by_ladder"] = {r["ladder"]: int(r["n"]) for r in by_ladder}
         doc["legitimate_cross_ladder_pairs"] = int(pairs["legitimate_cross_ladder_pairs"])
         doc["same_ladder_duplicates"] = int(dupes["same_ladder_duplicates"])
         doc["dedupe_index_present"] = bool(int(idx["n"]))
         doc["notes"] = {
             "legitimate_cross_ladder_pairs":
-                "One 1m baseline signal initiates a chain on BOTH the FC and PF "
-                "ladders. These share symbol, direction, origin_time and "
-                "origin_price and diverge at level 5 (FC: 1h, PF: 30m). They are "
-                "two distinct chains, not duplicates, and each is evaluated by "
-                "its own strategy. Non-zero is expected.",
+                "Live chains on DIFFERENT ladders sharing symbol, direction and "
+                "origin_time. Each ladder on a symbol runs its own chain machine "
+                "(FC and CN on BTC-USD, DL and ED on equities), so two can "
+                "initiate at the same bar. They are distinct chains, not "
+                "duplicates, each evaluated by its own strategies. Non-zero is "
+                "expected.",
+            "active_unconfigured_ladder":
+                "Live chains on a ladder no longer in config.EXTRA_LADDERS (e.g. "
+                "the deleted PF ladder). No machine advances or terminates them; "
+                "they are history, not live state.",
             "same_ladder_duplicates":
                 "Two live chains on the SAME ladder at one origin. These are real "
                 "duplicates. Expected 0: uq_chains_active_initiation makes them "
