@@ -263,13 +263,14 @@ def test_fanout_output_sorted():
     collected = []
     for sec in range(25):
         collected.extend(agg.add_source_bar("AAPL", sec * 1000, 10, 10, 10, 10))
-    # Every batch returned must be sorted by (timestamp, timeframe).
-    for i in range(1, len(collected)):
-        prev = (collected[i - 1].timestamp, collected[i - 1].timeframe)
-        cur = (collected[i].timestamp, collected[i].timeframe)
-        # within a single add_source_bar call the sort holds; across calls
-        # timestamps are non-decreasing too for a single symbol.
-        assert prev <= cur or collected[i - 1].timestamp <= collected[i].timestamp
+    # Close-time order, the shorter rung first on a tie — within a call and,
+    # for one symbol, across calls.
+    from feeds.close_order import order_key
+    keys = [order_key(p) for p in collected]
+    assert keys == sorted(keys)
+    # The 5s and 10s windows closing at 10 s: the 5s one first.
+    tie = [p.timeframe for p in collected if order_key(p)[0] == 10_000]
+    assert tie == ["5s", "10s"]
 
 
 def test_symbols_isolated():

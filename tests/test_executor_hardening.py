@@ -627,3 +627,35 @@ async def test_shadow_fee_per_asset_class_override():
     assert await book._fee_bps("equity") == Decimal("5")
     assert await book._fee_bps("crypto") == Decimal("120")
     assert await book._fee_bps(None) == Decimal("120")
+
+
+# --- SignalWriter: whole-position exits only, strategy required ---------------
+
+def test_signal_writer_requires_a_strategy():
+    from execution.signal_writer import SignalWriter, SignalWriterHooks
+    hooks = SignalWriterHooks(insert_signal=None)
+    with pytest.raises(TypeError):
+        SignalWriter(hooks)
+    with pytest.raises(ValueError):
+        SignalWriter(hooks, "")
+
+
+@pytest.mark.asyncio
+async def test_signal_writer_exit_is_whole_position_and_refuses_scale():
+    from execution.signal_writer import SignalWriter, SignalWriterHooks, _signal_id
+    from execution.types import ExitReason
+    rows = []
+    async def insert(row):
+        rows.append(row)
+        return True
+    w = SignalWriter(SignalWriterHooks(insert_signal=insert), strategy="s1")
+    kw = dict(chain_id="c1", side=TradeSide.LONG, symbol="ETH-USD",
+              asset_class="crypto", decided_at="2026-01-01T00:00:00+00:00")
+    await w.emit_exit(reason=ExitReason.TERMINAL, **kw)
+    (row,) = rows
+    assert row["fraction"] == 1.0 and row["exit_reason"] == "TERMINAL"
+    # Same id scheme as before: the reason alone is the discriminator.
+    assert row["signal_id"] == _signal_id("s1", "c1:L", "EXIT", "TERMINAL")
+    with pytest.raises(ValueError):
+        await w.emit_exit(reason=ExitReason.SCALE, **kw)
+    assert len(rows) == 1

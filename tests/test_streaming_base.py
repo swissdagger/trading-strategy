@@ -267,3 +267,46 @@ async def test_watchdog_trips_on_silence():
     await collect(feed, ["BTC"], ["5s"], {}, timeout=3.0)
     # Advancing past the first connect proves the stale socket was abandoned.
     assert feed._connect_idx >= 2
+
+
+# --------------------------------------------------------------------
+# Close-time order: backfill and the publish point
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_backfill_publishes_all_rungs_in_close_time_order():
+    def bar(t, tf):
+        return OHLCPoint("AAPL", t, 1, 1, 1, 1, tf, "equity")
+    # 30s bars 0..120 s and 1m bars 0..120 s, as the REST sibling returns them
+    # (one rung at a time).
+    backfill = FakeBackfillFeed(range_bars={
+        ("AAPL", "30s"): [bar(t, "30s") for t in range(0, 120_000, 30_000)],
+        ("AAPL", "1m"): [bar(t, "1m") for t in range(0, 120_000, 60_000)],
+    })
+    feed = FakeStreamingFeed(backfill, connect_scripts=[[]])
+    got = []
+
+    async def cb(points):
+        got.extend(points)
+
+    await feed._backfill_outage(["AAPL"], ["30s", "1m"], 0, cb)
+    keys = [(p.timestamp + {"30s": 30_000, "1m": 60_000}[p.timeframe], p.timeframe) for p in got]
+    assert keys == [(30_000, "30s"), (60_000, "30s"), (60_000, "1m"), (90_000, "30s"),
+                    (120_000, "30s"), (120_000, "1m")]
+
+
+@pytest.mark.asyncio
+async def test_a_window_the_backfill_already_emitted_is_not_published_again():
+    # After a reconnect the aggregator can still hold the window that was open
+    # at the disconnect; the backfill has since emitted it whole.
+    feed = FakeStreamingFeed(FakeBackfillFeed(), connect_scripts=[[]])
+    feed._backfill_cursors = {"AAPL": {"1m": 60_000}}
+    got = []
+
+    async def cb(points):
+        got.extend(points)
+
+    stale = OHLCPoint("AAPL", 60_000, 1, 1, 1, 1, "1m", "equity")     # partial copy
+    newer = OHLCPoint("AAPL", 120_000, 1, 1, 1, 1, "1m", "equity")
+    await feed._emit([stale, newer], cb)
+    assert got == [newer]

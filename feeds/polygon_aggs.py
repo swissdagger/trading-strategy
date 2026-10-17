@@ -44,6 +44,7 @@ import httpx
 
 from feeds.base import AssetFeed, LiveDataCallback, is_market_open
 from feeds.base import session_bounds_for, timeframe_to_ms
+from feeds.close_order import CloseOrderMerge, next_window_end
 # Single shared definition of the timeframe arithmetic and the OHLC
 # bucketing rule — see module docstring. Importing the underscore
 # names is deliberate: a private copy here WOULD drift.
@@ -837,12 +838,21 @@ class _PolygonAggsFeedBase(AssetFeed):
         Reuses the warmup walk's page fetcher (_fetch_ticks_window) and the
         shared resampler, so the sequence this emits is bucketed by exactly
         the rule fetch_subminute_history seeded the buffer with."""
+        points, new_cursor, _ok = await self._poll_trades(symbol, tf, cursor_ms, now_ms)
+        return points, new_cursor
+
+    async def _poll_trades(
+        self, symbol: str, tf: str, cursor_ms: int, now_ms: int,
+    ) -> "tuple[List[OHLCPoint], int, bool]":
+        """_poll_trades_once plus whether the read was COMPLETE. A failed page
+        leaves the window's earlier trades unread, so nothing is emitted (a
+        bar missing them would be wrong, and the cursor would move past it)."""
         tf_ms = timeframe_to_ms(tf)
         native = self.to_native_symbol(symbol)
         ticks, ok = await self._fetch_ticks_window(
             self._subminute_source_url(native), native, cursor_ms, now_ms)
-        if not ok and not ticks:
-            return [], cursor_ms
+        if not ok:
+            return [], cursor_ms, False
         points: List[OHLCPoint] = []
         new_cursor = cursor_ms
         for w in _resample_to_timeframe(ticks, tf):
@@ -855,7 +865,102 @@ class _PolygonAggsFeedBase(AssetFeed):
                 low=w["l"], close=w["c"], timeframe=tf, asset_class=self.asset_class,
             ))
             new_cursor = max(new_cursor, w["t"] + tf_ms)
-        return points, new_cursor
+        return points, new_cursor, True
+
+    # Aggregates are emitted (and a window with none is taken to have had no
+    # trades) only this long after the window ends, so a minute aggregate
+    # Polygon publishes a moment after the close is not skipped and then
+    # emitted out of order on the next poll.
+    AGG_SETTLE_MS = 5_000
+    # Live-poll retry after a failed read; cap on the session-open jitter (a
+    # bar waits for every rung's first read of the session, so keep it short).
+    LIVE_RETRY_S = 5.0
+    OPEN_JITTER_MAX_S = 15.0
+    CLOSED_RECHECK_S = 60.0
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    def _settle_ms(self, tf: str) -> int:
+        return self.TRADE_SETTLE_MS if _is_seconds_tf(tf) else self.AGG_SETTLE_MS
+
+    def _next_unread(self, tf: str, now_ms: int, cursor_ms: int) -> int:
+        """After a COMPLETE read at now_ms: the close of the first window of
+        `tf` not yet read (see feeds/close_order.py). Every window that ended
+        at least the settle delay ago is read — emitted, or known empty."""
+        return max(next_window_end(now_ms - self._settle_ms(tf), tf),
+                   cursor_ms + timeframe_to_ms(tf))
+
+    async def _poll_aggs(
+        self, symbol: str, tf: str, cursor_ms: int, now_ms: int,
+    ) -> "tuple[List[OHLCPoint], int, bool]":
+        """One live read of an aggregate rung: closed, settled windows at or
+        after the cursor, ascending, bucketed by the shared epoch-aligned rule.
+        2m/3m are built from 1-minute aggregates, exactly as fetch_history
+        builds them (source rule 2). Returns (points, new_cursor, complete)."""
+        native = self.to_native_symbol(symbol)
+        src_tf = "1m" if tf in self.DERIVE_FROM_MINUTE else tf
+        multiplier, timespan, _ = _parse_timeframe(src_tf)
+        tf_ms = timeframe_to_ms(tf)
+        url = (f"https://api.polygon.io/v2/aggs/ticker/{native}"
+               f"/range/{multiplier}/{timespan}/{cursor_ms}/{now_ms}")
+        params = {"adjusted": "true", "sort": "asc",
+                  "limit": self.MAX_CANDLES_PER_CALL, "apiKey": self.api_key}
+        try:
+            client = await self._get_client()
+            async with self.rate_limiter:
+                # 20s timeout — Polygon's sub-minute aggregations routinely
+                # exceed 10s (inherited from the options feed).
+                resp = await client.get(url, params=params, timeout=20.0)
+            if resp.status_code == 429:
+                logger.warning(f"[{self.name}:{tf}] 429 on {symbol}; will retry")
+                return [], cursor_ms, False
+            if resp.status_code in (401, 403):
+                logger.error(f"{resp.status_code} from Polygon for {native} {tf}; "
+                             f"holding this rung")
+                return [], cursor_ms, False
+            resp.raise_for_status()
+            body = resp.json()
+            results = body.get("results", []) or []
+        except Exception as e:
+            detail = f": {e}" if str(e) else ""
+            logger.error(f"[{self.name}:{tf}] {symbol} fetch error "
+                         f"({type(e).__name__}){detail}",
+                         exc_info=not isinstance(e, httpx.TransportError))
+            return [], cursor_ms, False
+        if len(results) >= self.MAX_CANDLES_PER_CALL:
+            # Truncated: windows after the last returned bar were not read.
+            logger.warning(f"[{self.name}:{tf}] {symbol}: {len(results)} aggregates "
+                           f"from the cursor (page cap); catching up next poll")
+            now_ms = results[-1]["t"]
+        points: List[OHLCPoint] = []
+        new_cursor = cursor_ms
+        for w in _resample_to_timeframe(results, tf):
+            if w["t"] < cursor_ms:
+                continue
+            if w["t"] + tf_ms + self.AGG_SETTLE_MS > now_ms:
+                break      # forming or settling: re-read next poll
+            points.append(OHLCPoint(
+                symbol=symbol, timestamp=w["t"], open=w["o"], high=w["h"],
+                low=w["l"], close=w["c"], timeframe=tf, asset_class=self.asset_class))
+            new_cursor = max(new_cursor, w["t"] + tf_ms)
+        return points, new_cursor, len(results) < self.MAX_CANDLES_PER_CALL
+
+    def _initial_cursor(self, initial_cursors: Dict[str, Dict[str, int]],
+                        symbol: str, tf: str) -> int:
+        """Start of the first window to read. initial_cursors holds the newest
+        bar ALREADY seen (warmup or the bar store), so live starts one window
+        past it — starting AT it re-emitted that bar. Never below the symbol's
+        inception (ticker-recycling guard)."""
+        tf_ms = timeframe_to_ms(tf)
+        seeded = initial_cursors.get(symbol, {}).get(tf)
+        cursor = seeded + tf_ms if seeded is not None \
+            else (self._now_ms() // tf_ms - 1) * tf_ms
+        floor_ms = self._inception_ms.get(symbol)
+        if floor_ms is not None and cursor < floor_ms:
+            cursor = floor_ms
+        return cursor
 
     async def start_live(
         self,
@@ -864,188 +969,79 @@ class _PolygonAggsFeedBase(AssetFeed):
         initial_cursors: Dict[str, Dict[str, int]],
         callback: LiveDataCallback,
     ) -> None:
-        """One poll loop per timeframe. Sleeps through closed sessions
-        (fx: weekend gap; equity: overnight/weekend — both driven by
-        is_market_open(self.asset_class, ...)).
-
-        Polling cadence is tf_seconds / 2, floored at 8s, ceilinged at
-        600s. The floor is 8s rather than the options feed's 10s
-        because the Phase 7 baseline is 15s (15s candle → ~8s cadence
-        keeps emission latency under one window). Closed-window-only
-        emission and the cursor-advance rule are identical to the
-        options feed — see its inline comments for the rationale; the
-        invariants are the same.
+        """One poll loop per timeframe, each woken when its next window can be
+        complete (window end + settle), sleeping through closed sessions
+        (is_market_open(self.asset_class, ...)). The rungs' bars go through a
+        CloseOrderMerge (feeds/close_order.py) and are published per symbol in
+        CLOSE-TIME order, the shorter rung first on a tie: the chain machines
+        apply bars in arrival order, so publishing in poll order let poll
+        timing decide whether a chain propagated or terminated.
         """
         self._running = True
+        cursors: Dict[str, Dict[str, int]] = {
+            tf: {sym: self._initial_cursor(initial_cursors, sym, tf) for sym in symbols}
+            for tf in timeframes}
+        merge = CloseOrderMerge(
+            {sym: list(timeframes) for sym in symbols},
+            {(sym, tf): c + timeframe_to_ms(tf)
+             for tf, by_sym in cursors.items() for sym, c in by_sym.items()})
+        emit_lock = asyncio.Lock()
 
         async def poll_one_tf(tf: str) -> None:
-            multiplier, _, candle_ms = _parse_timeframe(tf)
-            tf_s = (multiplier * candle_ms) // 1000
-
-            # Half-candle polling, 8s floor, 600s ceiling.
-            interval = min(max(tf_s // 2, 8), 600)
-
-            # Per-(symbol, tf) cursor — same shape as the other feeds.
-            cursors: Dict[str, int] = {}
-            for sym in symbols:
-                cursors[sym] = (
-                    initial_cursors.get(sym, {}).get(tf)
-                    or (int(datetime.now(timezone.utc).timestamp() * 1000) - tf_s * 1000)
-                )
-                # Ticker-recycling guard, live path: never let a stale
-                # DB cursor (e.g. one seeded from pre-inception rows
-                # that haven't been purged yet) drag the live fetch
-                # back below inception. Floor it.
-                floor_ms = self._inception_ms.get(sym)
-                if floor_ms is not None and cursors[sym] < floor_ms:
-                    cursors[sym] = floor_ms
-
-            logger.info(f"[{self.name}:{tf}] polling every {interval}s")
-
+            logger.info(f"[{self.name}:{tf}] REST polling at window close")
             was_closed = True  # tracks market-open transition for jitter
             while self._running:
+                delay = self.LIVE_RETRY_S
                 try:
                     now = datetime.now(timezone.utc)
                     if not is_market_open(self.asset_class, now):
                         was_closed = True
-                        await asyncio.sleep(interval)
+                        await asyncio.sleep(self.CLOSED_RECHECK_S)
                         continue
-
-                    # Market-open jitter: on the first cycle after a
-                    # closed period, sleep a random fraction of the
-                    # interval before fetching, so all timeframe
-                    # pollers × symbols don't fire simultaneously at
-                    # the session open. Same spike-avoidance the
-                    # options feed needed.
                     if was_closed:
-                        jitter = random.uniform(0, interval)
-                        logger.debug(
-                            f"[{self.name}:{tf}] market open — jitter "
-                            f"{jitter:.1f}s before first fetch"
-                        )
-                        await asyncio.sleep(jitter)
+                        # Spread the session-open burst a little; short,
+                        # because every bar waits for each rung's first read.
+                        await asyncio.sleep(random.uniform(
+                            0, min(self.OPEN_JITTER_MAX_S, timeframe_to_ms(tf) / 2000)))
                         was_closed = False
-                        now = datetime.now(timezone.utc)
-
-                    batch: List[OHLCPoint] = []
-                    if _is_seconds_tf(tf):
-                        # Source rule 1: sub-minute rungs are NEVER served
-                        # from /v2/aggs (T+1 stale). Poll trades forward
-                        # from the cursor and bucket them locally.
-                        now_ms = int(now.timestamp() * 1000)
-                        for sym in symbols:
+                    now_ms = self._now_ms()
+                    results = []
+                    for sym in symbols:
+                        if _is_seconds_tf(tf):
+                            # Source rule 1: never /v2/aggs second aggregates.
                             try:
-                                pts, cursors[sym] = await self._poll_trades_once(
-                                    sym, tf, cursors[sym], now_ms)
+                                pts, cursors[tf][sym], ok = await self._poll_trades(
+                                    sym, tf, cursors[tf][sym], now_ms)
                             except Exception as e:
                                 detail = f": {e}" if str(e) else ""
                                 logger.error(
                                     f"[{self.name}:{tf}] {sym} trades poll error "
                                     f"({type(e).__name__}){detail}",
-                                    exc_info=not isinstance(e, httpx.TransportError),
-                                )
-                                continue
-                            batch.extend(pts)
+                                    exc_info=not isinstance(e, httpx.TransportError))
+                                pts, ok = [], False
+                        else:
+                            pts, cursors[tf][sym], ok = await self._poll_aggs(
+                                sym, tf, cursors[tf][sym], now_ms)
+                        results.append((sym, pts, ok))
+                    async with emit_lock:
+                        for sym, pts, ok in results:
+                            merge.offer(sym, tf, pts,
+                                        self._next_unread(tf, now_ms, cursors[tf][sym])
+                                        if ok else None)
+                        batch = merge.release(now_ms)
                         if batch:
                             await callback(batch)
-                        await asyncio.sleep(interval)
-                        continue
-
-                    for sym in symbols:
-                        native = self.to_native_symbol(sym)
-                        multiplier, timespan, _ = _parse_timeframe(tf)
-                        url = (
-                            f"https://api.polygon.io/v2/aggs/ticker/{native}"
-                            f"/range/{multiplier}/{timespan}/{cursors[sym]}/"
-                            f"{int(now.timestamp() * 1000)}"
-                        )
-                        params = {
-                            "adjusted": "true",
-                            "sort":     "asc",
-                            "limit":    self.MAX_CANDLES_PER_CALL,
-                            "apiKey":   self.api_key,
-                        }
-
-                        try:
-                            client = await self._get_client()
-                            async with self.rate_limiter:
-                                # 20s timeout — inherited from the
-                                # options feed's hard-won finding that
-                                # Polygon's sub-minute aggregations
-                                # routinely exceed 10s. See the long
-                                # comment in polygon_options.py.
-                                resp = await client.get(url, params=params, timeout=20.0)
-                            if resp.status_code == 429:
-                                # Don't retry inside the live loop; the
-                                # next polling cycle retries naturally.
-                                logger.warning(f"[{self.name}:{tf}] 429 on {sym}; will retry next cycle")
-                                continue
-                            if resp.status_code in (401, 403):
-                                logger.error(
-                                    f"{resp.status_code} from Polygon for {native}. "
-                                    f"Stopping live poll for this symbol."
-                                )
-                                continue
-                            resp.raise_for_status()
-                            results = resp.json().get("results", [])
-                        except Exception as e:
-                            # str(e) is empty for several httpx network
-                            # exceptions — log the type, append str(e)
-                            # only when non-empty (same convention as
-                            # the options feed).
-                            detail = f": {e}" if str(e) else ""
-                            logger.error(
-                                f"[{self.name}:{tf}] {sym} fetch error "
-                                f"({type(e).__name__}){detail}",
-                                exc_info=not isinstance(e, httpx.TransportError),
-                            )
-                            continue
-
-                        # Resample to timeframe-aligned windows and emit
-                        # only CLOSED windows. Open windows are held back
-                        # and re-fetched next cycle — and the cursor is
-                        # NOT advanced past them. The cursor advances to
-                        # window_start + tf_ms (no +1 — a +1 skips the
-                        # first raw bar of the next window and corrupts
-                        # its open/high/low). Identical invariants to
-                        # the options live loop.
-                        if not results:
-                            continue
-                        _, _, base_ms = _parse_timeframe(tf)
-                        tf_ms_local = multiplier * base_ms
-                        now_ms = int(now.timestamp() * 1000)
-                        resampled = _resample_to_timeframe(results, tf)
-                        emitted_for_sym = 0
-                        for tick in resampled:
-                            window_start = tick["t"]
-                            if window_start + tf_ms_local > now_ms:
-                                continue
-                            batch.append(OHLCPoint(
-                                symbol=sym,
-                                timestamp=window_start,
-                                open=tick["o"],
-                                high=tick["h"],
-                                low=tick["l"],
-                                close=tick["c"],
-                                timeframe=tf,
-                                asset_class=self.asset_class,
-                            ))
-                            cursors[sym] = max(
-                                cursors[sym], window_start + tf_ms_local,
-                            )
-                            emitted_for_sym += 1
-                        if emitted_for_sym:
-                            logger.debug(
-                                f"[{self.name}:{tf}] {sym}: emitted "
-                                f"{emitted_for_sym} closed windows"
-                            )
-
-                    if batch:
-                        await callback(batch)
+                    if all(ok for _, _, ok in results):
+                        nxt = next_window_end(self._now_ms() - self._settle_ms(tf), tf) \
+                            + self._settle_ms(tf) + 1_000
+                        delay = (nxt - self._now_ms()) / 1000
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.error(f"[{self.name}:{tf}] cycle error: {e}")
-
-                await asyncio.sleep(interval)
+                if not self._running:
+                    break
+                await asyncio.sleep(max(delay, 1.0))
 
         tasks = [asyncio.create_task(poll_one_tf(tf)) for tf in timeframes]
         try:

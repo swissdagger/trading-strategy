@@ -38,12 +38,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Dict, List, Set
+from typing import List, Set
 
 import websockets
 
 from feeds.streaming_base import StreamingFeedBase
-from producer.bar import OHLCPoint
 
 logger = logging.getLogger(__name__)
 

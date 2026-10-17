@@ -50,7 +50,6 @@ from dataclasses import dataclass, field, replace
 from decimal import ROUND_DOWN, Decimal
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from execution import client_order_id as coid
 from execution.adapter import ExecutionAdapter, FillCallback
 from execution.pricing import is_buy, quantize_limit_price, validate_touch
 from execution.types import (

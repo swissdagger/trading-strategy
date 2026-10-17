@@ -7,10 +7,9 @@ of truth for:
   * which strategies run and on which ladders (STRATEGIES, EXTRA_LADDERS), and
   * the execution venue's connection settings (VENUE_ENDPOINTS).
 
-ADR-001 (docs/adr/001-coinbase-spot-long-only.md): crypto-only, long-only, one
-venue (Coinbase Advanced Trade spot). The equity/fx classes are removed here; the
-asset_class plumbing (universe.py, feeds/base.is_market_open, by-class caps) is
-deliberately kept for future equities.
+ADR-001 (docs/adr/001-coinbase-spot-long-only.md): one venue (Coinbase Advanced
+Trade spot), long-only. Crypto is traded; equities (Polygon) feed the
+shadow-only chain rules and research.
 
 producer/universe.py reads ASSET_CONFIGS to resolve symbol -> asset_class. A
 symbol must appear under exactly ONE class (universe.build_symbol_class_map
@@ -44,13 +43,9 @@ ASSET_CONFIGS = {
         # everywhere — Kafka, chains, trades, trade_signals. Built from
         # CRYPTO_BASES and QUOTE_CURRENCY below.
         "symbols": [],
-        # confirmed_15m's ladder [1m,3m,5m,15m,1h] — the only enabled strategy.
-        # prior_failure_scaleout's PF rungs (30m..12h) are not fetched while it
-        # is disabled; re-add them here (and re-run warmup) before enabling it.
-        #
-        # Served by CONTINUOUS REST polling of Coinbase's public candles
-        # endpoint (CoinbaseSpotFeed.start_live: one poll loop per timeframe
-        # at ~tf/2, complete windows only, relaunched on error by
+        # Served by REST polling of Coinbase's public candles endpoint
+        # (CoinbaseSpotFeed.start_live: one poller per timeframe at its window
+        # close, merged per symbol into close-time order, relaunched on error by
         # feed_process). 3m has no Coinbase granularity and is derived from
         # 1m. No websocket feed exists for Coinbase yet.
         # FC ∪ CN. The seconds rungs (30s/45s) are built from trades and
@@ -166,10 +161,6 @@ def crypto_symbols() -> list[str]:
 # validation agree on the allowed set.
 VALID_TRANSPORTS = ("rest", "ws")
 
-# Asset classes that actually HAVE a websocket feed today. A class not
-# listed here must not be configured with transport="ws" — the feed
-# builder would have nothing to instantiate.
-WS_CAPABLE_CLASSES = ("crypto",)
 
 
 def transport_for(asset_class: str) -> str:
@@ -228,6 +219,17 @@ VENUE_ENDPOINTS = {
 }
 
 # ---------------------------------------------------------------------------
+# Bar store (warmup_bars). Warmup seeds it and the signal process appends every
+# bar it applies, so a restart hydrates to where the last run got. A machine
+# only ever reads the newest WINDOW_SIZE (5000) rows per (symbol, timeframe),
+# so the signal process prunes each stream to its newest
+# BAR_STORE_KEEP_PER_STREAM rows every BAR_STORE_PRUNE_INTERVAL_S. The margin
+# above 5000 is headroom, not a requirement.
+# ---------------------------------------------------------------------------
+BAR_STORE_KEEP_PER_STREAM = 6000
+BAR_STORE_PRUNE_INTERVAL_S = 3600
+
+# ---------------------------------------------------------------------------
 # Executor risk and safety settings (ADR-001 Phase 3). Read by run_executor.py
 # and injected into the executor; execution/ never imports config directly.
 # ---------------------------------------------------------------------------
@@ -274,9 +276,8 @@ PAPER_STARTING_CASH = 10_000
 STRATEGIES = {
     "confirmed_15m": {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
-        # Crypto-only: resolved just below the dict to the current crypto
-        # universe so new crypto symbols auto-join.
-        "symbols": [],                # set to crypto_symbols() below
+        # The current crypto universe, so new crypto symbols auto-join.
+        "symbols": crypto_symbols(),
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
         # No time-based retention (confirmed_15m's pattern span is unbounded); the
         # ChainHistoryView is bounded only by a per-symbol count cap. Override it
@@ -284,135 +285,70 @@ STRATEGIES = {
         # default; omitted => the view's default cap.
         "params": {},
     },
-    # prior_failure_scaleout — the loose-gate sibling of confirmed_15m (same
-    # opposing-failure ingredient, no corroboration requirements; ~3x the
-    # frequency for a similar edge per the research). Entry: a chain reaching
-    # P2 with a recent prior opposing L1-only failure on the same symbol.
-    # Exit: seven scale-out tranches banked as the chain propagates, weighted
-    # toward the deep levels; any remainder closes at chain termination. NO
-    # stop loss — deliberate; giveback/trailing stops failed as a class in the
-    # research, the chain's own termination is the stop.
-    #
-    # DISABLED by ADR-001: expected to be replaced (slippage), and its PF rungs
-    # above 1h are no longer fetched (ASSET_CONFIGS). Code stays in the tree
-    # (debt D2). The original rollout gates still apply if it is revived:
-    # (1) migration 016 applied, (2) the consuming team confirms
-    # fraction/SCALE/TERMINAL support, (3) the strategy factory is registered
-    # (rollout step 3), (4) the executor's partial-exit support lands (step 4). The executor carries an
-    # interlock that refuses partial exits until (4), so enabling early fails
-    # loud, not wrong — but don't.  Enable in PAPER mode first.
-    #
-    # NOTE on first enable: the gate needs prior-chain history. The PF
-    # machines start producing chains only once this strategy is enabled
-    # (owned_symbol_ladders gates computation), so for ~failure_window_hours
-    # after first enable the gate cannot fire — expected warm-in, not a bug.
-    # Re-run warmup_process just before enabling so the PF buffers hydrate
-    # fresh (a stale warmup leaves a gap between its last bar and live).
-    "prior_failure_scaleout": {
-        "enabled": False,
-        # Crypto-only, resolved below to the current crypto universe
-        # (mirrors confirmed_15m).
-        "symbols": [],
-        "ladders": ["PF"],            # [1m..12h] below; entry P2=3m, schedule tops at P9=6h
-        "params": {
-            "entry_level": 2,          # P2 (3m on PF). Schedule keys are OFFSETS from this.
-            "gate": {
-                # Admit iff a prior opposing chain on the same symbol FAILED
-                # (exact depth 1 — initiated and died without propagating; a
-                # chain that reached L3 then terminated is NOT a failure) with
-                # its START inside the window before this chain's start.
-                "failure_window_hours": 6,   # research default, never swept
-                "failure_exact_depth": 1,
-            },
-            "exit": {
-                # Fraction of ORIGINAL size banked at each level PAST entry
-                # (offset -> fraction; sums to 1.0). Offsets, not absolute
-                # levels: entry at P2 puts offset 7 at P9 = 6h. Back-loaded on
-                # purpose — the deep levels carry the magnitude.
-                "schedule": {1: 0.05, 2: 0.05, 3: 0.10, 4: 0.10,
-                             5: 0.15, 6: 0.20, 7: 0.35},
-                "remainder_at_termination": True,
-                "stop": None,          # deliberate — see above; do not add one
-            },
-            "sizing": "flat",          # v1; per_symbol_base_rate is a follow-up
-        },
+
+    # chain_recorder — a record-only OWNER for the dense equity ladder. The
+    # router only computes chains for (symbol, ladder) pairs some enabled
+    # strategy owns, so a ladder being evaluated as data still needs an owner;
+    # this one emits no trade_signals (chains and signals rows are the
+    # product). Replace it with the real DL strategy when that lands: same
+    # 'symbols'/'ladders', different key.
+    "chain_recorder": {
+        "enabled": True,          # kept on beside rule1: depth counters on /health, no signals
+        "symbols": equity_symbols(),
+        "ladders": ["DL"],
+        "params": {},
     },
-    # Example of a future strategy on different ladders (disabled):
-    # "mean_revert": {
-    #     "enabled": False,
-    #     "symbols": ["EURUSD"],
-    #     "ladders": ["C"],           # e.g. a 1m/5m/1h ladder registered at startup
-    #     "params": {"lookback": 20},
-    # },
-}
 
-# two_ladder is not configured at all (ADR-001): its sub-minute A/B ladders have
-# no crypto source, and its code stays only because the built-in A/B ladders are
-# woven into the ladder registry (debt D1). The signal process still registers
-# its factory; with no STRATEGIES entry it is never instantiated.
-STRATEGIES["confirmed_15m"]["symbols"] = crypto_symbols()
-STRATEGIES["prior_failure_scaleout"]["symbols"] = crypto_symbols()
-
-# chain_recorder — a record-only OWNER for the dense equity ladder. The router
-# only computes chains for (symbol, ladder) pairs some enabled strategy owns,
-# so a ladder being evaluated as data still needs an owner; this one emits no
-# trade_signals (chains and signals rows are the product). Replace it with the
-# real DL strategy when that lands: same 'symbols'/'ladders', different key.
-STRATEGIES["chain_recorder"] = {
-    "enabled": True,              # kept on beside rule1: depth counters on /health, no signals
-    "symbols": equity_symbols(),
-    "ladders": ["DL"],
-    "params": {},
-}
-
-# ---------------------------------------------------------------------------
-# The owner's frozen chain-following rules (strategy/rules.py, run verbatim
-# through strategy/chain_rules.py). Each is its OWN pre-registered 200-trade
-# review; the package is explicit that trades are never pooled across ladders
-# or rules, which is why a rule on two ladders is two strategies.
-#
-# LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is 3m;
-# on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is 45s. The
-# adapter logs the resolved (level, rung) pairs at start. `entry_tf` /
-# `confirm_tf` pin a rule to rungs by name when a level number would land
-# somewhere else on a different ladder.
-#
-# All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the executor
-# never sends their signals to a venue, in paper or live mode. Crypto LONGs
-# would otherwise reach Coinbase.
-# ---------------------------------------------------------------------------
-STRATEGIES["rule1_v1"] = {                       # the research rule, on the research ladder
-    "enabled": True,
-    "symbols": equity_symbols(),
-    "ladders": ["ED"],
-    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 3m, L3 = 5m
-}
-STRATEGIES["rule1_new_literal_v1"] = {           # the same rule's level numbers on the dense ladder
-    "enabled": True,
-    "symbols": equity_symbols(),
-    "ladders": ["DL"],
-    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
-}
-STRATEGIES["rule3_v1"] = {                       # crypto, pre-registered 2026-10-17
-    "enabled": True,
-    "symbols": crypto_symbols(),
-    "ladders": ["FC"],                           # FC's P2 = 3m, L3 = 5m: the research ladder's
-    "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
-}
-# The two new-ladder crypto rules, on the CN universe only (the seconds rungs
-# are built from trades for ASSET_CONFIGS["crypto"]["subminute_symbols"]).
-STRATEGIES["rule3_new_literal_v1"] = {
-    "enabled": True,
-    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
-    "ladders": ["CN"],
-    "params": {"rule": "RULE3_NEW_LITERAL", "tick_seconds": 15},  # P2 = 45s, L3 = 1m
-}
-STRATEGIES["rule3_new_equiv_v1"] = {
-    "enabled": True,
-    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
-    "ladders": ["CN"],
-    "params": {"rule": "RULE3_NEW_EQUIV", "entry_tf": "3m", "confirm_tf": "5m",
-               "tick_seconds": 15},                               # pinned by rung, not level
+    # -----------------------------------------------------------------------
+    # The owner's frozen chain-following rules (strategy/rules.py, run
+    # verbatim through strategy/chain_rules.py). Each is its OWN
+    # pre-registered 200-trade review; the package is explicit that trades
+    # are never pooled across ladders or rules, which is why a rule on two
+    # ladders is two strategies.
+    #
+    # LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is
+    # 3m; on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is
+    # 45s. The adapter logs the resolved (level, rung) pairs at start.
+    # `entry_tf` / `confirm_tf` pin a rule to rungs by name when a level
+    # number would land somewhere else on a different ladder.
+    #
+    # All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the
+    # executor never sends their signals to a venue, in paper or live mode.
+    # Crypto LONGs would otherwise reach Coinbase.
+    # -----------------------------------------------------------------------
+    "rule1_v1": {                       # the research rule, on the research ladder
+        "enabled": True,
+        "symbols": equity_symbols(),
+        "ladders": ["ED"],
+        "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 3m, L3 = 5m
+    },
+    "rule1_new_literal_v1": {           # the same rule's level numbers on the dense ladder
+        "enabled": True,
+        "symbols": equity_symbols(),
+        "ladders": ["DL"],
+        "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
+    },
+    "rule3_v1": {                       # crypto, pre-registered 2026-10-17
+        "enabled": True,
+        "symbols": crypto_symbols(),
+        "ladders": ["FC"],              # FC's P2 = 3m, L3 = 5m: the research ladder's
+        "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
+    },
+    # The two new-ladder crypto rules, on the CN universe only (the seconds
+    # rungs are built from trades for ASSET_CONFIGS["crypto"]["subminute_symbols"]).
+    "rule3_new_literal_v1": {
+        "enabled": True,
+        "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+        "ladders": ["CN"],
+        "params": {"rule": "RULE3_NEW_LITERAL", "tick_seconds": 15},  # P2 = 45s, L3 = 1m
+    },
+    "rule3_new_equiv_v1": {
+        "enabled": True,
+        "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+        "ladders": ["CN"],
+        "params": {"rule": "RULE3_NEW_EQUIV", "entry_tf": "3m", "confirm_tf": "5m",
+                   "tick_seconds": 15},                               # pinned by rung, not level
+    },
 }
 
 # Strategies whose signals the executor must NEVER route to a venue, in any
@@ -433,25 +369,16 @@ SHADOW_ONLY_STRATEGIES = frozenset(
 # (research_quotes has the measured spread per signal).
 SHADOW_FEE_BPS_BY_CLASS = {"equity": 5}
 
-# Extra ladders to register beyond the built-in A and B (name -> timeframes).
-# A strategy referencing a ladder name not here (and not A/B) fails at startup.
+# Every ladder the system knows (name -> timeframes, ascending). A strategy
+# referencing a ladder name not here fails at startup.
 EXTRA_LADDERS = {
     "FC": ["1m", "3m", "5m", "15m", "1h"],   # confirmed_15m strategy's ladder
-    # prior_failure_scaleout's ladder: the research's 10-level hierarchy.
-    # Levels: 1m=P1 .. 6h=P9, 12h=P10. Entry at P2 (3m); the scale-out
-    # schedule's last tranche is offset 7 = P9 = 6h, so 12h sits ABOVE the
-    # schedule — kept in the ladder so live chain records stay depth-comparable
-    # with the research population, at a cost of 2 forecasts/day/symbol.
-    # PF shares 1m/3m/5m/15m/1h with FC; the ForecastMemo dedupes those
-    # (Sumtyme is deterministic), so PF's marginal Sumtyme demand is only its
-    # five new rungs (~70 calls/day/symbol), not a doubling of the shared ones.
-    "PF": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h"],
     # DL — the dense equity ladder (ASSET_CONFIGS["equity"]). 12 rungs; a
     # chain climbs one rung at a time (no skipping), so 3m→15m is one step
     # like any other. Levels: 30s=L1 .. 6h=L12. Shares 1m/3m/15m/1h LABELS
     # with FC, but the memo keys on asset class, so equity and crypto windows
-    # never collide; ownership (chain_recorder on equities, confirmed_15m on
-    # crypto) keeps the router from building DL machines for crypto symbols.
+    # never collide; ownership (equity strategies only) keeps the router from
+    # building DL machines for crypto symbols.
     "DL": ["30s", "45s", "1m", "90s", "2m", "3m",
            "15m", "30m", "1h", "2h", "4h", "6h"],
     # ED — the equity DEFAULT ladder (1m base), on which rule1_v1's 216
@@ -468,10 +395,8 @@ EXTRA_LADDERS = {
 # Rungs whose short/unwarmed buffer is EXPECTED and acceptable, per ladder
 # (ladder name -> timeframes). Downgrades the machine's hydrate fill report
 # from WARNING to INFO for those rungs — logging only; an unwarmed rung is
-# inert either way. PF's 12h needs ~6.9y of venue history (BTC-USD only), and
-# nothing in prior_failure_scaleout depends on it (schedule tops at 6h).
+# inert either way.
 LADDER_OPTIONAL_TIMEFRAMES = {
-    "PF": ["12h"],
     # 5000 × 6h of EQUITY session time is years of history; a young listing
     # cannot warm these and they fill live. Logging only.
     "DL": ["4h", "6h"],

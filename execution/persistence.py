@@ -38,7 +38,7 @@ persist_trade writes it, load_open_trades reads it. Apply 014 before running
 this module against a multi-strategy deployment — without it, load_open_trades'
 SELECT of the strategy column fails, and (worse, if you removed the SELECT)
 two strategies holding a position on the same (chain_id, side) would collide on
-one in-memory key. DEFAULT_STRATEGY below only documents the column's default.
+one in-memory key.
 """
 from __future__ import annotations
 
@@ -60,12 +60,6 @@ from execution.pricing import CapConfig
 from execution.types import OrderIntent, TradeSide
 
 log = logging.getLogger("executor.persistence")
-
-# The `trades.strategy` column default (migration 014), mirroring 011's default
-# on trade_signals. load_open_trades reads the real column; this constant is kept
-# only as documentation of what a row with no explicit strategy resolves to.
-DEFAULT_STRATEGY = "two_ladder"
-
 
 def _position_key(chain_id: str, side: str) -> str:
     """Reproduce signal_writer.position_key exactly: chain + directional suffix.
@@ -103,15 +97,12 @@ def make_persist_trade(pool: asyncpg.Pool):
                 INSERT INTO trades
                     (trade_id, chain_id, symbol, asset_class, side, state,
                      entry_client_order_id, entry_target_qty, entry_filled_qty,
-                     exit_filled_qty, strategy, scale_banked, exit_reason,
-                     last_updated)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                        $12::jsonb, $13, now())
+                     exit_filled_qty, strategy, exit_reason, last_updated)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
                 ON CONFLICT (chain_id, side) DO UPDATE SET
                     state             = EXCLUDED.state,
                     entry_filled_qty  = EXCLUDED.entry_filled_qty,
                     exit_filled_qty   = EXCLUDED.exit_filled_qty,
-                    scale_banked      = EXCLUDED.scale_banked,
                     exit_reason       = EXCLUDED.exit_reason,
                     last_updated      = now()
                 WHERE trades.trade_id = EXCLUDED.trade_id
@@ -120,13 +111,10 @@ def make_persist_trade(pool: asyncpg.Pool):
                 t.trade_id, chain_id, t.symbol, t.asset_class, t.side.value,
                 t.state, t.entry_client_order_id, t.target_qty, t.filled_qty,
                 t.exit_filled_qty, t.strategy,
-                # scale_banked: {trigger_level -> fraction}, both as STRINGS so
-                # the fractions stay exact decimals through JSON (a JSON number
-                # would round-trip through binary float). Empty for whole-exit
-                # strategies. exit_reason: the reason driving the current/last
-                # exit lifecycle (distinguishes closing-a-tranche from
-                # closing-for-good across a restart — migration 017).
-                json.dumps({str(k): str(v) for k, v in t.scale_banked.items()}),
+                # exit_reason: the reason driving the current/last close, so a
+                # close requested but not yet issued survives a restart
+                # (migration 017). trades.scale_banked (also 017) is no longer
+                # written: it keeps its '{}' default, or a historical value.
                 t.exit_reason,
             )
         if written is None:
@@ -320,7 +308,7 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 SELECT t.trade_id, t.chain_id, t.symbol, t.asset_class, t.side,
                        t.state, t.entry_client_order_id, t.entry_target_qty,
                        t.entry_filled_qty, t.exit_filled_qty, t.strategy,
-                       t.scale_banked::text AS scale_banked_json, t.exit_reason,
+                       t.exit_reason,
                        es.escalation_rung,
                        (EXTRACT(EPOCH FROM es.escalation_deadline) * 1000)::bigint
                            AS escalation_deadline_ms
@@ -329,6 +317,27 @@ def make_load_open_trades(pool: asyncpg.Pool):
                  WHERE t.state NOT IN ('CLOSED', 'REJECTED')
                 """
             )
+            # Exit quantity the venue REPORTED filled per order (orders.filled_qty,
+            # from submit/cancel results) beyond the fills the stream has
+            # delivered for that order. The executor nets it out of the next
+            # exit rung; it was in memory only, so a restart forgot it and the
+            # next rung could oversell.
+            unstreamed_rows = await conn.fetch(
+                """
+                SELECT o.trade_id, o.client_order_id,
+                       o.filled_qty - COALESCE(SUM(f.qty), 0) AS unstreamed
+                  FROM orders o
+                  JOIN trades t ON t.trade_id = o.trade_id
+                  LEFT JOIN fills f ON f.order_id = o.order_id
+                 WHERE o.intent = 'EXIT' AND t.state NOT IN ('CLOSED', 'REJECTED')
+                 GROUP BY o.order_id
+                HAVING o.filled_qty > COALESCE(SUM(f.qty), 0)
+                """
+            )
+        unstreamed: dict = {}
+        for u in unstreamed_rows:
+            unstreamed.setdefault(str(u["trade_id"]), {})[u["client_order_id"]] = \
+                Decimal(u["unstreamed"])
         out: list[OpenTrade] = []
         for r in rows:
             side = TradeSide(r["side"])
@@ -348,15 +357,11 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 # NULL when no exit_state row exists yet; keep the field default (0).
                 exit_rung=r["escalation_rung"] if r["escalation_rung"] is not None else 0,
                 exit_deadline_ms=int(deadline_ms) if deadline_ms is not None else None,
-                # Scale-out state (migration 017): banked tranches back to
-                # {int level -> Decimal fraction} (stored as strings for
-                # exactness), and the driving exit reason — together these let
-                # a restarted executor tell a CLOSING tranche (returns to OPEN)
-                # from a CLOSING final (finalizes CLOSED), and recompute the
-                # scale deficit from durable state alone.
-                scale_banked={int(k): Decimal(v)
-                              for k, v in json.loads(r["scale_banked_json"] or "{}").items()},
+                # The driving exit reason (migration 017): a close requested
+                # but not yet issued is re-queued at boot. A historical SCALE
+                # here is handled by SignalExecutor.start (never a close).
                 exit_reason=r["exit_reason"],
+                exit_unstreamed=unstreamed.get(str(r["trade_id"]), {}),
             ))
         return out
     return load_open_trades

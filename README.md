@@ -126,9 +126,9 @@ executor routes any signal for an asset class its venue does not trade to the
 shadow book, so an equity strategy on DL gets virtual round trips at
 `decision_price` without a venue.
 
-**Disabled, kept in the tree** (ADR-001 debt D1/D2): `two_ladder` (sub-minute
-A/B ladders; no crypto source) and `prior_failure_scaleout` (scale-out exits;
-expected to be replaced).
+The former `two_ladder` and `prior_failure_scaleout` strategies are deleted
+(ADR-001 debts D1/D2 closed), with the built-in A/B ladders and the executor's
+scale-out (partial exit) support; every exit closes the whole position.
 
 Positions are keyed `position_key = (chain_id, side)` and scoped by strategy, so
 two strategies can hold independent positions on the same chain.
@@ -229,8 +229,12 @@ risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
 - **Execution caps** (`execution_caps`): marketable-limit caps per class and
   intent, with an exit escalation ladder that HALTs at the top. Hot-reloadable.
 - **HALTs** are logged at ERROR and stay visible in `trades` (`state = 'HALTED'`,
-  `halt_reason`); a refused boot is logged and retried every few minutes. There is
-  no alerting.
+  `halt_reason`); a refused boot is logged and retried every few minutes.
+- **Alerts** go to Slack (`SLACK_WEBHOOK_URL`, `ops/alerts.py`): every trade
+  opened (paper or live one by one; shadow batched every 15 min), HALTs, boot failures and crashes, stuck
+  signals, kill-switch and trade-mode changes, pipeline stalls, and a daily
+  summary. Each process also pings a dead-man's switch (`HEARTBEAT_URL_*`) while
+  healthy, so a dead or wedged process alerts by going quiet. RUNBOOK §5.
 - **Idempotency everywhere**: `signal_id`, `client_order_id` (deterministic `cv1`;
   Coinbase returns the existing order for a repeated id), `venue_exec_id`, and a
   unique `(chain_id, side)` on trades.
@@ -304,12 +308,18 @@ unroutable by design.
 - **Bar latency.** Coinbase revises a closed candle for up to ~36 s, so the feed
   emits a bar 60 s after its window closes. Thin books omit no-trade minutes; the
   gaps pass through.
-- **Bar ordering.** The Coinbase feed publishes each symbol's bars in
-  CLOSE-TIME order across all its rungs, the shorter rung first on a tie
-  (`CloseOrderMerge` in `feeds/coinbase_spot.py`): a bar waits until every rung
-  of its symbol has been read past its close. The chain machines apply bars in
-  arrival order, so without this the poll timing decided whether a chain
-  propagated or terminated.
+- **Bar ordering.** Every feed publishes each symbol's bars in CLOSE-TIME
+  order across all its rungs, the shorter rung first on a tie. The chain
+  machines apply bars in arrival order, so without this the poll timing decided
+  whether a chain propagated or terminated. The REST feeds (Coinbase, Polygon)
+  poll each rung at its window close and pass the bars through
+  `CloseOrderMerge` (`feeds/close_order.py`): a bar waits only until every rung
+  that could still produce an earlier-closing bar has been read past it. The
+  Polygon websocket builds every rung from the same 1-second stream, already
+  in close order; its reconnect backfill is merged into close order too, and a
+  window the backfill already emitted is never published again. Polygon REST
+  emits an aggregate 5 s after its window ends (late minute aggregates), and
+  builds 2m/3m from 1-minute aggregates live as in history.
 - **Bar times.** Bars are labelled by their OPEN time, and that label is what
   `chain_steps.step_time`, `chains.origin_time` and `trade_signals.decided_at`
   record. A signal's information exists at its bar's CLOSE (= label + one
@@ -326,8 +336,9 @@ unroutable by design.
   hydrates its buffers to where the last run got; Kafka replays the rest and
   machines drop any bar not newer than their buffer. A new consumer group reads
   the topic from the earliest offset. The feed resumes from the newest stored
-  bar (or warmup's cursor, if newer). The store grows by every live bar
-  (~15k rows/day for the crypto universe).
+  bar (or warmup's cursor, if newer). The signal process prunes the store
+  hourly to the newest `BAR_STORE_KEEP_PER_STREAM` (6000) rows per (symbol,
+  timeframe); a machine only ever reads the newest 5000.
 - **State-machine sync.** The chain machine is copied from CausaView's
   `service_2_sumtyme_bridge.process_forecast`, not shared as a library (ADR-001
   debt D9). The INIT condition, the one-rung-at-a-time PROPAGATE loop and both

@@ -1,41 +1,24 @@
 """
-producer/fanout_router_multi.py — generalized bars-in, tagged-events-out router.
+producer/fanout_router_multi.py — bars in, ladder-tagged chain events out.
 
-The multi-ladder generalization of producer/fanout_router.py. The original router
-is hardwired to the two-ladder ChainSet enum (A/B); this one keys machines by
-LADDER NAME from the LadderRegistry, so it can run ANY set of ladders — the
-two-ladder A/B AND the confirmed_15m FC ladder [1m,3m,5m,15m,1h] — in one process,
-computing each ladder's chains once (compute-once: a ladder shared by strategies
-runs a single machine per symbol).
+One ChainMachine per (symbol, ladder), keyed by LADDER NAME from the
+LadderRegistry, lazily created and hydrated once; a ladder shared by several
+strategies runs a single machine per symbol (compute once).
 
-WHAT CARRIES OVER UNCHANGED (the original router's guarantees):
-  * one ChainMachine per (symbol, ladder), lazily created + hydrated once;
-  * for each closed bar, fan out to EVERY ladder whose timeframes contain the
-    bar's timeframe (registry.ladders_for_timeframe);
-  * run each machine, tag events with the producing ladder, publish;
-  * ALL work for a symbol under that symbol's lock (shared with the consumer
-    runtime + executor), so producer and consumer never interleave for a symbol;
-  * deterministic ladder order for stable interleaving;
-  * one machine failing on a bar does not poison the others.
+  * For each closed bar, fan out to EVERY owned ladder whose timeframes contain
+    the bar's timeframe (registry.ladders_for_timeframe), in deterministic
+    registry order.
+  * All of a symbol's work happens under that symbol's lock, shared with the
+    strategy runtime, so producer and consumer never interleave for a symbol.
+  * One machine failing on a bar does not poison the others.
+  * The bar is split into prepare (lock) / forecast (no lock, concurrent) /
+    apply (lock, in arrival order) — see producer/symbol_workers.py.
 
-WHAT'S GENERALIZED:
-  * MachineFactory is (symbol, ladder_name, ladder_timeframes) -> ChainMachine,
-    not (symbol, ChainSet). The factory builds the right machine for any ladder.
-  * Tagging: events carry the LADDER NAME. For backward compatibility with the
-    two-ladder ChainView (which consumes a ChainSet `set` tag), when the ladder
-    name is a known ChainSet value ("A"/"B") we ALSO populate `set`; for other
-    ladders `set` is left as the ladder name string. Consumers that key on the
-    ladder name (the confirmed_15m adapter) read `ladder`; the two-ladder ChainView
-    reads `set` and only ever sees A/B events (its strategies only subscribe to
-    A/B), so it is unaffected.
+## The event shape
 
-## The tagged event shape
-
-TaggedChainEvent already has `set`. We add `ladder` (the ladder name) via a thin
-wrapper dict at publish time — the wire/raw form carries both `set` and `ladder`,
-and TaggedChainEvent.from_raw reads `set`. The multi-runtime's strategies get the
-raw event through their adapters and can read `ladder`. This keeps the existing
-consumer contract intact while adding the ladder name for new consumers.
+Each event is a raw dict carrying `ladder` (the producing ladder's name), plus
+`set` with the same value for consumers of the chain-events topic that still
+read that key.
 """
 from __future__ import annotations
 
@@ -56,12 +39,10 @@ log = logging.getLogger("producer.fanout_multi")
 
 
 # Factory: build a ChainMachine for one (symbol, ladder_name, ladder_timeframes).
-# Generalized from the original (symbol, ChainSet) so any ladder can be built.
 MachineFactory = Callable[[str, str, List[str]], "ChainMachine"]
 
-# Sink the router publishes RAW tagged-event dicts to. Raw (not TaggedChainEvent)
-# so the dict can carry both `set` (back-comp) and `ladder` (the general name),
-# and so the same publish can go to Kafka (needs a dict) and the runtime.
+# Sink the router publishes RAW tagged-event dicts to, so the same publish can
+# go to Kafka (needs a dict) and the runtime.
 PublishRaw = Callable[[dict], Awaitable[None]]
 
 # Predicate: does at least one enabled strategy read (symbol, ladder)? Injected
@@ -69,11 +50,6 @@ PublishRaw = Callable[[dict], Awaitable[None]]
 # None predicate means "compute every timeframe-matched ladder" — the original
 # behaviour, preserved for callers/tests that don't supply ownership.
 OwnsPredicate = Callable[[str, str], bool]
-
-
-# Ladder names that correspond to the two-ladder ChainSet enum, so we can keep
-# populating `set` for them (backward compatibility with the two-ladder view).
-_CHAINSET_LADDERS = {"A", "B"}
 
 
 @dataclass
@@ -293,15 +269,10 @@ class MultiLadderRouter:
         await self.apply(routed)
 
     def _tag(self, ce: ChainEvent, ladder_name: str) -> dict:
-        """Build the raw tagged-event dict. Carries `ladder` (the general name)
-        and, for A/B ladders, `set` too (so the two-ladder ChainView's
-        from_raw, which requires `set`, keeps working). For non-ChainSet ladders
-        `set` is set to the ladder name so from_raw doesn't raise if a consumer
-        routes such an event through it — though the confirmed_15m adapter reads the
-        raw dict directly and doesn't require `set`."""
-        set_tag = ladder_name  # for A/B this equals the ChainSet value ("A"/"B")
+        """Build the raw tagged-event dict. `set` repeats the ladder name for
+        chain-events topic consumers that read that key."""
         return {
-            "set": set_tag,
+            "set": ladder_name,
             "ladder": ladder_name,
             "event_type": ce.event_type,
             "chain_id": ce.chain_id,

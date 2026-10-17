@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import List, Optional, Set
+from typing import List, Optional
 
 from execution.adapter import ExecutionAdapter, FillCallback
 from execution.trade_enable import TradeEnableState

@@ -173,7 +173,9 @@ async def test_subminute_rest_live_loop_emits_via_callback(monkeypatch):
     monkeypatch.setattr(pa.random, "uniform", lambda a, b: 0.0)
     try:
         await asyncio.wait_for(
-            f.start_live(["AAPL"], ["30s"], {"AAPL": {"30s": t0}}, cb), timeout=5)
+            # The seeded cursor is the newest bar ALREADY seen: live starts one
+            # window after it (it used to re-emit the seeded bar).
+            f.start_live(["AAPL"], ["30s"], {"AAPL": {"30s": t0 - w}}, cb), timeout=5)
     except asyncio.CancelledError:
         pass
     assert [p.timestamp for p in got] == [t0]
@@ -357,3 +359,57 @@ async def test_verifier_rest_pass_runs_each_source_rule(monkeypatch):
     assert fails == [], fails
     # Only 1-minute aggs and trades were requested — never a 3m or 30s aggregate.
     assert all("/range/1/minute/" in u or "/v3/trades/" in u for u in fake.requests)
+
+
+# ---------------------------------------------------------------------------
+# 5. REST live: rungs published in close-time order
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rest_live_publishes_rungs_in_close_time_order(monkeypatch):
+    base = 1_700_000_000_000 // (3 * MIN) * (3 * MIN)
+    fake = FakePolygon(minute_bars=minute_series(base, 12))
+    f = feed_with(fake, ["1m", "3m"])
+    import feeds.polygon_aggs as pa
+    now_ms = base + 12 * MIN + 6_000          # every window through base+12m has settled
+
+    class _Now:
+        @staticmethod
+        def now(tz=None):
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_s):
+        await real_sleep(0)
+
+    monkeypatch.setattr(pa, "datetime", _Now)
+    monkeypatch.setattr(pa, "is_market_open", lambda ac, now: True)
+    monkeypatch.setattr(pa.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(pa.asyncio, "sleep", fast_sleep)
+    got = []
+
+    async def cb(points):
+        got.extend(points)
+
+    seeded = {"1m": base - MIN, "3m": base - 3 * MIN}     # newest bars already seen
+    task = asyncio.create_task(f.start_live(["AAPL"], ["1m", "3m"], {"AAPL": seeded}, cb))
+    for _ in range(200):
+        await real_sleep(0)
+    f._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    tf_ms = {"1m": MIN, "3m": 3 * MIN}
+    keys = [(p.timestamp + tf_ms[p.timeframe], tf_ms[p.timeframe]) for p in got]
+    assert keys == sorted(keys)                            # close order, 1m first on ties
+    assert len(keys) == len(set(keys))
+    expected = {(t + tf_ms[tf], tf_ms[tf]) for tf in ("1m", "3m")
+                for t in range(base, base + 12 * MIN, tf_ms[tf])}
+    assert set(keys) == expected
+    # 3m is derived from 1-minute aggregates live, as in history.
+    assert all("/range/1/minute/" in u for u in fake.requests)

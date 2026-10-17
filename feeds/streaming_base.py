@@ -71,6 +71,7 @@ from typing import Optional, Dict, List, Protocol, Sequence, runtime_checkable
 
 from feeds.base import AssetFeed, LiveDataCallback, is_market_open, timeframe_to_ms
 from feeds.bar_aggregator import BarAggregator
+from feeds.close_order import order_key
 from producer.bar import OHLCPoint
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,8 @@ class StreamingFeedBase(AssetFeed, ABC):
         # depend on start_live having run first. start_live seeds it from
         # initial_cursors on top of this.
         self._backfill_cursors: Dict[str, Dict[str, int]] = {}
+        # Serialises the live, flush and backfill publishes (see _emit).
+        self._emit_lock = asyncio.Lock()
         # Finest configured timeframe in ms; set in start_live. Kept as an
         # attribute (not a start_live local) so _staleness_window_s can read
         # it, with a floor fallback when unset.
@@ -348,8 +351,7 @@ class StreamingFeedBase(AssetFeed, ABC):
             for (symbol, src_t, o, h, l, c) in bars:
                 emitted.extend(aggregator.add_source_bar(symbol, src_t, o, h, l, c))
             if emitted:
-                self._advance_cursors(emitted)
-                await callback(emitted)
+                await self._emit(emitted, callback)
 
     def _staleness_window_s(self) -> float:
         """Seconds of silence (during an open market) that we treat as a
@@ -378,8 +380,7 @@ class StreamingFeedBase(AssetFeed, ABC):
             await asyncio.sleep(self.FLUSH_INTERVAL_S)
             emitted = aggregator.flush_elapsed(self._now_ms())
             if emitted:
-                self._advance_cursors(emitted)
-                await callback(emitted)
+                await self._emit(emitted, callback)
 
     def _can_backfill_tf(self, tf: str) -> bool:
         """Whether the composed REST sibling can actually backfill this timeframe.
@@ -428,22 +429,39 @@ class StreamingFeedBase(AssetFeed, ABC):
             self.name, (now_ms - since_ms) / 1000.0, len(symbols), len(backfillable),
         )
         for symbol in symbols:
+            # All of a symbol's rungs first, then ONE close-time-ordered emit:
+            # rung by rung would publish every 30s bar of the outage before
+            # any 45s bar.
+            got: List[OHLCPoint] = []
             for tf in backfillable:
                 try:
-                    bars = await fetch_range_or_recent(
+                    got.extend(await fetch_range_or_recent(
                         self._backfill_feed, symbol, tf, since_ms, now_ms,
-                    )
+                    ))
                 except Exception:
                     logger.exception(
                         "[%s] backfill failed for %s %s; live will resume "
                         "(gap remains until next bar)", self.name, symbol, tf,
                     )
-                    continue
-                cursor = self._backfill_cursors.get(symbol, {}).get(tf)
-                fresh = [b for b in bars if cursor is None or b.timestamp > cursor]
-                if fresh:
-                    self._advance_cursors(fresh)
-                    await callback(fresh)
+            if got:
+                await self._emit(got, callback)
+
+    async def _emit(self, bars: List[OHLCPoint], callback: LiveDataCallback) -> None:
+        """The one publish point for the live, flush and backfill paths.
+        Drops any bar not newer than what was already emitted for its
+        (symbol, timeframe) — after a reconnect the aggregator can still hold
+        the window that was open at the disconnect, which the backfill has
+        since emitted whole — sorts the rest into close-time order, and holds
+        a lock so the three paths' batches never interleave on the wire."""
+        async with self._emit_lock:
+            fresh = [b for b in bars
+                     if b.timestamp > self._backfill_cursors.get(b.symbol, {})
+                     .get(b.timeframe, -1)]
+            if not fresh:
+                return
+            fresh.sort(key=order_key)
+            self._advance_cursors(fresh)
+            await callback(fresh)
 
     def _advance_cursors(self, bars: List[OHLCPoint]) -> None:
         """Move each (symbol, timeframe) high-water cursor to the latest

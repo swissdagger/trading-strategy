@@ -2,9 +2,9 @@
 Tests for strategy/multi_runtime.py — the fan-out, namespacing, and exit
 routing across multiple strategies.
 
-Uses fake strategies whose entry/exit fire on command, an in-memory persistence
-hooks, and a minimal ChainView stand-in, so we test the runtime's orchestration
-without the real strategy or Sumtyme machinery.
+Uses fake strategies whose entry/exit fire on command and in-memory persistence
+hooks, so we test the runtime's orchestration without the real strategy or
+Sumtyme machinery.
 """
 import pytest
 
@@ -16,19 +16,10 @@ from strategy.multi_runtime import MultiStrategyRuntime, OpenPosition, RuntimeHo
 # Fakes
 # --------------------------------------------------------------------
 
-class FakeView:
-    def __init__(self):
-        self.applied = []
-    def apply(self, ev):
-        self.applied.append(ev)
-
-
 def raw_event(symbol, asset_class="equity", timestamp="2026-01-01T00:00:00Z",
               ladder="FC", chain_id="c", direction=1, propagation_level=1,
               event_type="chain_propagated"):
-    """Build a raw event dict as the router produces. Defaults to a non-A/B
-    ladder ('FC') so the two-ladder ChainView isn't folded (the fakes here don't
-    exercise it); A/B routing is covered by the two-ladder path's own tests."""
+    """Build a raw event dict as the router produces."""
     return {
         "symbol": symbol, "asset_class": asset_class, "timestamp": timestamp,
         "ladder": ladder, "set": ladder, "chain_id": chain_id,
@@ -100,7 +91,7 @@ async def test_both_strategies_get_entry():
     x1, x2 = ScriptedExit(), ScriptedExit()
     s1 = _strategy("s1", e1, x1, ["AAPL"])
     s2 = _strategy("s2", e2, x2, ["AAPL"])
-    rt = MultiStrategyRuntime(FakeView(), _registry(s1, s2), MemHooks())
+    rt = MultiStrategyRuntime(_registry(s1, s2), MemHooks())
 
     await rt.on_raw_event_direct(raw_event("AAPL"))
     # Both strategies' entry evaluated.
@@ -117,7 +108,7 @@ async def test_namespaced_positions_do_not_collide():
     s1 = _strategy("s1", e1, x1, ["AAPL"])
     s2 = _strategy("s2", e2, x2, ["AAPL"])
     hooks = MemHooks()
-    rt = MultiStrategyRuntime(FakeView(), _registry(s1, s2), hooks)
+    rt = MultiStrategyRuntime(_registry(s1, s2), hooks)
 
     await rt.on_raw_event_direct(raw_event("AAPL"))
     # Two DISTINCT tracked positions despite the same base chain key.
@@ -134,7 +125,7 @@ async def test_exit_routes_to_owning_strategy():
     s1 = _strategy("s1", e1, x1, ["AAPL"])
     s2 = _strategy("s2", e2, x2, ["AAPL"])
     hooks = MemHooks()
-    rt = MultiStrategyRuntime(FakeView(), _registry(s1, s2), hooks)
+    rt = MultiStrategyRuntime(_registry(s1, s2), hooks)
 
     # Open both positions.
     await rt.on_raw_event_direct(raw_event("AAPL"))
@@ -157,7 +148,7 @@ async def test_disabled_strategy_position_not_evaluated(caplog):
     s1 = _strategy("s1", e1, x1, ["AAPL"])
     hooks = MemHooks()
     reg = _registry(s1)
-    rt = MultiStrategyRuntime(FakeView(), reg, hooks)
+    rt = MultiStrategyRuntime(reg, hooks)
     await rt.on_raw_event_direct(raw_event("AAPL"))
     assert "s1/chainX:L" in hooks.store
 
@@ -174,7 +165,7 @@ async def test_only_subscribed_strategies_act():
     x1, x2 = ScriptedExit(), ScriptedExit()
     s1 = _strategy("s1", e1, x1, ["AAPL"])          # AAPL only
     s2 = _strategy("s2", e2, x2, ["MSFT"])          # MSFT only
-    rt = MultiStrategyRuntime(FakeView(), _registry(s1, s2), MemHooks())
+    rt = MultiStrategyRuntime(_registry(s1, s2), MemHooks())
 
     await rt.on_raw_event_direct(raw_event("AAPL"))
     assert e1.calls == 1
@@ -191,7 +182,7 @@ async def test_restart_restores_positions():
     )
     e1, x1 = ScriptedEntry(), ScriptedExit()
     s1 = _strategy("s1", e1, x1, ["AAPL"])
-    rt = MultiStrategyRuntime(FakeView(), _registry(s1), hooks)
+    rt = MultiStrategyRuntime(_registry(s1), hooks)
     await rt.start()
     # The restored position is now tracked for exit evaluation.
     x1.exit_keys.add("chainX:L")
@@ -200,40 +191,21 @@ async def test_restart_restores_positions():
 
 
 # --------------------------------------------------------------------
-# Backward-compat: the two-ladder path through the raw-dict runtime
+# Ladder routing
 # --------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_two_ladder_view_folded_for_ab_events():
-    """An A/B-ladder raw event folds the two-ladder ChainView and reaches the
-    strategy as a TaggedChainEvent; a non-A/B (FC) event does NOT touch the
-    two-ladder view."""
-    from strategy.chain_view import ChainView, ChainSet
-
-    class TLEntry:
+async def test_a_strategy_only_sees_events_from_its_declared_ladders():
+    class Entry:
         def __init__(self): self.seen = []
         async def on_event(self, ev):
-            self.seen.append(ev); return None
-    class TLExit:
+            self.seen.append((ev.ladder, ev.chain_id)); return None
+    class Exit:
         async def maybe_emit_exit(self, **kw): return None
 
-    view = ChainView()
-    entry = TLEntry()
-    s = Strategy(name="two_ladder", entry=entry, exit=TLExit(),
-                 symbols=["AAPL"], ladders=["A", "B"])
-    reg = _registry(s)
-    rt = MultiStrategyRuntime(view, reg, MemHooks())
-
-    # A-ladder event: view folded, strategy sees a TaggedChainEvent with .set.
-    await rt.on_raw_event(raw_event("AAPL", ladder="A", chain_id="cA",
-                                    propagation_level=5))
-    assert view.get_chain("AAPL", ChainSet.A, "cA") is not None
-    assert entry.seen[-1].set == ChainSet.A
-
-    # FC-ladder event on the same symbol: two-ladder view must NOT gain a chain
-    # from it (it isn't an A/B chain).
-    before = len(view.active_chains("AAPL", ChainSet.A)) + len(view.active_chains("AAPL", ChainSet.B))
-    await rt.on_raw_event(raw_event("AAPL", ladder="FC", chain_id="cFC",
-                                    propagation_level=2))
-    after = len(view.active_chains("AAPL", ChainSet.A)) + len(view.active_chains("AAPL", ChainSet.B))
-    assert after == before   # FC event didn't touch the two-ladder view
+    entry = Entry()
+    s = Strategy(name="a_only", entry=entry, exit=Exit(), symbols=["AAPL"], ladders=["A"])
+    rt = MultiStrategyRuntime(_registry(s), MemHooks())
+    await rt.on_raw_event(raw_event("AAPL", ladder="A", chain_id="cA", propagation_level=2))
+    await rt.on_raw_event(raw_event("AAPL", ladder="FC", chain_id="cFC", propagation_level=2))
+    assert entry.seen == [("A", "cA")]

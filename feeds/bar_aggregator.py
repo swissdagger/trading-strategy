@@ -74,6 +74,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from feeds.base import count_synthetic_for_gap, timeframe_to_ms
+from feeds.close_order import order_key
 from producer.bar import OHLCPoint
 
 
@@ -296,9 +297,11 @@ class BarAggregator:
             emitted.extend(
                 self._stream_for(symbol, tf).add(src_t, o, h, l, c)
             )
-        # Stable order: a router/strategy consuming these wants the same
-        # order regardless of dict iteration. Sort by close time then tf.
-        emitted.sort(key=lambda p: (p.timestamp, p.timeframe))
+        # Close-time order, the shorter rung first on a tie: the chain
+        # machines apply bars in arrival order. (This sorted by the window
+        # START and the timeframe STRING, so a 5m and a 1m window closing
+        # together came out 5m first — and '15m' < '1m' as strings.)
+        emitted.sort(key=order_key)
         return emitted
 
     def flush_elapsed(self, now_ms: int) -> List[OHLCPoint]:
@@ -309,5 +312,5 @@ class BarAggregator:
         emitted: List[OHLCPoint] = []
         for stream in self._streams.values():
             emitted.extend(stream.flush_elapsed(now_ms))
-        emitted.sort(key=lambda p: (p.timestamp, p.timeframe))
+        emitted.sort(key=order_key)
         return emitted

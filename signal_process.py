@@ -57,10 +57,11 @@ from producer.fanout_router_multi import MultiLadderRouter
 from producer.forecast_gate import ForecastGate, ForecastMemo
 from producer.offset_tracker import OffsetTracker
 from producer.symbol_workers import SymbolWorkerPool
+from feeds.base import timeframe_to_ms
+from ops.alerts import alert, install_alerting, start_heartbeat
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
-    make_load_chain_view_seed,
     make_load_open_positions,
     # NOTE: only chain_init remains synchronous. persist_signal / chain_propagate
     # / chain_terminate are now served by BatchedAuditWriter (off the hot path);
@@ -68,21 +69,19 @@ from producer.persistence import (
     make_persist_chain_init,
     make_load_buffers,
     make_persist_live_bar,
+    make_prune_bar_store,
     make_load_last_base_signal,
     make_load_strategy_open_entries,
     make_load_opposing_chain_since,
     make_load_chain_confirmed,
 )
 from producer.service2_machine import ServiceTwoChainMachine
-from strategy.chain_view import ChainView, TaggedChainEvent
-from strategy.ladder_registry import default_registry
-from strategy.registry import StrategyRegistry, Strategy
+from strategy.ladder_registry import LadderRegistry
+from strategy.registry import StrategyRegistry
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
-from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
 from strategy.confirmed_15m_adapter import make_confirmed_15m
 from strategy.chain_recorder import make_chain_recorder
 from strategy.chain_rules import make_chain_rule
-from strategy.prior_failure_adapter import make_prior_failure_scaleout
 
 log = logging.getLogger("signal_process")
 
@@ -95,8 +94,8 @@ class Config:
         self.kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
         # Dedicated bar topic on THIS system's Kafka — deliberately NOT named
         # 'raw-prices' so it can't be confused with CausaView's topic. The
-        # trading system's feeds publish the two-ladder granularities here; this
-        # stream is independent of CausaView entirely.
+        # trading system's feeds publish every configured ladder's timeframes
+        # here; this stream is independent of CausaView entirely.
         self.bars_topic = os.environ.get("TRADING_BARS_TOPIC", "trading-bars")
         self.events_topic = os.environ.get("CHAIN_EVENTS_TOPIC", "chain-events")
         self.consumer_group = os.environ.get(
@@ -308,6 +307,9 @@ class SignalProcess:
         self.audit_cache = AuditCache()
         self.metrics = Metrics()
         self._audit_task: Optional[asyncio.Task] = None
+        self._last_bar_monotonic = time.monotonic()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._prune_task: Optional[asyncio.Task] = None
         self._health_server: Optional[HealthServer] = None
 
         # --- Batched audit writer: research/audit writes OFF the hot path ---
@@ -337,38 +339,17 @@ class SignalProcess:
                 strategy=strategy_name,
             )
 
-        # --- Ladder registry: built-in A/B plus any extras from config ---
+        # --- Ladder registry: every ladder comes from config ---
         from config import EXTRA_LADDERS, STRATEGIES
-        self.ladders = default_registry()
+        self.ladders = LadderRegistry()
         for name, tfs in EXTRA_LADDERS.items():
             self.ladders.register(name, tfs)
 
         # --- Strategy registry: register factories, build enabled from config ---
-        view = ChainView()   # the two-ladder shared view (A/B only)
         self.strategies = StrategyRegistry()
-        self.strategies.register_factory(
-            "two_ladder",
-            lambda *, name, symbols, ladders, params: Strategy(
-                name=name,
-                entry=TwoLadderEntry(view, make_writer(name)),
-                exit=TwoLadderExit(view, make_writer(name)),
-                symbols=symbols, ladders=ladders,
-            ),
-        )
         self.strategies.register_factory(
             "confirmed_15m",
             lambda *, name, symbols, ladders, params: make_confirmed_15m(
-                name=name, symbols=symbols, ladders=ladders, params=params,
-                view_registry=self.ladders, writer_factory=make_writer,
-            ),
-        )
-        # prior_failure_scaleout: same factory shape as confirmed_15m (own
-        # ChainHistoryView on its own ladder). Registered UNCONDITIONALLY —
-        # the config's `enabled` flag decides instantiation, and the factory
-        # validates the schedule-fits-ladder invariant loudly at build time.
-        self.strategies.register_factory(
-            "prior_failure_scaleout",
-            lambda *, name, symbols, ladders, params: make_prior_failure_scaleout(
                 name=name, symbols=symbols, ladders=ladders, params=params,
                 view_registry=self.ladders, writer_factory=make_writer,
             ),
@@ -444,9 +425,9 @@ class SignalProcess:
         # strategy actually reads (compute-once, ownership-gated). The ownership
         # set is the (symbol, ladder) pairs enabled strategies declare; the router
         # intersects its timeframe-matched targets with it, so a symbol-scoped
-        # strategy (e.g. two_ladder on AAPL only, confirmed_15m on BTC-USD only)
-        # doesn't make the router compute A/B chains for BTC-USD just because
-        # BTC-USD emits a shared timeframe (1m). Snapshot the set once at startup
+        # strategy (e.g. the CN-ladder rules on BTC-USD only) doesn't make the
+        # router compute CN chains for every crypto symbol just because they all
+        # emit a shared timeframe (1m). Snapshot the set once at startup
         # (strategies are fixed for the process lifetime). ---
         owned = self.strategies.owned_symbol_ladders()
         self.router = MultiLadderRouter(
@@ -458,7 +439,6 @@ class SignalProcess:
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(
-            view=view,
             registry=self.strategies,
             hooks=self._runtime_hooks(),
             locks=self.router._locks,   # SHARE the router's lock map
@@ -485,6 +465,11 @@ class SignalProcess:
         # just the process. Threaded (stdlib http.server on a daemon thread), NOT
         # async: a wedged event loop is precisely the failure this must report, so
         # the server must not share it.
+        from config import BAR_STORE_KEEP_PER_STREAM, BAR_STORE_PRUNE_INTERVAL_S
+        self._prune_task = asyncio.create_task(
+            self._prune_loop(make_prune_bar_store(self.pool, BAR_STORE_KEEP_PER_STREAM),
+                             BAR_STORE_PRUNE_INTERVAL_S),
+            name="bar-store-prune")
         self._audit_task = asyncio.create_task(
             make_chain_audit_refresher(
                 self.pool, self.audit_cache,
@@ -590,6 +575,18 @@ class SignalProcess:
             )
         return factory
 
+    async def _prune_loop(self, prune, period: float) -> None:
+        """Keep warmup_bars bounded: it gains every live bar (config:
+        BAR_STORE_KEEP_PER_STREAM). First run one period after start, so a
+        restart is not slowed by it."""
+        while not self._stop.is_set():
+            await asyncio.sleep(period)
+            try:
+                deleted = await prune()
+                log.info("bar store pruned: %d row(s) deleted", deleted)
+            except Exception:
+                log.exception("bar store prune failed (retried next period)")
+
     async def _tick_loop(self, comp, period: float) -> None:
         while not self._stop.is_set():
             try:
@@ -618,7 +615,7 @@ class SignalProcess:
             rows = await load_open_rows()
             out = []
             for r in rows:
-                strategy = r.get("strategy", "two_ladder")
+                strategy = r["strategy"]
                 base_pkey = r["position_key"]
                 out.append(OpenPosition(
                     tracking_key=namespaced_position_key(strategy, base_pkey),
@@ -647,8 +644,7 @@ class SignalProcess:
         """Router publish sink: send to Kafka chain-events (audit + any other
         consumers) AND feed the in-process multi-strategy runtime.
 
-        The router produces RAW event dicts (carrying `ladder` and, for A/B,
-        `set`). We forward the dict to Kafka and to the runtime. The runtime's
+        The router produces RAW event dicts (carrying `ladder`). We forward the dict to Kafka and to the runtime. The runtime's
         _process_raw_locked is called DIRECTLY (not on_raw_event) because the
         router already holds this symbol's lock — and the router and runtime
         SHARE one lock map, so re-acquiring would deadlock on the non-reentrant
@@ -671,7 +667,7 @@ class SignalProcess:
         calls runtime._process_raw_locked() assuming the router already holds the
         symbol's lock. The old docstring warned that a blanket create_task per bar
         would let two bars for the SAME symbol run at once — contending for the
-        lock, reaching the ChainView out of order, and silently breaking the
+        lock, reaching the strategies out of order, and silently breaking the
         chain machine's timestamp-ordered propagation WITHOUT RAISING. That
         warning still stands, and it prescribed the fix:
 
@@ -776,15 +772,25 @@ class SignalProcess:
         This is the number that would have made a 39-hour stall obvious on day
         one instead of after a day of watching. Export it (Prometheus/statsd) —
         alert if it exceeds a few bar intervals. Sudden growth here, or growth in
-        SymbolWorkerPool.queue_depths(), is this bug recurring."""
-        age_s = time.time() - (bar.timestamp / 1000.0)
+        SymbolWorkerPool.queue_depths(), is this bug recurring.
+
+        Age is measured from the bar's CLOSE (label + one timeframe): measured
+        from its open label, every 15m/1h bar read as "behind" on arrival."""
+        self._last_bar_monotonic = time.monotonic()
+        age_s = time.time() - (bar.timestamp + timeframe_to_ms(bar.timeframe)) / 1000.0
         if age_s > self.cfg.lag_warn_s:
             log.warning(
-                "PROCESSING LAG: bar %s/%s is %.0fs (%.1fh) old — the pipeline is "
+                "PROCESSING LAG: bar %s/%s closed %.0fs (%.1fh) ago — the pipeline is "
                 "behind. queue depths=%s",
                 bar.symbol, bar.timeframe, age_s, age_s / 3600.0,
                 self.workers.queue_depths() if self.workers else {},
+                extra=alert(f"lag:{bar.symbol}"),
             )
+
+    def bars_flowing(self, within_s: float = 300.0) -> bool:
+        """A bar was consumed in the last within_s (for the heartbeat; the
+        crypto rungs produce one every minute, 24/7)."""
+        return time.monotonic() - self._last_bar_monotonic < within_s
 
     async def _commit_offsets(self) -> None:
         """Commit the contiguous low-water mark, if it advanced. Single-partition
@@ -831,6 +837,10 @@ class SignalProcess:
             self._health_server.stop()
         if self._audit_task is not None:
             self._audit_task.cancel()
+        if self._prune_task is not None:
+            self._prune_task.cancel()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
         for t in getattr(self, "_strategy_tickers", []):
             t.cancel()
 
@@ -876,18 +886,6 @@ def _all_configured_symbols() -> list:
     return out
 
 
-def _tagged_to_wire(tev: TaggedChainEvent) -> dict:
-    """TaggedChainEvent -> JSON dict for Kafka. Carries the 'set' tag so a Kafka
-    consumer can reconstruct it via TaggedChainEvent.from_raw."""
-    return {
-        "set": tev.set.value, "event_type": tev.event_type,
-        "chain_id": tev.chain_id, "symbol": tev.symbol,
-        "asset_class": tev.asset_class, "direction": tev.direction,
-        "metadata": {"propagation_level": tev.propagation_level},
-        "propagation_level": tev.propagation_level, "timestamp": tev.timestamp,
-    }
-
-
 async def amain() -> None:
     logging.basicConfig(
         # Configurable so DEBUG (the `forecast OK` heartbeat, and the audit
@@ -898,6 +896,7 @@ async def amain() -> None:
             logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    install_alerting("signal")
     cfg = Config()
     proc = SignalProcess(cfg)
 
@@ -940,6 +939,7 @@ async def amain() -> None:
 
     try:
         await proc.start()
+        proc._heartbeat_task = start_heartbeat("HEARTBEAT_URL_SIGNAL", proc.bars_flowing)
         await proc.run()
     finally:
         # Don't wait on threads stuck in a hung SDK call — the SDK exposes no

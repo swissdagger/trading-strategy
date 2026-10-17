@@ -10,8 +10,8 @@ data we will get, so instead of dropping them the executor routes them here:
   * EXIT fills at the touch on the opposite side — a short closes by BUYING at
     the ASK.
   * The taker fee is charged on both legs; pnl_bps is net of it.
-  * Whole positions only: SCALE tranches are ignored and the position closes on
-    the final EXIT.
+  * Whole positions only: an EXIT closes the position. A historical SCALE
+    (partial-exit) row is ignored.
   * Shadow-only strategies (the chain rules) fill both legs at the signal's
     decision_price instead, per their spec; the touch only if it is missing.
 
@@ -36,6 +36,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from execution.pricing import is_buy, validate_touch
 from execution.types import OrderIntent, Touch, TradeSide
+from ops.alerts import alert
 
 log = logging.getLogger("executor.shadow")
 
@@ -97,7 +98,8 @@ def _ms_to_dt(ms: int) -> datetime:
 class ShadowBook:
     def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal,
                  fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None,
-                 fee_bps_by_class: Optional[dict] = None):
+                 fee_bps_by_class: Optional[dict] = None,
+                 opened_digest=None):
         """taker_fee_bps: the fallback fee per leg. fee_bps_fn: optional async
         source of the account's real taker fee (the venue's fee tier); when it
         returns a value, that is what a new virtual entry is charged."""
@@ -108,6 +110,9 @@ class ShadowBook:
         # not trade, its fee tier is meaningless (an equity CFD's cost is the
         # half-spread, not Coinbase's taker fee).
         self.fee_bps_by_class = {k: Decimal(str(v)) for k, v in (fee_bps_by_class or {}).items()}
+        # Where "shadow trade opened" alerts collect for a batched Slack post
+        # (ops.alerts.AlertDigest); None alerts once per open.
+        self.opened_digest = opened_digest
         self._open: Dict[Tuple[str, str], ShadowPosition] = {}
 
     async def _fee_bps(self, asset_class: Optional[str] = None) -> Decimal:
@@ -156,7 +161,7 @@ class ShadowBook:
         return None, "none"
 
     async def on_enter(self, row: dict, at_decision_price: bool = False) -> None:
-        strategy = row.get("strategy", "two_ladder")
+        strategy = row["strategy"]
         position_key = row["position_key"]
         if self.holds(strategy, position_key):
             return   # replayed ENTER
@@ -188,20 +193,30 @@ class ShadowBook:
             # add). Track it; the DB row is the original.
             log.info("shadow ENTER %s/%s already recorded", strategy, position_key)
         self._open[(strategy, position_key)] = pos
-        log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
-                 pos.symbol, px, source)
+        if inserted:
+            line = (f"{side.value} {pos.symbol} {pos.asset_class} @ {px} ({source}; fee "
+                    f"{fee_bps} bps/leg; strategy {strategy}, position {position_key})")
+            if self.opened_digest is not None:
+                # Batched: one Slack message per interval lists every open.
+                self.opened_digest.add(line)
+                log.info("SHADOW trade OPENED: %s", line)
+            else:
+                log.info("SHADOW trade OPENED: %s", line,
+                         extra=alert(f"shadow-open:{strategy}:{position_key}", every=0))
+        else:
+            log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
+                     pos.symbol, px, source)
 
     async def on_exit(self, row: dict, at_decision_price: bool = False) -> None:
-        strategy = row.get("strategy", "two_ladder")
+        strategy = row["strategy"]
         position_key = row["position_key"]
         pos = self._open.get((strategy, position_key))
         if pos is None:
             log.debug("shadow EXIT %s/%s: no open virtual position", strategy, position_key)
             return
         if row.get("exit_reason") == "SCALE":
-            # Partial tranches are not modelled: the virtual position closes in
-            # full on the final (non-SCALE) EXIT. Only prior_failure_scaleout
-            # emits SCALE, and it is disabled.
+            # A partial-exit tranche from the removed prior_failure_scaleout
+            # strategy (only a historical row can carry it): never a close.
             log.debug("shadow EXIT %s/%s: SCALE tranche ignored", strategy, position_key)
             return
         px, source = await self._price(row, pos.side, OrderIntent.EXIT, at_decision_price)

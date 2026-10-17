@@ -68,9 +68,10 @@ import asyncio
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, List, Optional
+from typing import Callable, List, Optional
 
 from execution.types import ExitReason, TradeSide
+from ops.alerts import alert
 from strategy import rules as R
 from strategy.rules import Intent, Rule, RuleConfig, Trade, VolState
 
@@ -277,7 +278,8 @@ class ChainRuleEntry:
                 self.stats["write_failures"] += 1
                 self.rule.reject(t.chain_id, intent.action)
                 log.exception("%s %s write failed for %s chain=%s — will retry",
-                              self._name, intent.action, t.symbol, t.chain_id)
+                              self._name, intent.action, t.symbol, t.chain_id,
+                              extra=alert(f"rule-write:{self._name}"))
 
 
 class ChainRuleExit:

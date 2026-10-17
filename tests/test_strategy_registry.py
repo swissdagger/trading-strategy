@@ -8,19 +8,26 @@ Tests for the multi-strategy machinery:
 """
 import pytest
 
-from strategy.ladder_registry import (
-    Ladder,
-    LadderRegistry,
-    default_registry,
-    SET_A_LADDER,
-    SET_B_LADDER,
-)
+from strategy.ladder_registry import Ladder, LadderRegistry
 from strategy.registry import (
     Strategy,
     StrategyRegistry,
     namespaced_position_key,
     split_namespaced_key,
 )
+
+
+# Two overlapping ladders as test data (shapes chosen so one timeframe sits
+# at different levels in each).
+SET_A_LADDER = ["5s", "10s", "30s", "1m", "2m"]
+SET_B_LADDER = ["30s", "1m", "2m", "5m", "10m"]
+
+
+def default_registry() -> LadderRegistry:
+    reg = LadderRegistry()
+    reg.register("A", SET_A_LADDER)
+    reg.register("B", SET_B_LADDER)
+    return reg
 
 
 # --------------------------------------------------------------------

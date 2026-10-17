@@ -55,11 +55,11 @@ class ExitReason(str, Enum):
     TIME = "TIME"
     MANUAL = "MANUAL"
     KILL_SWITCH = "KILL_SWITCH"
-    # Partial-exit reasons (migration 016, prior_failure_scaleout). SCALE is a
-    # scheduled scale-out tranche — TARGET-like, no urgency. TERMINAL is "the
-    # chain terminated, close the remainder" — protective, STOP-like posture.
-    # Until the executor supports partial exits (rollout step 4) it must not
-    # receive SCALE rows; see the interlock in signal_executor._on_exit.
+    # From migration 016 (the removed prior_failure_scaleout strategy). Kept so
+    # historical rows parse. SCALE was a partial-exit tranche: nothing emits it
+    # any more, and the executor and shadow book ignore a SCALE EXIT row (never
+    # a close). TERMINAL ("chain terminated, close the remainder") is an
+    # ordinary whole-position close.
     SCALE = "SCALE"
     TERMINAL = "TERMINAL"
 

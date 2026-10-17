@@ -53,8 +53,10 @@ the same dedupe makes the overlap safe.
 
 ## Failed signals are retried
 
-A signal whose handler raised is kept in a retry set and re-dispatched every
-_RETRY_INTERVAL_S while the listener runs. The persisted cursor never moves
+A signal whose handler raised is kept in a retry set and re-dispatched with
+per-signal exponential backoff (5 s up to 5 min) while the listener runs; one
+that keeps failing is logged at ERROR and counted in stuck_signals(), never
+dropped. The persisted cursor never moves
 past the oldest such signal (later successes still advance the in-memory
 high-water), so after a restart the sweep re-reads it.
 """
@@ -68,6 +70,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional
 
 import asyncpg
+
+from ops.alerts import alert
 
 log = logging.getLogger("executor.signal_listener")
 
@@ -84,8 +88,14 @@ _RECENT_CAPACITY = 4096
 # committed after it. Re-read rows are deduped.
 _SWEEP_LAG_S = 30.0
 
-# How often signals whose handler raised are retried.
+# Signals whose handler raised are retried with per-signal exponential
+# backoff: 5 s, 10 s, ... capped at 5 min. One that keeps failing is never
+# dropped (it may be an EXIT); past _STUCK_AFTER attempts it is logged at
+# ERROR, then about hourly, and counted in stuck_signals().
 _RETRY_INTERVAL_S = 5.0
+_RETRY_MAX_S = 300.0
+_STUCK_AFTER = 10
+_STUCK_LOG_EVERY = 12
 
 # Reconnect backoff bounds for the dedicated LISTEN connection.
 _RECONNECT_BASE_S = 1.0
@@ -95,8 +105,8 @@ _RECONNECT_MAX_S = 30.0
 # A handler takes the full signal row (dict) and acts on it. Must be idempotent
 # on row['signal_id'] (see module docstring). Returns when the signal has been
 # handled; raising is logged and does NOT crash the listener (one bad signal
-# must not stop the stream); the signal is retried every _RETRY_INTERVAL_S and
-# the persisted cursor does not move past it until it succeeds.
+# must not stop the stream); the signal is retried with backoff and the
+# persisted cursor does not move past it until it succeeds.
 SignalHandler = Callable[[dict], Awaitable[None]]
 
 
@@ -145,9 +155,11 @@ class SignalListener:
         # The last cursor value persisted (or the starting one): only a later
         # value is saved.
         self._persisted: datetime = self._cursor
-        # Signals whose handler raised, by signal_id -> row, retried on a timer.
+        # Signals whose handler raised, by signal_id -> row, retried with
+        # backoff; attempts and next retry time per signal.
         self._failed: Dict[str, dict] = {}
-        self._last_retry = time.monotonic()
+        self._attempts: Dict[str, int] = {}
+        self._next_retry: Dict[str, float] = {}
 
         self._conn: Optional[asyncpg.Connection] = None
         self._running = False
@@ -164,6 +176,10 @@ class SignalListener:
         """Current created_at high-water. Callers may persist this to resume
         across restarts without replaying."""
         return self._cursor
+
+    def connected(self) -> bool:
+        """The LISTEN connection is open (for the heartbeat)."""
+        return self._conn is not None and not self._conn.is_closed()
 
     async def run(self) -> None:
         """Run until cancelled. Maintains the LISTEN connection (reconnecting
@@ -291,7 +307,7 @@ class SignalListener:
             """
             SELECT signal_id, position_key, chain_id, direction, action,
                    symbol, asset_class, strategy, trigger_level, decision_price,
-                   exit_reason, fraction, decided_at, created_at
+                   exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE created_at >= $1
             ORDER BY created_at ASC, signal_id ASC
@@ -314,7 +330,7 @@ class SignalListener:
             """
             SELECT signal_id, position_key, chain_id, direction, action,
                    symbol, asset_class, strategy, trigger_level, decision_price,
-                   exit_reason, fraction, decided_at, created_at
+                   exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE signal_id = $1
             """,
@@ -329,22 +345,21 @@ class SignalListener:
         """Run the handler for one signal, then advance dedup state and cursor.
 
         A handler that raises leaves the signal in the retry set (re-dispatched
-        every _RETRY_INTERVAL_S) and holds the PERSISTED cursor at or before
+        with backoff) and holds the PERSISTED cursor at or before
         it, even while later signals succeed and move the in-memory high-water
         on. At-least-once delivery; the handler's idempotency makes retries
         safe.
         """
         signal_id = row["signal_id"]
         if signal_id in self._recent:
-            self._failed.pop(signal_id, None)
+            self._forget_failure(signal_id)
             return
         try:
             await self._handler(row)
         except Exception:
-            log.exception("handler failed for signal %s; will retry", signal_id)
-            self._failed[signal_id] = row
+            self._note_failure(signal_id, row)
             return
-        self._failed.pop(signal_id, None)
+        self._forget_failure(signal_id)
         self._mark_seen(signal_id)
         created_at = row["created_at"]
         if created_at is not None and created_at > self._cursor:
@@ -369,17 +384,45 @@ class SignalListener:
             return
         self._persisted = target
 
+    def _note_failure(self, signal_id: str, row: dict) -> None:
+        n = self._attempts.get(signal_id, 0) + 1
+        self._attempts[signal_id] = n
+        self._failed[signal_id] = row
+        delay = min(_RETRY_INTERVAL_S * 2 ** (n - 1), _RETRY_MAX_S)
+        self._next_retry[signal_id] = time.monotonic() + delay
+        if n < _STUCK_AFTER:
+            log.exception("handler failed for signal %s (attempt %d); retrying in %.0fs",
+                          signal_id, n, delay)
+        elif (n - _STUCK_AFTER) % _STUCK_LOG_EVERY == 0:
+            log.error("signal %s (%s %s %s) has failed %d times and is STUCK — still "
+                      "retrying every %.0fs; the persisted cursor is held at it",
+                      signal_id, row.get("action"), row.get("strategy"),
+                      row.get("position_key"), n, delay, exc_info=True,
+                      extra=alert(f"stuck:{signal_id}", every=3600))
+
+    def _forget_failure(self, signal_id: str) -> None:
+        self._failed.pop(signal_id, None)
+        self._attempts.pop(signal_id, None)
+        self._next_retry.pop(signal_id, None)
+
+    def stuck_signals(self) -> int:
+        """Signals that have failed at least _STUCK_AFTER times (for health)."""
+        return sum(1 for n in self._attempts.values() if n >= _STUCK_AFTER)
+
     async def _maybe_retry_failed(self) -> None:
-        """Re-dispatch failed signals, oldest first, at most every
-        _RETRY_INTERVAL_S."""
-        if not self._failed or time.monotonic() - self._last_retry < _RETRY_INTERVAL_S:
+        """Re-dispatch failed signals whose backoff has elapsed, oldest
+        first."""
+        if not self._failed:
             return
-        self._last_retry = time.monotonic()
-        rows = sorted(self._failed.values(),
-                      key=lambda r: (r.get("created_at") is None, r.get("created_at") or 0,
-                                     r["signal_id"]))
-        log.info("retrying %d failed signal(s)", len(rows))
-        for row in rows:
+        now = time.monotonic()
+        due = [r for sid, r in self._failed.items()
+               if self._next_retry.get(sid, 0) <= now]
+        if not due:
+            return
+        due.sort(key=lambda r: (r.get("created_at") is None, r.get("created_at") or 0,
+                                r["signal_id"]))
+        log.info("retrying %d failed signal(s)", len(due))
+        for row in due:
             await self._dispatch_row(row)
 
     def _mark_seen(self, signal_id: str) -> None:

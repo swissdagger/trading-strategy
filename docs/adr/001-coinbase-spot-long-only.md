@@ -527,3 +527,15 @@ Each phase is independently mergeable and leaves the system runnable.
   seconds rungs to trades; universe restriction (no request for others);
   live poll settle/cursor and paging back to an old cursor; `start_live`
   serves seconds rungs only for the universe.
+
+### Alerting reinstated (owner decision, supersedes PR 7's removal)
+
+- **Delivered, not queued.** PR 7 dropped the `executor_alerts` outbox because nothing ever delivered from it. Alerts now go straight to Slack from each process (`ops/alerts.py`, `SLACK_WEBHOOK_URL`): an alert is a log record tagged with an `alert` key, posted by a daemon thread, rate-limited per key, never blocking trading. No table.
+- **Events:** every trade opened (paper/live/shadow), HALT, boot refused or crash, stuck signal, kill-switch and trade-mode changes, processing lag, Sumtyme failure bursts, failed chain-rule writes, feed holds/crashes/ws fallback, and a daily summary (`ops/summary.py`).
+- **Heartbeats:** each long-running process pings a dead-man's switch (`HEARTBEAT_URL_EXECUTOR` / `_SIGNAL` / `_FEED`) only while healthy, so a crash, wedged loop or stalled pipeline alerts by going quiet. RUNBOOK §5.
+
+### Dormant strategies deleted (owner decision; closes D1 and D2)
+
+- **D1:** `two_ladder`, the built-in A/B ladders (`ladder_registry.default_registry`), `strategy/chain_view.py` and the shared ChainView in the multi-strategy runtime, and `write_path_probe.py` are deleted. Every ladder now comes from `config.EXTRA_LADDERS`. Raw events still carry `set` (= the ladder name) for chain-events topic consumers.
+- **D2:** `prior_failure_scaleout`, the PF ladder, `write_path_probe_pfs.py`, `executor_scale_probe.py` and the executor's scale-out / partial-exit model are deleted; every exit closes the whole position. Migrations 016/017 stay (immutable); historical SCALE/TERMINAL rows and strided `cv1` rungs still parse.
+- `strategy` is now required where it silently defaulted to `two_ladder` (trade_signals insert, SignalWriter).

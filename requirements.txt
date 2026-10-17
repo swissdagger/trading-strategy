@@ -18,7 +18,6 @@ sumtyme==2.0.6
 
 # HTTP client for the REST feeds (and the Coinbase client, ADR-001 Phase 4).
 httpx==0.28.1
-pydantic==2.14.1
 
 # Market calendars — kept for future equities (feeds/base.is_market_open).
 exchange_calendars==4.13.2

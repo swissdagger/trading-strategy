@@ -15,9 +15,10 @@ One server runs everything under `docker compose`:
 |---|---|---|
 | `kafka` | always | single broker; `trading-bars` and `chain-events` topics |
 | `warmup` | once | seeds `warmup_bars` + `feed_cursors`, then exits 0 |
-| `feed` | unless-stopped | Coinbase public candles → `trading-bars` |
-| `signal` | unless-stopped | bars → Sumtyme chains → `confirmed_15m` → `trade_signals` |
-| `executor` | unless-stopped | `trade_signals` → paper or live orders |
+| `feed` | unless-stopped | Coinbase candles (crypto) and Polygon (equities) → `trading-bars` |
+| `signal` | unless-stopped | bars → Sumtyme chains → strategies (`confirmed_15m`, the shadow-only chain rules) → `trade_signals` |
+| `executor` | unless-stopped | `trade_signals` → paper or live orders; shadow book for the rest |
+| `research` | unless-stopped | `trade_signals` + Polygon → `research_*` tables (off the live path) |
 
 `feed`, `signal` and `executor` start only after `warmup` has completed.
 
@@ -226,8 +227,39 @@ SELECT state, count(*) FROM trades GROUP BY 1;
 | executor | `kill switch FLATTEN` | flatten is closing a position (§6.1) |
 | executor | `cannot start` / `retrying in` | boot refused (§6.3) |
 
-There is no alerting: nothing pages or emails. Check the HALTs and the
-executor log as part of the routine:
+### Alerts (Slack)
+
+Each process posts to Slack when `SLACK_WEBHOOK_URL` is set (a Slack
+incoming-webhook URL; `.env`). An alert is a log line tagged for Slack, so the
+text in Slack is the line in the log. Posting runs on its own thread and never
+blocks trading; repeats of the same condition are limited to one per 10 min.
+
+| Process | Alert | When |
+|---|---|---|
+| executor | `PAPER`/`LIVE trade OPENED` | a real entry's first fill (side, symbol, class, qty, avg price, strategy) |
+| executor | `SHADOW trades opened (n)` | one message per `SHADOW_DIGEST_INTERVAL_S` (default 15 min) listing every shadow position opened in it (side, symbol, price and its source, fee, strategy); nothing for an empty interval |
+| executor | `HALTED` | a trade needs a human (§6.2) |
+| executor | `cannot start` / `executor failed` | boot refused, or a crash (§6.3) |
+| executor | `STUCK` | a signal has failed 10 times; still retried, cursor held at it |
+| executor | `kill switch ENGAGED` / `released` | any change, and at startup if already engaged |
+| executor | `trade mode changed` | off / paper / live |
+| executor | `Daily summary` | `DAILY_SUMMARY_HOUR_UTC` (default 07:00): trades opened/closed and P&L by strategy (real and shadow), open positions, HALTs, signals, forecasts |
+| signal | `PROCESSING LAG` | a bar is applied more than `LAG_WARN_S` after it closed |
+| signal | `Sumtyme failing` | 5 forecast failures within 5 min |
+| signal | `write failed` | a chain rule could not write a signal (retried) |
+| feed | `bars held` | a symbol's bars wait over 5 min for a lagging rung |
+| feed | `errored` / `FALLING BACK to REST` | a feed crashed and relaunched; the websocket could not connect |
+
+**Heartbeats.** A process that has died cannot alert. Each long-running process
+pings a dead-man's switch while it is healthy: create one check per process
+(e.g. on healthchecks.io, period 1 min, grace 5 min, with its Slack
+integration) and set `HEARTBEAT_URL_EXECUTOR` (pings while its LISTEN
+connection is up), `HEARTBEAT_URL_SIGNAL` (while a bar was consumed in the last
+5 min) and `HEARTBEAT_URL_FEED` (while a bar was published in the last 5 min).
+The service alerts when the pings stop: a crash, a wedged event loop, or a
+stalled pipeline.
+
+Check the HALTs as part of the routine too:
 
 ```sql
 SELECT trade_id, symbol, halt_reason, last_updated FROM trades WHERE state = 'HALTED';

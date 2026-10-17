@@ -1,63 +1,52 @@
 """
 strategy/registry.py — the multi-strategy registry.
 
-QISS runs a SET of strategies, configurable at runtime: which strategies are
-active, and which symbols each applies to. This module is the registry that
+The system runs a SET of strategies, configured in config.STRATEGIES: which are
+enabled, which symbols each trades, and which ladders each reads. This module
 holds that configuration and hands the runtime the enabled strategies for a
 given symbol.
 
 ## What a "strategy" is here
 
-A Strategy is a named unit with two behavioural components the runtime already
-knows how to drive (the two-ladder strategy established the shape):
+A Strategy is a named unit with two behavioural components the runtime drives:
 
   - an ENTRY component:  on_event(ev) -> Optional[position_key]
   - an EXIT  component:  maybe_emit_exit(...) -> Optional[position_key]
 
-plus its identity (name) and the symbols it trades. That's the whole contract.
-The two-ladder strategy satisfies it already; a future strategy satisfies it by
-providing the same two components. We deliberately keep this a PROTOCOL + a dict
-registry, not a plugin framework or a DSL — there is one strategy today and a
-firm plan for more, so the abstraction earns its place, but building a loader/
-DSL now would be speculative (YAGNI). When strategy #2 exists and shows what
-actually varies, the abstraction can grow to fit; until then it stays minimal.
+plus its identity (name), the symbols it trades and the ladders it reads. That
+is the whole contract: a PROTOCOL + a dict registry, deliberately not a plugin
+framework.
 
 ## Configuration shape (config.STRATEGIES)
 
     STRATEGIES = {
-        "two_ladder": {
+        "confirmed_15m": {
             "enabled": True,
-            "symbols": ["AAPL", "EURUSD", ...],   # or "*" for all tracked
+            "symbols": ["BTC-USD", ...],          # or "*" for all tracked
+            "ladders": ["FC"],
             "params": { ... },                    # strategy-specific, opaque here
         },
-        "future_strategy": { "enabled": False, "symbols": [...], "params": {...} },
     }
 
-The registry reads this, instantiates each ENABLED strategy via its registered
-factory, and resolves per-symbol subscriptions. A disabled strategy is never
-instantiated. Changing which strategies are active is a config edit (+ restart);
-the DB-backed live toggle is a possible future addition (mirroring
-trade_enabled), deliberately not built yet — flip-a-strategy-live wasn't
-requested and adds moving parts.
+The registry instantiates each ENABLED strategy via its registered factory and
+resolves per-symbol subscriptions. A disabled strategy is never instantiated.
+Changing which strategies are active is a config edit (+ restart).
 
 ## Multiple strategies on one symbol
 
-Two enabled strategies may both trade the same symbol and both hold positions in
-it concurrently (a deliberate choice). They SHARE one ChainView (the chain state
-is the market's, not a strategy's — see runtime), but their positions must not
-collide. So every position is namespaced by strategy: the runtime tracks open
-positions by (strategy_name, position_key), and the strategy_name is woven into
-the emitted signal's identity so the downstream consumer and the DB never merge
-two strategies' positions on the same chain. See namespaced_position_key.
+Two enabled strategies may both trade the same symbol and hold positions in it
+concurrently. Their positions must not collide, so every position is
+namespaced by strategy: the runtime tracks open positions by
+(strategy_name, position_key), and the strategy_name is woven into the emitted
+signal's identity so the downstream consumer and the DB never merge two
+strategies' positions on the same chain. See namespaced_position_key.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, runtime_checkable
 
-from strategy.chain_view import ChainView, TaggedChainEvent
-from execution.types import ExitReason
 
 log = logging.getLogger("strategy.registry")
 
@@ -68,9 +57,9 @@ log = logging.getLogger("strategy.registry")
 
 @runtime_checkable
 class EntryComponent(Protocol):
-    async def on_event(self, ev: TaggedChainEvent) -> Optional[str]:
-        """Process one tagged event; return the position_key if an ENTER was
-        emitted, else None. The ChainView is already updated with `ev`."""
+    async def on_event(self, ev) -> Optional[str]:
+        """Process one chain event (attribute access over the router's raw
+        event); return the position_key if an ENTER was emitted, else None."""
         ...
 
 
@@ -116,8 +105,8 @@ class Strategy:
         self._symbol_set = set(self.symbols)
 
 
-# A factory builds a Strategy given the shared ChainView, the SignalWriter, and
-# the strategy's config params. Registered per strategy name; called only for
+# A factory builds a Strategy given its name, symbols, ladders and config
+# params. Registered per strategy name; called only for
 # ENABLED strategies. Kept as a plain callable (not a class hierarchy) — the
 # variation between strategies is behavioural (the components), not structural.
 StrategyFactory = Callable[..., Strategy]
@@ -134,7 +123,7 @@ def namespaced_position_key(strategy_name: str, position_key: str) -> str:
     Base position_key is `chain_id:L|S` (signal_writer.position_key). Two
     strategies can both enter chain X long; without namespacing both would emit
     position_key "X:L" and the consumer/DB would treat them as ONE position.
-    Prefixing with the strategy name disambiguates: "two_ladder/X:L" vs
+    Prefixing with the strategy name disambiguates: "rule3_v1/X:L" vs
     "other/X:L". The separator '/' is not used in chain ids or the L/S suffix,
     so the composite parses unambiguously.
     """
@@ -257,9 +246,9 @@ class StrategyRegistry:
 
         The router computes chains per (symbol, ladder), fanning a bar to EVERY
         ladder whose timeframes contain the bar's timeframe. That over-computes
-        once a strategy is scoped to a SUBSET of symbols: e.g. two_ladder on AAPL
-        only and confirmed_15m on BTC-USD only still share the 1m timeframe, so a
-        BTC-USD 1m bar would build A/B machines for BTC-USD that NO strategy reads
+        once a strategy is scoped to a SUBSET of symbols: e.g. the CN-ladder rules
+        on BTC-USD only and rule3_v1 (FC) on every crypto symbol share the 1m
+        timeframe, so an ETH-USD 1m bar would build CN machines that NO strategy reads
         (wasted Sumtyme forecasts + junk chains). This set is the ground truth of
         which (symbol, ladder) pairs are actually wanted; the router intersects
         its timeframe-derived targets with it so it computes exactly the chains a
