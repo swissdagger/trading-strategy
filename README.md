@@ -304,12 +304,18 @@ unroutable by design.
 - **Bar latency.** Coinbase revises a closed candle for up to ~36 s, so the feed
   emits a bar 60 s after its window closes. Thin books omit no-trade minutes; the
   gaps pass through.
-- **Bar ordering.** The Coinbase feed publishes each symbol's bars in
-  CLOSE-TIME order across all its rungs, the shorter rung first on a tie
-  (`CloseOrderMerge` in `feeds/coinbase_spot.py`): a bar waits until every rung
-  of its symbol has been read past its close. The chain machines apply bars in
-  arrival order, so without this the poll timing decided whether a chain
-  propagated or terminated.
+- **Bar ordering.** Every feed publishes each symbol's bars in CLOSE-TIME
+  order across all its rungs, the shorter rung first on a tie. The chain
+  machines apply bars in arrival order, so without this the poll timing decided
+  whether a chain propagated or terminated. The REST feeds (Coinbase, Polygon)
+  poll each rung at its window close and pass the bars through
+  `CloseOrderMerge` (`feeds/close_order.py`): a bar waits only until every rung
+  that could still produce an earlier-closing bar has been read past it. The
+  Polygon websocket builds every rung from the same 1-second stream, already
+  in close order; its reconnect backfill is merged into close order too, and a
+  window the backfill already emitted is never published again. Polygon REST
+  emits an aggregate 5 s after its window ends (late minute aggregates), and
+  builds 2m/3m from 1-minute aggregates live as in history.
 - **Bar times.** Bars are labelled by their OPEN time, and that label is what
   `chain_steps.step_time`, `chains.origin_time` and `trade_signals.decided_at`
   record. A signal's information exists at its bar's CLOSE (= label + one
