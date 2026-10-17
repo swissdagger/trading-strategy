@@ -67,6 +67,7 @@ from producer.persistence import (
     # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
     make_load_buffers,
+    make_persist_live_bar,
     make_load_last_base_signal,
     make_load_strategy_open_entries,
     make_load_opposing_chain_since,
@@ -251,7 +252,12 @@ class SignalProcess:
             # holes in the chain machine's input. We commit only the contiguous
             # low-water mark of FINISHED bars (see run() / OffsetTracker).
             enable_auto_commit=False,
-            auto_offset_reset="latest",
+            # EARLIEST: a group with no committed offset (first start) reads
+            # the whole topic. The bars after warmup's newest may already have
+            # been published before this consumer joined; "latest" skipped
+            # them, leaving a hole after the hydrated buffer. Everything older
+            # than the buffer is dropped by the machines' monotonic guard.
+            auto_offset_reset="earliest",
         )
         self.producer = AIOKafkaProducer(
             bootstrap_servers=self.cfg.kafka_bootstrap,
@@ -437,6 +443,7 @@ class SignalProcess:
             make_machine=self._make_factory(client),
             publish=self._publish,
             owns=lambda symbol, ladder: (symbol, ladder) in owned,
+            persist_bar=make_persist_live_bar(self.pool),
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(

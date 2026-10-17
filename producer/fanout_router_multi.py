@@ -84,6 +84,9 @@ class RoutedBar:
     (it then runs its whole on_bar inside apply(), serially — the legacy path)."""
     bar: "OHLCPoint"
     items: list = field(default_factory=list)
+    # Did any machine APPEND this bar to its buffer (not a duplicate or an
+    # out-of-order drop)? Only appended bars go to the bar store.
+    appended: bool = False
 
 
 def _supports_split(machine) -> bool:
@@ -106,8 +109,16 @@ class MultiLadderRouter:
         publish: PublishRaw,
         locks: Optional[Dict[str, asyncio.Lock]] = None,
         owns: Optional[OwnsPredicate] = None,
+        persist_bar: Optional[Callable[["OHLCPoint"], Awaitable[None]]] = None,
     ):
         self._registry = registry
+        # The BAR STORE write (warmup_bars): every bar a machine appended, so a
+        # restart hydrates buffers up to where this process got instead of to
+        # where warmup left them. Written once the bar is fully applied — a bar
+        # stored but never applied would hydrate into the buffer and its Kafka
+        # replay would then be dropped as a duplicate, never forecast. None in
+        # tests / standalone.
+        self._persist_bar = persist_bar
         self._make_machine = make_machine
         self._publish = publish
         self._locks: Dict[str, asyncio.Lock] = (
@@ -184,9 +195,25 @@ class MultiLadderRouter:
                     log.exception("chain machine prepare error: symbol=%s ladder=%s tf=%s",
                                   bar.symbol, ladder_name, bar.timeframe)
                     continue
+                if getattr(machine, "last_prepare_appended", False):
+                    routed.appended = True
                 if pending is not None:
                     routed.items.append((machine, ladder_name, pending))
-        return routed if routed.items else None
+        if routed.items:
+            return routed
+        # Nothing to forecast (buffers not yet full): the bar is fully handled.
+        await self._store(routed)
+        return None
+
+    async def _store(self, routed: RoutedBar) -> None:
+        if self._persist_bar is None or not routed.appended:
+            return
+        try:
+            await self._persist_bar(routed.bar)
+        except Exception:
+            log.exception("bar store write failed %s/%s ts=%s — a restart before the "
+                          "next warmup will hydrate without this bar",
+                          routed.bar.symbol, routed.bar.timeframe, routed.bar.timestamp)
 
     async def forecast(self, routed: RoutedBar) -> None:
         """STAGE 2. NO lock. Run every prepared ladder's forecast concurrently.
@@ -213,6 +240,12 @@ class MultiLadderRouter:
         the events. The publish sink runs the strategy runtime under this same
         lock (see signal_process._publish). One machine failing does not poison
         the others; one bad event drops that event, not the pipeline."""
+        try:
+            await self._apply_locked(routed)
+        finally:
+            await self._store(routed)
+
+    async def _apply_locked(self, routed: RoutedBar) -> None:
         bar = routed.bar
         async with self._lock(bar.symbol):
             for machine, ladder_name, pending in routed.items:

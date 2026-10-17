@@ -169,9 +169,16 @@ class FeedProcess:
         if self.cfg.db_url:
             try:
                 import asyncpg
-                from producer.persistence import read_feed_cursors
+                from producer.persistence import read_bar_store_cursors, read_feed_cursors
                 pool = await asyncpg.create_pool(self.cfg.db_url, min_size=1, max_size=2, statement_cache_size=0)
                 all_cursors = await read_feed_cursors(pool)
+                # Resume from the newer of warmup's cursor and the newest bar the
+                # signal process stored: feed_cursors is written only by warmup,
+                # so on its own a feed restart re-sent everything since warmup.
+                for sym, by_tf in (await read_bar_store_cursors(pool)).items():
+                    mine = all_cursors.setdefault(sym, {})
+                    for tf, ts in by_tf.items():
+                        mine[tf] = max(mine.get(tf, ts), ts)
                 await pool.close()
                 log.info("loaded feed cursors for %d symbols", len(all_cursors))
             except Exception:

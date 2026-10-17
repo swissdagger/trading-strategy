@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -285,6 +286,11 @@ class ServiceTwoChainMachine(ChainMachine):
         # timeframe -> rolling buffer of tick dicts
         self._buffers: Dict[str, deque] = {}
         self._hydrated = False
+        # Did the last prepare() append its bar? Read by the router to decide
+        # whether the bar goes to the bar store.
+        self.last_prepare_appended = False
+        self._older_drops = 0
+        self._older_drop_logged = -1e9
 
     # ---------------------------------------------------------------
     def _level_index(self, timeframe: str) -> Optional[int]:
@@ -458,6 +464,7 @@ class ServiceTwoChainMachine(ChainMachine):
         Returns None when there is nothing to forecast: timeframe not in this
         ladder, duplicate/out-of-order bar (dropped), or buffer not yet full.
         """
+        self.last_prepare_appended = False
         idx = self._level_index(bar.timeframe)
         if idx is None:
             return None   # not in this ladder (router shouldn't send it, but guard)
@@ -481,10 +488,10 @@ class ServiceTwoChainMachine(ChainMachine):
                 log.debug("drop duplicate bar %s/%s ts=%s",
                           self.symbol, bar.timeframe, bar.timestamp)
             else:
-                log.warning("drop out-of-order bar %s/%s ts=%s (newest buffered %s)",
-                            self.symbol, bar.timeframe, bar.timestamp, newest)
+                self._note_older_drop(bar, newest)
             return None
         buf.append(self._tick_dict(bar))
+        self.last_prepare_appended = True
 
         # >= not == : an over-filled buffer from a race-y warmup must still
         # forecast (service_2's explicit inline note).
@@ -511,6 +518,22 @@ class ServiceTwoChainMachine(ChainMachine):
         # is acquired, so a bar queued for a permit holds 5000 references, not
         # a 5001-row frame (this is what bounds peak memory under backlog).
         return PendingForecast(idx=idx, bar=bar, snapshot=tuple(buf), memo_key=memo_key)
+
+    def _note_older_drop(self, bar: OHLCPoint, newest: int) -> None:
+        """An OLDER bar is expected in bulk after a restart (the consumer and
+        the feed replay from before the hydrated buffer's newest bar), and
+        otherwise means an upstream ordering bug. Counted, and logged at most
+        once a minute per machine so a replay cannot flood the log."""
+        self._older_drops += 1
+        now = time.monotonic()
+        if now - self._older_drop_logged >= 60.0:
+            log.warning("dropped %d bar(s) not newer than the buffer for %s/%s "
+                        "(latest: %s ts=%s, newest buffered %s) — replay after a "
+                        "restart, or an upstream ordering bug",
+                        self._older_drops, self.symbol, self.ladder_name,
+                        bar.timeframe, bar.timestamp, newest)
+            self._older_drops = 0
+            self._older_drop_logged = now
 
     # ---------------------------------------------------------------
     # STAGE 2 — forecast: the slow part. NO lock held. Touches no machine state.

@@ -599,6 +599,47 @@ def make_persist_warmup_bars(pool):
     return persist_warmup_bars
 
 
+def make_persist_live_bar(pool):
+    """BAR STORE write for one live bar the signal process appended: the same
+    warmup_bars table warmup seeds, so make_load_buffers hydrates a restarted
+    machine up to where the last run got. Without it, buffers came back as
+    warmup left them while Kafka resumed after the last committed offset, and
+    every bar in between vanished — spliced out of the series Sumtyme reads
+    as consecutive steps.
+
+    DO NOTHING on conflict, unlike warmup's upsert: the buffer keeps the FIRST
+    version of a bar (a replay with revised values is dropped as a duplicate),
+    so the store must too."""
+    async def persist_live_bar(bar) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO warmup_bars
+                    (symbol, timeframe, timestamp_ms, open, high, low, close,
+                     asset_class, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                ON CONFLICT (symbol, timeframe, timestamp_ms) DO NOTHING
+                """,
+                bar.symbol, bar.timeframe, bar.timestamp, bar.open, bar.high,
+                bar.low, bar.close, bar.asset_class,
+            )
+    return persist_live_bar
+
+
+async def read_bar_store_cursors(pool) -> dict:
+    """The newest stored bar per (symbol, timeframe), as
+    cursors[symbol][timeframe] = epoch ms — the feed's resume point: everything
+    at or before it is already in the signal process's buffers."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT symbol, timeframe, max(timestamp_ms) AS ts FROM warmup_bars "
+            "GROUP BY symbol, timeframe")
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r["symbol"], {})[r["timeframe"]] = r["ts"]
+    return out
+
+
 def make_load_buffers(pool, symbol: str, timeframes: list):
     """Hydrate one machine's per-timeframe buffers from warmup_bars (migration
     006) so forecasting can start immediately on restart instead of waiting
