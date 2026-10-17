@@ -1,39 +1,21 @@
 """
 strategy/multi_runtime.py — multi-strategy consumer-side runtime.
 
-The multi-strategy evolution of strategy/runtime.py's StrategyRuntime. Same
-ordering / per-symbol-lock / open-position-persistence discipline, generalised
-from one hardcoded strategy to a REGISTRY of enabled strategies. For each event
-it fans out to every enabled strategy that trades the event's symbol.
+Drives a REGISTRY of enabled strategies from the router's chain events. For
+each event it fans out to every enabled strategy that trades the event's
+symbol AND declared the event's ladder.
 
-WHAT CARRIES OVER UNCHANGED (the invariants the single-strategy runtime
-established, which the strategy logic depends on):
+  1. PER-SYMBOL LOCK. All work for a symbol is serialised under one lock,
+     shared with the router, spanning every strategy on that symbol.
 
-  1. ORDERING. Fold the event into the ChainView FIRST, then run strategies.
-     Every strategy sees the current chain state.
+  2. OPEN-POSITION TRACKING + PERSISTENCE for continuous exit evaluation, and
+     restore-on-restart. Positions are tracked by (strategy_name,
+     base_position_key) (registry.namespaced_position_key), so two strategies
+     holding a position on the same chain/direction never collide.
 
-  2. PER-SYMBOL LOCK. All work for a symbol is serialised under one lock — now
-     spanning ALL strategies on that symbol, so two strategies mutating/reading
-     the shared view for the same symbol can't interleave.
-
-  3. OPEN-POSITION TRACKING + PERSISTENCE for continuous exit evaluation, and
-     restore-on-restart.
-
-WHAT'S NEW FOR MULTI-STRATEGY:
-
-  * SHARED ChainView. All strategies read one view — the chain state is the
-    market's, derived once from the events, not per-strategy. (Per-strategy
-    views would duplicate the same computation and risk drift.)
-
-  * POSITION NAMESPACING. Open positions are tracked by (strategy_name,
-    base_position_key), and the emitted signal's position_key is namespaced
-    (registry.namespaced_position_key) so two strategies holding a position on
-    the same chain/direction never collide in tracking, in the signal contract,
-    or in the DB. The tracking key here is the namespaced key itself.
-
-  * FAN-OUT. on_raw_event routes to registry.strategies_for(symbol): each
-    enabled strategy trading that symbol gets the entry call and its own open
-    positions get the exit sweep.
+  3. ORDER per event: entry fan-out, then the exit sweep. Each strategy keeps
+     whatever chain view it needs itself (confirmed_15m: strategy/
+     chain_history.py; the chain rules: their own trade state).
 """
 from __future__ import annotations
 
@@ -43,7 +25,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Optional
 
-from strategy.chain_view import ChainSet, ChainView, TaggedChainEvent
 from strategy.registry import (
     Strategy,
     StrategyRegistry,
@@ -53,16 +34,10 @@ from strategy.registry import (
 
 log = logging.getLogger("strategy.multi_runtime")
 
-# Ladder names that map to the two-ladder ChainSet enum. Only these events are
-# folded into the two-ladder ChainView; other ladders (e.g. FC) never touch it.
-_CHAINSET_LADDER_NAMES = {"A", "B"}
-
-
 class _RawEventView:
     """Thin attribute-access wrapper over a raw event dict, so a strategy
     component that reads ev.symbol / ev.chain_id / etc. (like the confirmed_15m
-    adapter) can consume a raw dict directly — no TaggedChainEvent construction
-    needed for non-A/B ladders (TaggedChainEvent is A/B-specific)."""
+    adapter) can consume a raw dict directly."""
     __slots__ = ("_raw",)
 
     def __init__(self, raw: dict):
@@ -72,8 +47,7 @@ class _RawEventView:
         try:
             return self._raw[name]
         except KeyError as e:
-            # asset_class may be absent on some events; default empty like the
-            # TaggedChainEvent path.
+            # asset_class may be absent on some events; default empty.
             if name == "asset_class":
                 return ""
             raise AttributeError(name) from e
@@ -104,12 +78,6 @@ class RuntimeHooks:
     load_open_positions: Callable[[], Awaitable[list[OpenPosition]]]
     save_open_position: Callable[[OpenPosition], Awaitable[None]]
     remove_open_position: Callable[[str], Awaitable[None]]   # by tracking_key
-    # Optional: load every active chain (all symbols, both sets) to hydrate the
-    # shared two-ladder ChainView at startup — see chain_view.ChainView.seed_active
-    # and producer.persistence.make_load_chain_view_seed. Optional (defaults to
-    # None) so existing callers/tests that don't wire DB-backed chain hydration
-    # keep working unchanged; start() simply skips seeding when it's absent.
-    load_chain_view_seed: Optional[Callable[[], Awaitable[list[dict]]]] = None
 
 
 class MultiStrategyRuntime:
@@ -118,12 +86,10 @@ class MultiStrategyRuntime:
 
     def __init__(
         self,
-        view: ChainView,
         registry: StrategyRegistry,
         hooks: RuntimeHooks,
         locks: Optional[Dict[str, asyncio.Lock]] = None,
     ):
-        self.view = view
         self.registry = registry
         self.hooks = hooks
         self._locks: Dict[str, asyncio.Lock] = (
@@ -137,33 +103,16 @@ class MultiStrategyRuntime:
         return self._locks[symbol]
 
     async def start(self) -> None:
-        """Restore open positions so exit evaluation resumes after a restart,
-        then hydrate the shared two-ladder ChainView from the DB so entry/exit
-        decisions see chains that were active before the restart (not just ones
-        that emit a fresh event after it). See ChainView.seed_active for why the
-        view can't be reconstructed from the live event stream alone."""
+        """Restore open positions so exit evaluation resumes after a restart."""
         for p in await self.hooks.load_open_positions():
             self._open_by_symbol[p.symbol][p.tracking_key] = p
         n = sum(len(v) for v in self._open_by_symbol.values())
         log.info("multi-runtime restored %d open positions for exit evaluation", n)
 
-        # Hydrate the shared two-ladder ChainView, separately from open positions.
-        if self.view is not None and self.hooks.load_chain_view_seed is not None:
-            seeds = await self.hooks.load_chain_view_seed()
-            for s in seeds:
-                self.view.seed_active(
-                    symbol=s["symbol"], set_=ChainSet(s["set"]),
-                    chain_id=s["chain_id"], direction=s["direction"],
-                    peak_level=s["peak_level"],
-                )
-            log.info("multi-runtime seeded ChainView with %d active chains from DB",
-                     len(seeds))
-
     async def on_raw_event(self, raw: dict) -> None:
         """Single ingress per causal-events message: a RAW event dict from the
-        router (carrying `ladder` and, for A/B ladders, `set`). Acquires the
-        symbol lock, then processes (fold-to-view for A/B, entry fan-out, exit
-        sweep) via _process_raw_locked.
+        router (carrying `ladder`). Acquires the symbol lock, then processes
+        (entry fan-out, exit sweep) via _process_raw_locked.
 
         The caller must NOT already hold the symbol lock — this is the entry
         point for callers OUTSIDE the shared-lock region (e.g. a Kafka consumer
@@ -188,33 +137,15 @@ class MultiStrategyRuntime:
         symbol's lock (the shared-lock entry point the router's publish sink
         calls — re-acquiring a non-reentrant asyncio.Lock would deadlock).
 
-        Routing by ladder is the heart of the multi-ladder design:
-          * The two-ladder ChainView is A/B-only; we fold it ONLY for A/B events,
-            so an FC-ladder event can't corrupt it.
-          * Each strategy receives the event through its entry component. The
-            two-ladder strategy reads a TaggedChainEvent + the shared ChainView;
-            the confirmed_15m strategy's adapter folds its OWN history view and
-            reads the raw fields. So each strategy sees only what its ladder
-            produces, and folding is per-monitor, not one global view.
-
-        Ordering the strategy logic depends on: fold the relevant view FIRST,
-        then entry fan-out, then the exit sweep."""
+        Routing by ladder: each strategy receives only events from the ladders
+        it declared, through its entry component, which folds whatever view it
+        keeps itself (confirmed_15m: its own chain history). Order: entry
+        fan-out, then the exit sweep."""
         symbol = raw["symbol"]
         ladder = raw.get("ladder", raw.get("set"))
 
-        # 1. Fold the two-ladder ChainView, but ONLY for its ladders (A/B). This
-        # keeps FC (or any non-A/B) events out of the A/B view.
-        tagged = None
-        if ladder in _CHAINSET_LADDER_NAMES and self.view is not None:
-            tagged = TaggedChainEvent.from_raw(raw)
-            self.view.apply(tagged)
-
-        # 2. Entry: fan out to each enabled strategy trading this symbol. Each
-        # strategy's entry component adapts the event to its own needs (the
-        # two-ladder one expects a TaggedChainEvent; the confirmed_15m adapter reads
-        # the raw dict and folds its own view). We pass the object each expects:
-        # a TaggedChainEvent when we built one (A/B), else the raw dict.
-        event_for_strategies = tagged if tagged is not None else _RawEventView(raw)
+        # 1. Entry: fan out to each enabled strategy trading this symbol.
+        event_for_strategies = _RawEventView(raw)
         for strategy in self.registry.strategies_for(symbol):
             # Isolate per strategy. An exception raised inside one strategy's
             # entry path (a bad event field, a DB write that fails, a bug in the
@@ -242,7 +173,7 @@ class MultiStrategyRuntime:
                     raw.get("event_type"),
                 )
 
-        # 3. Exit sweep: every open position on this symbol, routed to its owner.
+        # 2. Exit sweep: every open position on this symbol, routed to its owner.
         # Deliberately OUTSIDE the entry try/except above: a failed entry must
         # never prevent an open position's exit from being evaluated. Exits are
         # risk-reducing; skipping one is strictly worse than skipping an entry.

@@ -25,12 +25,8 @@ strategies' ladders is what gets computed; overlap is deduplicated at the ladder
 level. This is what makes "compute chains once, let each strategy monitor the
 ladders it cares about" work: the shared unit is the LADDER, not the strategy.
 
-## Backward compatibility
-
-Set A and Set B are pre-registered under names "A" and "B" with their original
-timeframes, so existing two-ladder code that refers to them by name keeps
-working. The ChainSet enum's string values ("A"/"B") become ladder names; a
-migration path for code importing ChainSet.A is a thin shim (see compat note).
+Every ladder is registered at startup from config.EXTRA_LADDERS; there are no
+built-in ones.
 """
 from __future__ import annotations
 
@@ -120,21 +116,3 @@ class LadderRegistry:
                 if tf not in seen:
                     seen.append(tf)
         return seen
-
-
-# ---------------------------------------------------------------------------
-# The default registry, pre-seeded with the original Set A / Set B ladders so
-# the existing two-ladder strategy runs unchanged. New ladders (for new
-# strategies) are registered here at startup from config.
-# ---------------------------------------------------------------------------
-SET_A_LADDER: List[str] = ["5s", "10s", "30s", "1m", "2m"]
-SET_B_LADDER: List[str] = ["30s", "1m", "2m", "5m", "10m"]
-
-
-def default_registry() -> LadderRegistry:
-    """A registry pre-seeded with A and B. Strategies needing other ladders
-    register them (via config) on top of this."""
-    reg = LadderRegistry()
-    reg.register("A", SET_A_LADDER)
-    reg.register("B", SET_B_LADDER)
-    return reg

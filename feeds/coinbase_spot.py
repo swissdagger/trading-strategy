@@ -25,8 +25,7 @@ Kafka, chains, trades and trade_signals. to_native_symbol is identity.
 Native granularities are fetched as-is. A rung Coinbase does not offer is
 DERIVED from a finer native one with the shared resampling rule
 (feeds/resample.py): 3m from 1m (the confirmed_15m ladder's second rung), and 4h
-from 1h / 12h from 6h (the disabled prior_failure_scaleout ladder), so
-re-enabling PF needs no feed change.
+from 1h / 12h from 6h, available should a ladder need them.
 
 ## Live path
 

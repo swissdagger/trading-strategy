@@ -1,12 +1,11 @@
 """
 producer/chain_machine.py — The chain-machine INTERFACE (the extraction seam).
 
-The two-ladder producer runs ONE chain state machine instance per (symbol, set).
-That state machine is the subtle INIT -> PROPAGATE -> TERMINATE logic that today
-lives in CausaView's service_2_sumtyme_bridge.py. We do NOT reimplement it here —
-we specify the INTERFACE it must satisfy, so the real implementation can be
-extracted and dropped in behind this seam mechanically, WITHOUT the fan-out
-router (or the rest of the producer) needing to change.
+The producer runs ONE chain state machine instance per (symbol, ladder). That
+state machine is the INIT -> PROPAGATE -> TERMINATE logic extracted from
+CausaView's service_2_sumtyme_bridge.py (producer/service2_machine.py). This
+file specifies the INTERFACE it satisfies, so the fan-out router depends on the
+contract, not the implementation.
 
 WHY AN INTERFACE, NOT A REIMPLEMENTATION. service_2's state machine carries
 hard-won invariants (the per-symbol asyncio.Lock around active_chains, the
@@ -17,7 +16,7 @@ implementation is supplied later by extracting the real code.
 
 THE CONTRACT (what any ChainMachine implementation must guarantee):
 
-  * ONE INSTANCE PER (symbol, set). Each instance owns the chain state for one
+  * ONE INSTANCE PER (symbol, ladder). Each instance owns the chain state for one
     symbol on one ladder. It knows its ladder (the ordered timeframes) and its
     baseline timeframe (level 1).
 
@@ -26,7 +25,7 @@ THE CONTRACT (what any ChainMachine implementation must guarantee):
     right per-timeframe buffer, runs its forecast when the buffer is ready, and
     advances its chain state. It RETURNS the chain events that resulted (zero or
     more) as ChainEvent objects — initiate / propagate / terminate. The router
-    tags these with the set and publishes them.
+    tags these with the ladder and publishes them.
 
   * EVENTS ARE UNTAGGED HERE. A ChainMachine instance doesn't know about "sets" —
     it just runs one ladder. The SET TAG is applied by the router (which knows
@@ -56,8 +55,7 @@ from producer.bar import OHLCPoint
 @dataclass(frozen=True)
 class ChainEvent:
     """An UNTAGGED chain event returned by a ChainMachine. The router adds the
-    set tag to produce the TaggedChainEvent the consumer contract expects. Fields
-    mirror what the consumer needs (chain_view.TaggedChainEvent) minus `set`.
+    ladder to produce the raw event dict the strategies consume.
 
     direction is -1 | +1 (never 0). propagation_level is 1-based within this
     machine's ladder. price is the canonical price at this step (origin price for

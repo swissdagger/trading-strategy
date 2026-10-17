@@ -269,7 +269,7 @@ class FeedProcess:
                     # It is here to make horizontal scale-out SAFE BY CONSTRUCTION
                     # later. Without a key, adding partitions or a second signal
                     # process would round-robin one symbol's bars across instances
-                    # — each with its own lock map, ChainView, and machines — so two
+                    # — each with its own lock map, runtime and machines — so two
                     # bars for the same symbol could be processed concurrently on
                     # different hosts. The chain machine's timestamp-ordered
                     # propagation (next_sig["timestamp"] >= chain["last_timestamp"])

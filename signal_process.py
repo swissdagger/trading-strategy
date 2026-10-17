@@ -62,7 +62,6 @@ from ops.alerts import alert, install_alerting, start_heartbeat
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
-    make_load_chain_view_seed,
     make_load_open_positions,
     # NOTE: only chain_init remains synchronous. persist_signal / chain_propagate
     # / chain_terminate are now served by BatchedAuditWriter (off the hot path);
@@ -77,15 +76,12 @@ from producer.persistence import (
     make_load_chain_confirmed,
 )
 from producer.service2_machine import ServiceTwoChainMachine
-from strategy.chain_view import ChainView, TaggedChainEvent
-from strategy.ladder_registry import default_registry
-from strategy.registry import StrategyRegistry, Strategy
+from strategy.ladder_registry import LadderRegistry
+from strategy.registry import StrategyRegistry
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
-from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
 from strategy.confirmed_15m_adapter import make_confirmed_15m
 from strategy.chain_recorder import make_chain_recorder
 from strategy.chain_rules import make_chain_rule
-from strategy.prior_failure_adapter import make_prior_failure_scaleout
 
 log = logging.getLogger("signal_process")
 
@@ -98,8 +94,8 @@ class Config:
         self.kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
         # Dedicated bar topic on THIS system's Kafka — deliberately NOT named
         # 'raw-prices' so it can't be confused with CausaView's topic. The
-        # trading system's feeds publish the two-ladder granularities here; this
-        # stream is independent of CausaView entirely.
+        # trading system's feeds publish every configured ladder's timeframes
+        # here; this stream is independent of CausaView entirely.
         self.bars_topic = os.environ.get("TRADING_BARS_TOPIC", "trading-bars")
         self.events_topic = os.environ.get("CHAIN_EVENTS_TOPIC", "chain-events")
         self.consumer_group = os.environ.get(
@@ -343,38 +339,17 @@ class SignalProcess:
                 strategy=strategy_name,
             )
 
-        # --- Ladder registry: built-in A/B plus any extras from config ---
+        # --- Ladder registry: every ladder comes from config ---
         from config import EXTRA_LADDERS, STRATEGIES
-        self.ladders = default_registry()
+        self.ladders = LadderRegistry()
         for name, tfs in EXTRA_LADDERS.items():
             self.ladders.register(name, tfs)
 
         # --- Strategy registry: register factories, build enabled from config ---
-        view = ChainView()   # the two-ladder shared view (A/B only)
         self.strategies = StrategyRegistry()
-        self.strategies.register_factory(
-            "two_ladder",
-            lambda *, name, symbols, ladders, params: Strategy(
-                name=name,
-                entry=TwoLadderEntry(view, make_writer(name)),
-                exit=TwoLadderExit(view, make_writer(name)),
-                symbols=symbols, ladders=ladders,
-            ),
-        )
         self.strategies.register_factory(
             "confirmed_15m",
             lambda *, name, symbols, ladders, params: make_confirmed_15m(
-                name=name, symbols=symbols, ladders=ladders, params=params,
-                view_registry=self.ladders, writer_factory=make_writer,
-            ),
-        )
-        # prior_failure_scaleout: same factory shape as confirmed_15m (own
-        # ChainHistoryView on its own ladder). Registered UNCONDITIONALLY —
-        # the config's `enabled` flag decides instantiation, and the factory
-        # validates the schedule-fits-ladder invariant loudly at build time.
-        self.strategies.register_factory(
-            "prior_failure_scaleout",
-            lambda *, name, symbols, ladders, params: make_prior_failure_scaleout(
                 name=name, symbols=symbols, ladders=ladders, params=params,
                 view_registry=self.ladders, writer_factory=make_writer,
             ),
@@ -450,9 +425,9 @@ class SignalProcess:
         # strategy actually reads (compute-once, ownership-gated). The ownership
         # set is the (symbol, ladder) pairs enabled strategies declare; the router
         # intersects its timeframe-matched targets with it, so a symbol-scoped
-        # strategy (e.g. two_ladder on AAPL only, confirmed_15m on BTC-USD only)
-        # doesn't make the router compute A/B chains for BTC-USD just because
-        # BTC-USD emits a shared timeframe (1m). Snapshot the set once at startup
+        # strategy (e.g. the CN-ladder rules on BTC-USD only) doesn't make the
+        # router compute CN chains for every crypto symbol just because they all
+        # emit a shared timeframe (1m). Snapshot the set once at startup
         # (strategies are fixed for the process lifetime). ---
         owned = self.strategies.owned_symbol_ladders()
         self.router = MultiLadderRouter(
@@ -464,7 +439,6 @@ class SignalProcess:
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(
-            view=view,
             registry=self.strategies,
             hooks=self._runtime_hooks(),
             locks=self.router._locks,   # SHARE the router's lock map
@@ -641,7 +615,7 @@ class SignalProcess:
             rows = await load_open_rows()
             out = []
             for r in rows:
-                strategy = r.get("strategy", "two_ladder")
+                strategy = r["strategy"]
                 base_pkey = r["position_key"]
                 out.append(OpenPosition(
                     tracking_key=namespaced_position_key(strategy, base_pkey),
@@ -670,8 +644,7 @@ class SignalProcess:
         """Router publish sink: send to Kafka chain-events (audit + any other
         consumers) AND feed the in-process multi-strategy runtime.
 
-        The router produces RAW event dicts (carrying `ladder` and, for A/B,
-        `set`). We forward the dict to Kafka and to the runtime. The runtime's
+        The router produces RAW event dicts (carrying `ladder`). We forward the dict to Kafka and to the runtime. The runtime's
         _process_raw_locked is called DIRECTLY (not on_raw_event) because the
         router already holds this symbol's lock — and the router and runtime
         SHARE one lock map, so re-acquiring would deadlock on the non-reentrant
@@ -694,7 +667,7 @@ class SignalProcess:
         calls runtime._process_raw_locked() assuming the router already holds the
         symbol's lock. The old docstring warned that a blanket create_task per bar
         would let two bars for the SAME symbol run at once — contending for the
-        lock, reaching the ChainView out of order, and silently breaking the
+        lock, reaching the strategies out of order, and silently breaking the
         chain machine's timestamp-ordered propagation WITHOUT RAISING. That
         warning still stands, and it prescribed the fix:
 
@@ -911,18 +884,6 @@ def _all_configured_symbols() -> list:
             if s not in out:
                 out.append(s)
     return out
-
-
-def _tagged_to_wire(tev: TaggedChainEvent) -> dict:
-    """TaggedChainEvent -> JSON dict for Kafka. Carries the 'set' tag so a Kafka
-    consumer can reconstruct it via TaggedChainEvent.from_raw."""
-    return {
-        "set": tev.set.value, "event_type": tev.event_type,
-        "chain_id": tev.chain_id, "symbol": tev.symbol,
-        "asset_class": tev.asset_class, "direction": tev.direction,
-        "metadata": {"propagation_level": tev.propagation_level},
-        "propagation_level": tev.propagation_level, "timestamp": tev.timestamp,
-    }
 
 
 async def amain() -> None:

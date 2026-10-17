@@ -315,72 +315,6 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
         return out
     return load_active_chains
 
-def make_load_chain_view_seed(pool):
-    """Load EVERY active chain (all symbols, both sets) as ChainView seed rows,
-    for consumer-side hydrate-on-restart (runtime.start -> ChainView.seed_active).
- 
-    Returns a list of dicts, one per active chain, each carrying exactly what
-    ChainView.seed_active needs:
- 
-        {"symbol", "set", "chain_id", "direction", "peak_level"}
- 
-      * set        — "A" | "B", classified from the chain's BASELINE timeframe
-                     (active_timeframes[0]), per migration 008: we classify from
-                     active_timeframes rather than history[0] so this needs no
-                     per-step data at all. A chain whose baseline tf belongs to
-                     neither set's ladder baseline is skipped (defensive — it
-                     belongs to some other ladder, e.g. the confirmed_15m FC ladder,
-                     which the two-ladder ChainView must not adopt).
-      * direction  — -1 | +1, straight from the column.
-      * peak_level — propagation_levels, the highest level reached. ChainView
-                     stores peak (not current) level and only ascends it, so
-                     propagation_levels is the right source.
- 
-    Only active chains are read (partial index ix_chains_active). Unlike
-    make_load_active_chains this is NOT filtered by symbol/asset_class — the
-    ChainView is global across all symbols, so one query hydrates everything.
-    """
-    from strategy.chain_view import SET_A_LADDER, SET_B_LADDER, ChainSet
- 
-    # baseline timeframe -> ChainSet. Baseline is ladder[0].
-    _SET_FOR_BASELINE = {
-        SET_A_LADDER[0]: ChainSet.A,   # "5s" -> A
-        SET_B_LADDER[0]: ChainSet.B,   # "30s" -> B
-    }
- 
-    async def load_chain_view_seed() -> list:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT chain_id, symbol, direction,
-                       propagation_levels, active_timeframes
-                FROM chains
-                WHERE active = true
-                """
-            )
-        out = []
-        for r in rows:
-            tfs = list(r["active_timeframes"]) if r["active_timeframes"] else []
-            if not tfs:
-                # No timeframes recorded — cannot classify a set; skip defensively.
-                continue
-            set_ = _SET_FOR_BASELINE.get(tfs[0])
-            if set_ is None:
-                # Baseline tf isn't an A/B baseline — chain belongs to another
-                # ladder (e.g. confirmed_15m). The two-ladder ChainView must not
-                # adopt it.
-                continue
-            out.append({
-                "symbol": r["symbol"],
-                "set": set_.value,             # "A" | "B" — seed_active wraps in ChainSet
-                "chain_id": r["chain_id"],
-                "direction": int(r["direction"]),
-                "peak_level": int(r["propagation_levels"]),
-            })
-        return out
- 
-    return load_chain_view_seed
-
 # ---- signal-writer persistence (trade_signals table, migration 004) --------
 
 def make_insert_signal(pool):
@@ -401,7 +335,7 @@ def make_insert_signal(pool):
             "insert_signal ATTEMPT signal_id=%s action=%s %s/%s strategy=%s "
             "decided_at=%s",
             row["signal_id"], row["action"], row["symbol"],
-            row["position_key"], row.get("strategy", "two_ladder"),
+            row["position_key"], row["strategy"],
             decided_at.isoformat(),
         )
         t0 = time.perf_counter()
@@ -418,7 +352,7 @@ def make_insert_signal(pool):
                     """,
                     row["signal_id"], row["position_key"], row["chain_id"],
                     row["direction"], row["action"], row["symbol"],
-                    row["asset_class"], row.get("strategy", "two_ladder"),
+                    row["asset_class"], row["strategy"],
                     row.get("trigger_level"),
                     row.get("decision_price"), row.get("exit_reason"),
                     # fraction (migration 016): portion of the position this

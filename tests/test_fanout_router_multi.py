@@ -10,7 +10,15 @@ from dataclasses import dataclass
 import pytest
 
 from producer.fanout_router_multi import MultiLadderRouter
-from strategy.ladder_registry import default_registry
+from strategy.ladder_registry import LadderRegistry
+
+
+def default_registry() -> LadderRegistry:
+    """Two overlapping ladders as test data (30s, 1m and 2m are in both)."""
+    reg = LadderRegistry()
+    reg.register("A", ["5s", "10s", "30s", "1m", "2m"])
+    reg.register("B", ["30s", "1m", "2m", "5m", "10m"])
+    return reg
 
 
 @dataclass
@@ -106,10 +114,10 @@ async def test_ab_events_carry_set_tag():
     published = []
     router, machines = _make_router(published)
     await router.on_bar(FakeBar("BTCUSDT", "1m"))
-    # A/B events carry `set` equal to the ladder name (back-compat with ChainView).
+    # Events carry `set` equal to the ladder name (chain-events topic consumers).
     a_event = next(r for r in published if r["ladder"] == "A")
     assert a_event["set"] == "A"
-    # metadata carries propagation_level (from_raw reads it).
+    # metadata carries propagation_level.
     assert a_event["metadata"]["propagation_level"] == 2
 
 
@@ -168,21 +176,19 @@ async def test_router_runtime_shared_lock_no_deadlock():
     lock (which would deadlock). Proves the shared-lock contract end-to-end."""
     from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks
     from strategy.registry import Strategy, StrategyRegistry
-    from strategy.chain_view import ChainView, ChainSet
 
     class TLEntry:
-        def __init__(self): self.sets = []
+        def __init__(self): self.ladders = []
         async def on_event(self, ev):
-            self.sets.append(ev.set); return None
+            self.ladders.append(ev.ladder); return None
     class TLExit:
         async def maybe_emit_exit(self, **kw): return None
 
     reg = default_registry()
-    view = ChainView()
     entry = TLEntry()
     sreg = StrategyRegistry()
-    sreg._strategies["two_ladder"] = Strategy(
-        name="two_ladder", entry=entry, exit=TLExit(), symbols=["AAPL"], ladders=["A", "B"])
+    sreg._strategies["probe"] = Strategy(
+        name="probe", entry=entry, exit=TLExit(), symbols=["AAPL"], ladders=["A", "B"])
 
     async def _empty(): return []
     async def _noop(*a): return None
@@ -190,7 +196,7 @@ async def test_router_runtime_shared_lock_no_deadlock():
 
     from collections import defaultdict
     shared = defaultdict(asyncio.Lock)
-    runtime = MultiStrategyRuntime(view, sreg, hooks, locks=shared)
+    runtime = MultiStrategyRuntime(sreg, hooks, locks=shared)
 
     async def publish(raw):
         await runtime._process_raw_locked(raw)   # router holds the lock here
@@ -200,6 +206,4 @@ async def test_router_runtime_shared_lock_no_deadlock():
     # 30s is in both A and B — a genuine fan-out under the shared lock. If the
     # deadlock-avoidance were wrong, wait_for would time out.
     await asyncio.wait_for(router.on_bar(FakeBar("AAPL", "30s")), timeout=5.0)
-    assert [s.value for s in entry.sets] == ["A", "B"]
-    assert view.get_chain("AAPL", ChainSet.A, "A-1") is not None
-    assert view.get_chain("AAPL", ChainSet.B, "B-1") is not None
+    assert entry.ladders == ["A", "B"]

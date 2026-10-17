@@ -2,22 +2,17 @@
 write_path_probe_fc.py — Deterministic end-to-end probe of the trade_signals
 write path for the CONFIRMED_15M strategy.
 
-Companion to write_path_probe.py (which covers two_ladder). confirmed_15m has a
-completely different gate — a start-ordered initiation+confirmation pattern
-across the [1m,3m,5m,15m,1h] ladder — so this builds a synthetic chain sequence
-that legitimately satisfies it, driven through the REAL make_confirmed_15m factory,
+confirmed_15m's gate is a start-ordered initiation+confirmation pattern across
+the [1m,3m,5m,15m,1h] ladder, so this builds a synthetic chain sequence that
+legitimately satisfies it, driven through the REAL make_confirmed_15m factory,
 the REAL Confirmed15mEntry/Exit, the REAL MultiStrategyRuntime, writer, insert, and
 SignalListener. Nothing is hand-inserted; the actual gate fires.
 
-Why a separate confirmed_15m probe matters (beyond "test the other strategy"):
-  * It exercises Confirmed15mExitAdapter.maybe_emit_exit, whose MISSING
-    decision_price parameter made every confirmed_15m exit raise TypeError — the
-    patched adapter must accept and forward it. The two_ladder probe cannot
-    catch this; only the confirmed_15m exit path does.
-  * It exercises the strategy column round-trip under a NON-default strategy
-    name ("confirmed_15m"): the listener SELECT must carry it, and the handler must
-    NOT fall back to "two_ladder". A regression here silently mislabels every
-    confirmed_15m trade.
+What it covers:
+  * Confirmed15mExitAdapter.maybe_emit_exit, whose MISSING decision_price
+    parameter once made every confirmed_15m exit raise TypeError.
+  * The strategy column round-trip: the listener SELECT must carry
+    "confirmed_15m". A regression here silently mislabels every trade.
 
 THE PATTERN (verbatim from confirmed_15m_strategy's prose spec), by chain-START
 time (first_seen == 1m initiation on this ladder):
@@ -35,8 +30,7 @@ time (first_seen == 1m initiation on this ladder):
 
   EXIT: an opposing chain reaches 5m (level 3) -> STOP.
 
-SAFETY: identical to the two_ladder probe — pg_notify fans out to every
-listener; run with the executor stopped or in paper trade_mode, and keep the
+SAFETY: pg_notify fans out to every listener; run with the executor stopped or in paper trade_mode, and keep the
 unroutable default symbol. Requires --i-understand-live-listeners.
 
 Usage:
@@ -58,7 +52,6 @@ import asyncpg
 from execution.signal_writer import SignalWriter, SignalWriterHooks
 from execution.signal_listener import SignalListener
 from producer.persistence import make_insert_signal, make_load_open_positions
-from strategy.chain_view import ChainView
 from strategy.ladder_registry import LadderRegistry
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks
 from strategy.registry import StrategyRegistry
@@ -78,10 +71,8 @@ def _iso(base: datetime, seconds: int) -> str:
 
 def _event(*, chain_id: str, event_type: str, symbol: str, direction: int,
            level: int, ts: str, price: float) -> dict:
-    """Raw event in the router's published shape. confirmed_15m reads via
-    _RawEventView (raw dict), ignoring the A/B 'set' tag, but the runtime routes
-    on 'ladder'; we stamp ladder='FC' so this event is fanned to confirmed_15m and
-    is NOT folded into the two-ladder ChainView."""
+    """Raw event in the router's published shape. The runtime routes on
+    'ladder'; we stamp ladder='FC' so this event is fanned to confirmed_15m."""
     return {
         "ladder": "FC",
         "event_type": event_type,
@@ -128,9 +119,8 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
         handled: dict[str, dict] = {}
 
         async def handler(row: dict) -> None:
-            # The confirmed_15m-specific assertion: the listener must carry the
-            # strategy column, and it must read "confirmed_15m", NOT the
-            # "two_ladder" fallback. This is the bug the two_ladder probe can't see.
+            # The listener must carry the strategy column, and it must read
+            # "confirmed_15m".
             if row.get("strategy") != STRATEGY_NAME:
                 failures.append(
                     f"strategy column wrong/absent through listener: "
@@ -170,11 +160,8 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
         async def _noop(*_a, **_k):
             return None
 
-        # No two-ladder ChainView needed (FC uses its own history), but the
-        # runtime requires a view object; pass an empty one — FC events carry
-        # ladder='FC' so they are never folded into it.
         runtime = MultiStrategyRuntime(
-            view=ChainView(), registry=registry,
+            registry=registry,
             hooks=RuntimeHooks(
                 load_open_positions=make_load_open_positions(pool),
                 save_open_position=_noop, remove_open_position=_noop))
@@ -287,7 +274,7 @@ async def run_probe(dsn: str, symbol: str, base_ts: datetime,
             failures.append(f"listener never dispatched: {expected - set(handled)}")
         else:
             log.info("PHASE 2 OK: SignalListener dispatched both "
-                     "(strategy column = confirmed_15m, not the two_ladder fallback)")
+                     "(strategy column = confirmed_15m)")
 
         listener_task.cancel()
         try:
