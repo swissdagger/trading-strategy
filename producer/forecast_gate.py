@@ -81,12 +81,13 @@ class ForecastMemo:
 
     WHY. Sumtyme is DETERMINISTIC: an identical input window produces an
     identical signal, every time. Chain machines are per (symbol, ladder), and
-    two ladders that share a timeframe (FC and PF share 1m/3m/5m/15m/1h) each
-    hold their own buffer for it and would each forecast the SAME
+    two ladders that share a timeframe (FC and CN share 1m/3m/5m/15m/1h on
+    BTC-USD) each hold their own buffer for it and would each forecast the SAME
     (symbol, timeframe, window) — paying the pipeline's scarcest resource twice
     for one answer. The 1m rung alone is ~1440 calls/day/symbol, so without
-    this memo a second ladder on crypto roughly DOUBLES Sumtyme demand; with
-    it, the second ladder costs only its genuinely new rungs (~70/day/symbol).
+    this memo a second ladder on the same rungs roughly DOUBLES Sumtyme demand;
+    with it, the second ladder costs only its genuinely new rungs (CN's
+    30s/45s/2m/30m).
 
     KEY: (asset_class, symbol, timeframe, first_bar_ts, last_bar_ts, n_bars).
     The first/last timestamps + length pin the exact window, not just its tail

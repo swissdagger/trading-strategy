@@ -7,8 +7,8 @@ entry to ASSET_CONFIGS — Services 2 and 3 know nothing about which
 feeds exist.
 
 The interface is deliberately small. Anything source-specific
-(Polygon's `O:` prefix, Binance's USDⓈ-M Futures endpoint, contract
-discovery for options) lives behind the concrete class. The signature
+(Polygon's REST/websocket split, Coinbase's candle granularities and
+trade-built seconds rungs) lives behind the concrete class. The signature
 shape is fixed by the plan; the rationale for each method is below.
 """
 from __future__ import annotations
@@ -217,9 +217,9 @@ def session_bounds_for(
       - Always returns a sentinel (0, very_large) since crypto has
         no session boundaries. Callers that distinguish intra-session
         from inter-session gaps will always treat crypto gaps as
-        intra-session (i.e. all fillable). In practice Binance fills
-        no-trade minutes itself, so the feed never produces gaps for
-        crypto and this branch is rarely hit.
+        intra-session (i.e. all fillable). Coinbase omits no-trade
+        intervals, so crypto series can have gaps; all of them are
+        intra-session.
 
     For equity:
       - Same daily 13:30..20:00 UTC bounds as options (one shared
@@ -384,7 +384,7 @@ class AssetFeed(ABC):
 
     Each feed owns its own RateLimiter and any source-specific state
     (HTTP client, auth headers, partial-bar dedupe cursors). Feeds do
-    NOT share rate budget — Polygon and Binance have independent
+    NOT share rate budget — Polygon and Coinbase have independent
     HTTP quotas. (This was an explicit user direction during Phase 1
     design.)
     """
@@ -433,15 +433,14 @@ class AssetFeed(ABC):
     def supported_timeframes(self) -> Set[str]:
         """Which canonical timeframes (e.g. '1m', '5m', '12h') this
         feed can produce. Used by config validation to refuse
-        configurations that ask for unsupported pairs (e.g. '10m' on
-        Binance Futures, which doesn't offer it).
+        configurations that ask for unsupported pairs (e.g. a rung
+        Coinbase neither serves nor can derive).
         """
 
     @abstractmethod
     def to_native_symbol(self, symbol: str) -> str:
         """Convert the canonical symbol to whatever string the source
-        API expects. Polygon forex needs `C:EURUSD`; Polygon options
-        already includes the `O:` prefix in the canonical name;
-        Binance is pass-through. Returns the native form; canonical
+        API expects. Coinbase (product id "BTC-USD") and Polygon stocks
+        are pass-through. Returns the native form; canonical
         form is what's stored in the DB and emitted to Kafka.
         """

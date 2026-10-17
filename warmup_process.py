@@ -103,9 +103,9 @@ async def _seed_one_stream(
     if _is_sub_minute(timeframe):
         seed_fn = _subminute_seed_fn(feed)
         if seed_fn is None:
-            # Feed has no sub-minute tick source (e.g. crypto/Binance — no
-            # sub-minute REST at all). Keep the pure cold-start: no seed, no
-            # cursor, fills live.
+            # Feed has no sub-minute tick source (e.g. Coinbase with no
+            # subminute_symbols configured). Keep the pure cold-start: no seed,
+            # no cursor, fills live.
             log.info("skip warmup for %s:%s %s — no sub-minute tick source; "
                      "cold-start (fills live)", asset_class, symbol, timeframe)
             return

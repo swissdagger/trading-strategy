@@ -2,8 +2,8 @@
 execution/client_order_id.py — The deterministic client-order-id scheme.
 
 This is small but it is the KEYSTONE of the whole crash-recovery and idempotency
-story. Every order sent to a venue carries a client order id (IBKR orderRef;
-Binance newClientOrderId) that is DERIVED FROM THE TRADE, never random. Because
+story. Every order sent to a venue carries a client order id (Coinbase
+client_order_id) that is DERIVED FROM THE TRADE, never random. Because
 it is deterministic and parseable:
 
   * A crash between "submit" and "ack" is recoverable: on restart we know exactly
@@ -50,13 +50,14 @@ PURPOSE, so the venue dedupes if it secretly landed). Exit: rung increments, so
 each ladder step is a fresh id.
 
 LENGTH BUDGET: tag(3) + dots(3) + trade_short(32) + intent(1) + rung(<=3 typ.)
-= ~42 chars. IBKR orderRef allows well over this; Binance newClientOrderId
-allows 36 chars for some endpoints and more for others — if a target venue's
-limit is tighter than our id, that is a per-adapter concern: the adapter may
-hash-compress the trade_short into its own space WHILE preserving determinism
-(same input -> same compressed id) and keep a local map back. The CANONICAL id
-stored in orders.client_order_id is this full form; any venue-side compression
-is the adapter's private business and must round-trip deterministically.
+= ~42 chars. The Coinbase adapter sends this full id unchanged (ADR-001 leaves
+the venue's length limit to be verified on the first real call); paper keys
+its ledger on it as-is. If a venue's limit is tighter than our id, that is a
+per-adapter concern: the adapter may hash-compress the trade_short into its
+own space WHILE preserving determinism (same input -> same compressed id) and
+keep a local map back. The CANONICAL id stored in orders.client_order_id is
+this full form; any venue-side compression is the adapter's private business
+and must round-trip deterministically.
 """
 from __future__ import annotations
 

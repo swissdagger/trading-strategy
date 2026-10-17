@@ -28,7 +28,7 @@ A stream never ends, so we need a trigger. The rule:
     timestamp belongs to a LATER window (source_window_start > W_start).
 
 That arriving later bar is the PROOF that no more trades can land in W:
-Polygon/Binance emit source bars in non-decreasing time order per symbol,
+Polygon emits source bars in non-decreasing time order per symbol,
 so once a bar for a later window shows up, W can receive nothing further.
 This is the event-driven form of the "closed-window-only emission" the
 REST feeds already do by only returning fully-elapsed windows.

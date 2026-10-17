@@ -387,12 +387,11 @@ class StreamingFeedBase(AssetFeed, ABC):
 
         Default True: the Polygon REST feeds backfill every target timeframe
         (their fetch_history resamples from per-second/minute aggregates the REST
-        API serves). A feed whose REST sibling CANNOT serve some timeframe — e.g.
-        Binance, whose futures REST klines bottom out at 1m so sub-minute rungs
-        would (incorrectly) request interval=1s and 400 — overrides this to skip
-        those rungs. Skipped rungs simply resume live after reconnect (for
-        sub-minute crypto they self-heal from fresh 1s klines); attempting REST
-        backfill on them only produces a 400-storm that delays live resumption.
+        API serves). A feed whose REST sibling CANNOT usefully serve some
+        timeframe — e.g. Polygon's websocket feed, whose REST sub-minute
+        aggregates lag badly — overrides this to skip those rungs. Skipped rungs
+        simply resume live after reconnect; attempting REST backfill on them only
+        produces a 400/latency storm that delays live resumption.
         """
         return True
 

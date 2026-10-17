@@ -376,10 +376,10 @@ def make_get_touch(pool: asyncpg.Pool):
     schema has no quotes table (see its header: "no prices table here"). This
     factory exists only so build_executor_hooks can populate the field; the
     launcher OVERWRITES hooks.get_touch with the live adapter's get_touch
-    (execution/adapter.ExecutionAdapter.get_touch, implemented on IBKRAdapter via
-    reqTickers and BinanceAdapter via bookTicker). If it is ever left as-is it
-    returns None, which the pricer treats as "no reference" and skips the order —
-    a safe no-op, never a stale price."""
+    (execution/adapter.ExecutionAdapter.get_touch: Coinbase best_bid_ask, which
+    the paper adapter reads too). If it is ever left as-is it returns None,
+    which the pricer treats as "no reference" and skips the order — a safe
+    no-op, never a stale price."""
     async def get_touch(symbol: str, asset_class: str) -> Optional[Touch]:
         log.warning("get_touch(%s): DB no-op reached — launcher should have wired "
                     "the adapter's get_touch. Returning None.", symbol)
@@ -818,23 +818,23 @@ def build_executor_hooks(pool: asyncpg.Pool) -> ExecutorHooks:
 # ==========================================================================
 # LEFT TO DO (status after the adapter get_touch/equity + sizing work):
 #
-# 1. get_touch  — RESOLVED. Added to the adapter ABC and implemented on both
-#    venues (IBKRAdapter via reqTickers; BinanceAdapter via bookTicker). The
-#    launcher wires hooks.get_touch to the live adapter, so this module's
-#    make_get_touch no-op is never used at runtime.
+# 1. get_touch  — RESOLVED. Added to the adapter ABC and implemented on the
+#    Coinbase adapter (best_bid_ask; paper reads the same). The launcher wires
+#    hooks.get_touch to the live adapter, so this module's make_get_touch no-op
+#    is never used at runtime.
 #
-# 2. size_position — RESOLVED. Implemented in execution/sizing.py (5% of account
-#    equity per position), wired by the launcher over the adapter's
+# 2. size_position — RESOLVED. Implemented in execution/sizing.py (5% of
+#    available equity per position), wired by the launcher over the adapter's
 #    get_account_equity + get_touch, and floored to the venue step via
-#    adapter.get_step_size (IB contract details / Binance LOT_SIZE). No separate
-#    step map to maintain.
+#    adapter.get_step_size (Coinbase base_increment). No separate step map to
+#    maintain.
 #
 # 3. trades.strategy — RESOLVED by migration 014 (apply it). persist_trade now
 #    writes t.strategy; load_open_trades reads the column. Nothing further needed
 #    beyond applying the migration.
 #
-# 4. persist_fill order mapping — assumes orders.venue_order_id is populated on
-#    ack (it is, per the adapter contract). Fills that arrive before their order
-#    row's venue_order_id is written will be skipped and re-swept on reconcile;
-#    confirm the adapter writes venue_order_id promptly on ack for your venue.
+# 4. persist_fill order mapping — RESOLVED. Fills resolve their order by
+#    client_order_id first, falling back to venue_order_id, and back-fill
+#    orders.venue_order_id the first time a fill reveals it (see
+#    make_persist_fill).
 # ==========================================================================

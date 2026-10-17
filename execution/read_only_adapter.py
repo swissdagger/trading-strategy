@@ -1,11 +1,13 @@
 """
 execution/read_only_adapter.py — wraps a real adapter and refuses every write.
 
-Used for TradeMode.OFF against the real Coinbase adapter (ADR-001 Phase 4):
-the executor can connect, reconcile, read balances and touches, and stream
-fills, but submit/cancel/amend never reach the venue — regardless of what the
-GatedAdapter above it decides. Belt and braces: OFF must never be able to
-place a real order, even through a bug in the mode gate.
+Used around the real Coinbase adapter wherever only its market data may be
+used (ADR-001 Phase 4): as the paper adapter's market source in OFF and PAPER
+mode, and by GatedAdapter.block_all_writes when a mode change switches venue.
+Reads, reconcile and fills pass through; submit/cancel/amend never reach the
+venue — regardless of what the GatedAdapter above it decides. Belt and braces:
+OFF and PAPER must never be able to place a real order, even through a bug in
+the mode gate.
 """
 from __future__ import annotations
 
