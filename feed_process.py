@@ -39,6 +39,9 @@ class FeedConfig:
         self.kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
         self.bars_topic = os.environ.get("TRADING_BARS_TOPIC", "trading-bars")
         self.db_url = os.environ.get("TRADING_DB_URL")   # for reading feed_cursors
+        # Required only when ASSET_CONFIGS has equities (PR 9). Read here and
+        # in warmup via _build_feeds, so a missing key fails at startup.
+        self.polygon_api_key = os.environ.get("POLYGON_API_KEY")
 
 
 def _build_rest_feed(asset_class: str, symbols: list, timeframes: list):
@@ -56,8 +59,16 @@ def _build_rest_feed(asset_class: str, symbols: list, timeframes: list):
     and avoid importing a feed for a class that has no symbols configured.
     """
     if asset_class == "crypto":
+        from config import ASSET_CONFIGS
         from feeds.coinbase_spot import CoinbaseSpotFeed
-        return CoinbaseSpotFeed(symbols, timeframes)
+        return CoinbaseSpotFeed(symbols, timeframes,
+                                subminute_symbols=ASSET_CONFIGS["crypto"].get("subminute_symbols"))
+    if asset_class == "equity":
+        key = os.environ.get("POLYGON_API_KEY")
+        if not key:
+            raise RuntimeError("POLYGON_API_KEY not set — required for the equity feed")
+        from feeds.polygon_stocks import PolygonStocksFeed
+        return PolygonStocksFeed(key, symbols, timeframes)
     return None
 
 
@@ -67,9 +78,11 @@ def _build_ws_feed(asset_class: str, backfill_feed):
     no ws feed (config.transport_for already rejects ws for such classes, so
     this is defence in depth, not the primary guard).
     """
-    # No class has a websocket feed since ADR-001 Phase 2: the Binance ws feed
-    # wrapped a Binance REST backfill engine and does not apply to Coinbase.
-    # A Coinbase websocket feed would add its branch here.
+    if asset_class == "equity":
+        from feeds.polygon_ws import PolygonStocksWSFeed
+        return PolygonStocksWSFeed(os.environ.get("POLYGON_API_KEY", ""), backfill_feed)
+    # Crypto has no websocket feed since ADR-001 Phase 2 (Coinbase candles
+    # are REST-polled). A Coinbase websocket feed would add its branch here.
     return None
 
 
@@ -187,7 +200,17 @@ class FeedProcess:
     async def _run_feed(self, feed, symbols, timeframes, cursors, callback) -> None:
         """Run one feed's live loop, restarting it if it errors out (a feed's
         start_live is expected never to return normally; if it raises, we back off
-        and relaunch rather than lose that asset class for the process lifetime)."""
+        and relaunch rather than lose that asset class for the process lifetime).
+
+        WEBSOCKET → REST FALLBACK. A streaming feed that cannot establish its
+        socket on a cold start (StreamingUnavailable: wrong host, no real-time
+        entitlement, bad key) is swapped for its REST sibling for the rest of
+        the process lifetime — loudly, once. A mid-run disconnect is NOT this
+        case; the streaming base reconnects and backfills those itself. The
+        swap is safe for the cursors: a feed that never connected never
+        emitted, so `cursors` is exactly what the REST feed should resume from.
+        """
+        from feeds.streaming_base import StreamingUnavailable
         while not self._stop.is_set():
             try:
                 await feed.start_live(symbols, timeframes, cursors, callback)
@@ -195,6 +218,20 @@ class FeedProcess:
                 log.warning("feed %s start_live returned; relaunching", feed.name)
             except asyncio.CancelledError:
                 raise
+            except StreamingUnavailable as e:
+                rest = getattr(feed, "rest_feed", None)
+                if rest is None:
+                    log.exception("feed %s unavailable and has no REST sibling; "
+                                  "backing off 5s then relaunching", feed.name)
+                else:
+                    log.error(
+                        "feed %s could not connect (%s) — FALLING BACK to REST "
+                        "feed %s for the process lifetime. Sub-minute rungs are "
+                        "served by polling trades; fix the websocket and restart "
+                        "to return to streaming.", feed.name, e, rest.name,
+                    )
+                    feed = rest
+                    continue
             except Exception:
                 log.exception("feed %s errored; backing off 5s then relaunching",
                               feed.name)

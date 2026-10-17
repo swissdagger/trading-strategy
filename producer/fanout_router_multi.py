@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 
 from strategy.ladder_registry import LadderRegistry
@@ -72,6 +74,25 @@ OwnsPredicate = Callable[[str, str], bool]
 # Ladder names that correspond to the two-ladder ChainSet enum, so we can keep
 # populating `set` for them (backward compatibility with the two-ladder view).
 _CHAINSET_LADDERS = {"A", "B"}
+
+
+@dataclass
+class RoutedBar:
+    """One bar, prepared on every ladder that owns it, awaiting forecast and
+    apply. `items` is (machine, ladder_name, pending) in deterministic registry
+    order; `pending` is None for a machine that does not implement the split
+    (it then runs its whole on_bar inside apply(), serially — the legacy path)."""
+    bar: "OHLCPoint"
+    items: list = field(default_factory=list)
+
+
+def _supports_split(machine) -> bool:
+    """Does this machine implement the prepare/forecast/apply split? The
+    ChainMachine ABC only requires on_bar; the split is an optional refinement
+    (ServiceTwoChainMachine has it; test fakes and future simple machines need
+    not)."""
+    return all(callable(getattr(machine, n, None))
+               for n in ("prepare", "forecast", "apply"))
 
 
 class MultiLadderRouter:
@@ -118,10 +139,14 @@ class MultiLadderRouter:
             self._hydrated.add(key)
         return m
 
-    async def on_bar(self, bar: OHLCPoint) -> None:
-        """Route ONE closed bar to every ladder whose timeframes contain the
-        bar's timeframe AND that at least one strategy reads for this symbol.
-        All under the symbol lock."""
+    # ------------------------------------------------------------------
+    # The three-stage path. signal_process's SymbolWorkerPool drives these
+    # separately so the Sumtyme call runs outside the lock and concurrently
+    # across bars, while prepare/apply stay under the lock in arrival order.
+    # on_bar() below composes them serially for callers that don't pipeline.
+    # ------------------------------------------------------------------
+
+    def _targets(self, bar: OHLCPoint) -> List[str]:
         targets = self._registry.ladders_for_timeframe(bar.timeframe)
         if self._owns is not None:
             # Drop ladders no enabled strategy reads for this symbol — a
@@ -129,16 +154,75 @@ class MultiLadderRouter:
             # nobody consumes (wasted forecasts + junk chains). With no owner
             # gate this is a no-op (original fan-to-all behaviour).
             targets = [ln for ln in targets if self._owns(bar.symbol, ln)]
+        return targets
+
+    async def prepare(self, bar: OHLCPoint) -> Optional[RoutedBar]:
+        """STAGE 1. Under the symbol lock: hydrate-if-needed and append the bar
+        to every owning ladder's machine, in deterministic ladder order. Fast —
+        no API call, no DB write (hydrate aside, once per machine).
+
+        Returns None when no ladder has anything to forecast for this bar
+        (unowned timeframe, duplicate/out-of-order, buffers not yet full), so
+        the caller can retire the bar immediately.
+        """
+        targets = self._targets(bar)
         if not targets:
             log.debug("dropping bar %s %s: no owned ladder for this timeframe",
                       bar.symbol, bar.timeframe)
-            return
+            return None
 
+        routed = RoutedBar(bar=bar)
         async with self._lock(bar.symbol):
             for ladder_name in targets:   # deterministic registry order
                 machine = await self._machine_for(bar.symbol, ladder_name)
+                if not _supports_split(machine):
+                    routed.items.append((machine, ladder_name, None))
+                    continue
                 try:
-                    events: List[ChainEvent] = await machine.on_bar(bar)
+                    pending = machine.prepare(bar)
+                except Exception:
+                    log.exception("chain machine prepare error: symbol=%s ladder=%s tf=%s",
+                                  bar.symbol, ladder_name, bar.timeframe)
+                    continue
+                if pending is not None:
+                    routed.items.append((machine, ladder_name, pending))
+        return routed if routed.items else None
+
+    async def forecast(self, routed: RoutedBar) -> None:
+        """STAGE 2. NO lock. Run every prepared ladder's forecast concurrently.
+        Two ladders sharing this bar's timeframe share one API call through the
+        memo (owner/join). A machine's forecast() never raises for the normal
+        failure modes (it leaves pending.forecast None); anything else is
+        logged here and the ladder's apply becomes a no-op."""
+        coros = [m.forecast(p) for (m, ln, p) in routed.items if p is not None]
+        if not coros:
+            return
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for (m, ln, p), r in zip(
+                [it for it in routed.items if it[2] is not None], results):
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+            if isinstance(r, BaseException):
+                log.exception("chain machine forecast error: symbol=%s ladder=%s tf=%s",
+                              routed.bar.symbol, ln, routed.bar.timeframe,
+                              exc_info=r)
+
+    async def apply(self, routed: RoutedBar) -> None:
+        """STAGE 3. Under the symbol lock, in deterministic ladder order: apply
+        each ladder's forecast (cache + INIT/PROPAGATE/TERMINATE) and publish
+        the events. The publish sink runs the strategy runtime under this same
+        lock (see signal_process._publish). One machine failing does not poison
+        the others; one bad event drops that event, not the pipeline."""
+        bar = routed.bar
+        async with self._lock(bar.symbol):
+            for machine, ladder_name, pending in routed.items:
+                try:
+                    if pending is None:
+                        # Legacy machine (no split): whole on_bar, serially,
+                        # under the lock — exactly the pre-split behaviour.
+                        events: List[ChainEvent] = await machine.on_bar(bar)
+                    else:
+                        events = await machine.apply(pending)
                 except Exception:
                     log.exception("chain machine error: symbol=%s ladder=%s tf=%s",
                                   bar.symbol, ladder_name, bar.timeframe)
@@ -160,6 +244,20 @@ class MultiLadderRouter:
                             "— dropping this event (pipeline continues)",
                             bar.symbol, ladder_name, ce.event_type, ce.chain_id,
                         )
+
+    async def on_bar(self, bar: OHLCPoint) -> None:
+        """Route ONE closed bar, serially: prepare -> forecast -> apply.
+
+        The original single-call contract, kept for probes, tests and any
+        caller that does not pipeline. Semantically identical to the pipelined
+        path for one bar; what the pipeline adds is overlapping the forecast of
+        bar N with the prepare of bars N+1.. for the same symbol (see
+        producer/symbol_workers.py), which this serial form does not do."""
+        routed = await self.prepare(bar)
+        if routed is None:
+            return
+        await self.forecast(routed)
+        await self.apply(routed)
 
     def _tag(self, ce: ChainEvent, ladder_name: str) -> dict:
         """Build the raw tagged-event dict. Carries `ladder` (the general name)
@@ -189,6 +287,12 @@ class MultiLadderRouter:
             # cross-team contract. Named decision_price (not price) because that is
             # the field name both strategies' entry/exit components already read.
             "decision_price": ce.price,
+            # When this event was DETECTED (wall clock), as opposed to
+            # `timestamp` (the closing bar, one timeframe earlier). The
+            # strategy package's replay harness needs it to time entries the
+            # way live does (its spec §2.4); additive, ignored by everything
+            # else.
+            "detected_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def machine_count(self) -> int:

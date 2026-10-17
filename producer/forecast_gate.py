@@ -53,6 +53,28 @@ from typing import Optional
 log = logging.getLogger("producer.forecast_gate")
 
 
+class _MemoEntry:
+    """One memo slot: the exact window key, and either a settled value or the
+    future of the call that will produce it."""
+    __slots__ = ("key", "future", "value", "done")
+
+    def __init__(self, key: tuple, future: Optional[asyncio.Future]):
+        self.key = key
+        self.future = future
+        self.value = None
+        self.done = False
+
+
+class MemoClaim:
+    """Result of ForecastMemo.claim(). See claim() for the three cases."""
+    __slots__ = ("value", "future", "owner")
+
+    def __init__(self, value, future: Optional[asyncio.Future], owner: bool):
+        self.value = value
+        self.future = future
+        self.owner = owner
+
+
 class ForecastMemo:
     """Cross-ladder forecast dedupe. ONE instance per process, shared by every
     chain machine (same discipline as ForecastGate).
@@ -78,43 +100,100 @@ class ForecastMemo:
     value, and memory stays bounded by the number of live (symbol, timeframe)
     pairs.
 
-    CONCURRENCY: none needed. The router runs a symbol's ladders SEQUENTIALLY
-    under the symbol lock (deterministic ladder order), so for any key the
-    first machine finishes before the second asks; different symbols never
-    share keys. Single event loop, synchronous dict ops.
+    CONCURRENCY: the two ladders sharing a timeframe no longer run one after
+    the other — since the forecast/apply split (service2_machine.prepare /
+    forecast / apply), a symbol's ladders prepare back-to-back under the lock
+    and then forecast CONCURRENTLY. So a plain value cache would see both
+    machines miss and both call the API. The memo therefore holds an IN-FLIGHT
+    future per slot: the first claimant (the owner) computes, later claimants
+    join its future. Single event loop, so the dict ops themselves need no lock.
 
-    Only USABLE results are stored (the caller stores after its own
-    Exception-object / empty-result checks pass), so a failed call is never
-    replayed to the other ladder — the second machine just retries the API.
+    FAILURES ARE NEVER SHARED. The owner resolves the future only with a
+    USABLE result; on any failure it calls fail(), which drops the entry and
+    settles joiners with None so they call the API themselves. A failed call
+    is thus never replayed to the other ladder — the same rule as before.
     """
 
     def __init__(self, *, stats_every: int = 500):
-        # (asset_class, symbol, timeframe) -> (full_key, forecast)
-        self._latest: dict[tuple, tuple] = {}
-        self._hits = 0
-        self._misses = 0
+        # (asset_class, symbol, timeframe) -> _MemoEntry
+        self._latest: dict[tuple, _MemoEntry] = {}
+        self._hits = 0      # value already present, or joined an in-flight call
+        self._misses = 0    # became the owner (an API call will be made)
         self._stats_every = stats_every
 
     @staticmethod
     def _slot(key: tuple) -> tuple:
         return key[:3]   # (asset_class, symbol, timeframe)
 
-    def get(self, key: tuple):
-        """The memoized forecast for exactly this window, or None."""
-        entry = self._latest.get(self._slot(key))
-        if entry is not None and entry[0] == key:
+    # ----- the three-way claim used by the live machines ------------------
+
+    def claim(self, key: tuple) -> "MemoClaim":
+        """Claim this window. Exactly one of three outcomes:
+          * value present  -> MemoClaim(value=forecast)           (hit)
+          * in flight      -> MemoClaim(future=f, owner=False)    (join: await f)
+          * nothing        -> MemoClaim(future=f, owner=True)     (you compute;
+                              you MUST resolve() or fail() this key)
+        Must be called from a running event loop."""
+        slot = self._slot(key)
+        entry = self._latest.get(slot)
+        if entry is not None and entry.key == key:
+            if entry.done:
+                self._hits += 1
+                self._maybe_log()
+                return MemoClaim(value=entry.value, future=None, owner=False)
             self._hits += 1
             self._maybe_log()
-            return entry[1]
+            return MemoClaim(value=None, future=entry.future, owner=False)
+        self._misses += 1
+        self._maybe_log()
+        fut = asyncio.get_running_loop().create_future()
+        self._latest[slot] = _MemoEntry(key=key, future=fut)
+        return MemoClaim(value=None, future=fut, owner=True)
+
+    def resolve(self, key: tuple, forecast) -> None:
+        """Owner (or a joiner re-putting the same value) publishes a USABLE
+        forecast for this window. Idempotent."""
+        slot = self._slot(key)
+        entry = self._latest.get(slot)
+        if entry is None or entry.key != key:
+            entry = _MemoEntry(key=key, future=None)
+            self._latest[slot] = entry
+        entry.value = forecast
+        entry.done = True
+        if entry.future is not None and not entry.future.done():
+            entry.future.set_result(forecast)
+
+    def fail(self, key: tuple) -> None:
+        """Owner reports that its call produced nothing usable. The entry is
+        dropped (so the next bar, or a retry, starts clean) and any joiners are
+        released with None so they make their own call. No-op if already
+        resolved."""
+        slot = self._slot(key)
+        entry = self._latest.get(slot)
+        if entry is None or entry.key != key or entry.done:
+            return
+        del self._latest[slot]
+        if entry.future is not None and not entry.future.done():
+            entry.future.set_result(None)
+
+    # ----- plain value interface (standalone/test use; kept for compatibility) --
+
+    def get(self, key: tuple):
+        """The memoized forecast for exactly this window, or None. Does not
+        join an in-flight call — use claim() for that."""
+        entry = self._latest.get(self._slot(key))
+        if entry is not None and entry.key == key and entry.done:
+            self._hits += 1
+            self._maybe_log()
+            return entry.value
         self._misses += 1
         self._maybe_log()
         return None
 
     def put(self, key: tuple, forecast) -> None:
         """Store a USABLE forecast for this window, replacing the slot's
-        previous window. Idempotent: re-putting a hit overwrites with the same
-        value."""
-        self._latest[self._slot(key)] = (key, forecast)
+        previous window. Equivalent to resolve()."""
+        self.resolve(key, forecast)
 
     def _maybe_log(self) -> None:
         total = self._hits + self._misses
@@ -155,11 +234,18 @@ class ForecastGate:
         # High wait + low latency = we are demand-bound, not API-bound.
         self._waits: deque[float] = deque(maxlen=500)
 
-    async def run(self, fn, *args, timeout_s: float, **kwargs):
+    async def run(self, fn, *args, timeout_s: float, prepare=None, **kwargs):
         """Run one blocking forecast under the gate, in a worker thread.
 
         Raises asyncio.TimeoutError on timeout (the caller's existing skip-the-bar
         path), or whatever the SDK raises. The permit is ALWAYS released.
+
+        `prepare`, if given, is a sync callable returning extra kwargs for `fn`;
+        it runs AFTER the permit is acquired. The machine uses it to build the
+        5001-row DataFrame only once the call is actually about to happen, so a
+        bar queued behind other symbols holds a buffer snapshot (5000 refs), not
+        a full frame. Under a backlog that is the difference between bounded and
+        unbounded memory.
 
         NOTE on the timeout: it is measured from the moment the permit is
         acquired, NOT from when this coroutine was called. That is deliberate —
@@ -171,6 +257,9 @@ class ForecastGate:
         async with self._sem:
             waited = time.perf_counter() - wait_start
             self._waits.append(waited)
+
+            if prepare is not None:
+                kwargs = {**kwargs, **prepare()}
 
             call_start = time.perf_counter()
             try:

@@ -26,7 +26,7 @@ shared with CausaView. Every service connects as a role that bypasses RLS (the
 service role or the owner); the trading tables are deny-all with no policies and
 there is no browser client.
 
-**Network.** Outbound HTTPS to `api.coinbase.com` (feed, warmup, executor) and to
+**Network.** Outbound HTTPS to `api.coinbase.com` (feed, warmup, executor), `api.exchange.coinbase.com` (feed, warmup: the trades source for the CN ladder's 30s/45s rungs) and to
 the Sumtyme API (signal). Nothing else.
 
 **First deployment, on a fresh database:**
@@ -35,6 +35,8 @@ the Sumtyme API (signal). Nothing else.
 for f in migrations/0*.sql; do psql "$TRADING_DB_URL" -v ON_ERROR_STOP=1 -f "$f"; done
 cp .env.example .env              # fill in: DB URL, Sumtyme key, Coinbase key (§3)
 python verify_coinbase_readonly.py    # must end with OK; places nothing
+python verify_polygon_feed.py         # equities: must end with OK; reads only (§3b)
+python verify_crypto_subminute.py     # CN ladder trades source: must end with OK; reads only (§3d)
 docker compose up -d --build
 ```
 
@@ -95,6 +97,49 @@ operator needs to know:
    - open orders and recent fills.
 
    It makes no writes. It must end with `OK`.
+
+### 3b. Polygon (equities, the DL ladder)
+
+1. Put `POLYGON_API_KEY` in `.env`. `POLYGON_WS_HOST` defaults to
+   `business.polygon.io`, the real-time entitlement host; the generic
+   `socket.polygon.io` denies real-time for this account.
+2. Run `python verify_polygon_feed.py` (optionally with tickers as arguments,
+   or `--no-ws`). For each DL rung it fetches a small sample through the same
+   source rule warmup will use and reports bars, span, **alignment** and
+   spacing, then authenticates the websocket on the configured host. It makes
+   no writes and touches neither Kafka nor the database. It must end with `OK`.
+   - `FAIL … off the grid` on 15m/30m/hour rungs is ADR-001 debt D16: add that
+     rung to `_PolygonAggsFeedBase.DERIVE_FROM_MINUTE` and re-run.
+   - `FAIL ws: could not connect` means the feed process will fall back to
+     REST polling at startup (logged at ERROR, once). Sub-minute rungs are then
+     served by polling trades every ~15 s; the data is correct, only later.
+   - Warnings about short samples on 4h/6h are expected (coarse rungs fill live).
+3. The warmup for a seconds-rung walks back across sessions reading raw
+   trades; a liquid name fills 30s/45s/90s from one or two sessions. Check
+   `warmup_bars` per rung after the first run as for crypto.
+
+### 3d. Crypto seconds rungs (the CN ladder)
+
+`ASSET_CONFIGS["crypto"]["subminute_symbols"]` (BTC-USD) is the only symbol
+whose 30s/45s bars are built, from the public Exchange trades endpoint
+(`api.exchange.coinbase.com`; no key). `python verify_crypto_subminute.py`
+reads a few pages, builds bars with the feed's code and reports alignment,
+the trade rate and the page budget a 5000-bar warmup needs. Warmup walks
+trades backward (bounded by `TRADES_MAX_PAGES`); a thin book gets a partial
+buffer that fills live. Live is a 15 s poll of the same endpoint with a 2 s
+settle. Adding a second symbol here is a capacity decision (ADR-001 D12),
+not a config one.
+
+### 3c. Research collection (optional, off the live path)
+
+`research_process.py` needs only `TRADING_DB_URL` and `POLYGON_API_KEY`.
+`python research_process.py --verify` reads one historical NBBO and one bars
+window with the key (no writes); a `403` on quotes means the plan lacks
+historical quotes and `research_quotes` will fill with `status = 'error'`
+until it does (re-run `--backfill` afterwards). Earnings dates:
+`python research_process.py --earnings-csv dates.csv` with
+`symbol,report_date[,time_of_day]` (`bmo`/`amc`). Review queries: spread paid
+per trade is `research_quotes` joined to `trade_signals` on `signal_id`.
 
 `connect()` checks the same things at every executor boot. It refuses a key that:
 - is not bound to the configured portfolio;

@@ -201,12 +201,14 @@ async def main() -> None:
         fn = getattr(current["adapter"], "get_taker_fee_bps", None)
         return await fn() if fn is not None else None
     shadow = ShadowBook(make_shadow_hooks(pool, _get_touch),
-                        taker_fee_bps=config.SHADOW_TAKER_FEE_BPS, fee_bps_fn=_fee_bps)
+                        taker_fee_bps=config.SHADOW_TAKER_FEE_BPS, fee_bps_fn=_fee_bps,
+                        fee_bps_by_class=getattr(config, "SHADOW_FEE_BPS_BY_CLASS", {}))
     await shadow.start()
 
     executor = SignalExecutor(
         adapter, hooks,
         shadow_book=shadow,
+        shadow_only_strategies=getattr(config, "SHADOW_ONLY_STRATEGIES", frozenset()),
         max_open_positions=config.MAX_OPEN_POSITIONS,
         enter_max_age_ms=config.ENTER_MAX_AGE_SECONDS * 1000,
         orphan_allowlist=config.ORPHAN_BALANCE_ALLOWLIST,

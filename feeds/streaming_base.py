@@ -69,7 +69,7 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Dict, List, Protocol, Sequence, runtime_checkable
+from typing import Optional, Dict, List, Protocol, Sequence, runtime_checkable
 
 from feeds.base import AssetFeed, LiveDataCallback, is_market_open, timeframe_to_ms
 from feeds.bar_aggregator import BarAggregator
@@ -127,6 +127,15 @@ async def fetch_range_or_recent(
     return windowed
 
 
+class StreamingUnavailable(RuntimeError):
+    """Raised by start_live when the stream could not be established on the
+    FIRST connect after FIRST_CONNECT_MAX_ATTEMPTS tries. Distinct from a
+    mid-run disconnect (which reconnects forever): on a cold start a repeated
+    auth/entitlement failure means this transport is not going to work, and
+    the caller (feed_process) can fall back to the REST sibling rather than
+    retrying a dead socket for the process lifetime. Carries the last error."""
+
+
 class StreamingFeedBase(AssetFeed, ABC):
     """Shared websocket supervisor. Subclasses implement the source-specific
     connect/subscribe/parse hooks; this base owns the resilience loop.
@@ -141,6 +150,8 @@ class StreamingFeedBase(AssetFeed, ABC):
     # Reconnect backoff: exponential from BASE to MAX, with full jitter.
     RECONNECT_BASE_S = 1.0
     RECONNECT_MAX_S = 30.0
+    # Cold-start budget before start_live raises StreamingUnavailable.
+    FIRST_CONNECT_MAX_ATTEMPTS = 3
     # Staleness: if no message for STALENESS_FACTOR × the finest configured
     # timeframe while the market is open, treat the socket as dead.
     STALENESS_FACTOR = 4.0
@@ -242,6 +253,7 @@ class StreamingFeedBase(AssetFeed, ABC):
         self._finest_tf_ms = min(timeframe_to_ms(tf) for tf in timeframes)
 
         attempt = 0
+        last_error: Optional[BaseException] = None
         flush_task = asyncio.create_task(
             self._flush_loop(aggregator, callback), name=f"{self.name}-flush",
         )
@@ -268,13 +280,22 @@ class StreamingFeedBase(AssetFeed, ABC):
 
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as e:
+                    last_error = e
                     logger.exception("[%s] connection error", self.name)
 
                 if not self._running:
                     break
                 # Exponential backoff with full jitter before reconnecting.
                 attempt += 1
+                if (not self._connected_once
+                        and attempt >= self.FIRST_CONNECT_MAX_ATTEMPTS):
+                    # Never got a socket up. Stop retrying here and let the
+                    # caller decide (feed_process falls back to REST).
+                    raise StreamingUnavailable(
+                        f"{self.name}: no successful connect after {attempt} "
+                        f"attempts (last error: {last_error!r})"
+                    ) from last_error
                 delay = min(
                     self.RECONNECT_MAX_S,
                     self.RECONNECT_BASE_S * (2 ** (attempt - 1)),

@@ -94,16 +94,23 @@ def _ms_to_dt(ms: int) -> datetime:
 
 class ShadowBook:
     def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal,
-                 fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None):
+                 fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None,
+                 fee_bps_by_class: Optional[dict] = None):
         """taker_fee_bps: the fallback fee per leg. fee_bps_fn: optional async
         source of the account's real taker fee (the venue's fee tier); when it
         returns a value, that is what a new virtual entry is charged."""
         self.hooks = hooks
         self.taker_fee_bps = Decimal(str(taker_fee_bps))
         self.fee_bps_fn = fee_bps_fn
+        # Per-asset-class override (bps per leg): for classes the venue does
+        # not trade, its fee tier is meaningless (an equity CFD's cost is the
+        # half-spread, not Coinbase's taker fee).
+        self.fee_bps_by_class = {k: Decimal(str(v)) for k, v in (fee_bps_by_class or {}).items()}
         self._open: Dict[Tuple[str, str], ShadowPosition] = {}
 
-    async def _fee_bps(self) -> Decimal:
+    async def _fee_bps(self, asset_class: Optional[str] = None) -> Decimal:
+        if asset_class in self.fee_bps_by_class:
+            return self.fee_bps_by_class[asset_class]
         if self.fee_bps_fn is not None:
             try:
                 bps = await self.fee_bps_fn()
@@ -155,7 +162,7 @@ class ShadowBook:
         if source != "touch":
             log.warning("shadow ENTER %s/%s priced off %s (no usable touch)",
                         strategy, position_key, source)
-        fee_bps = await self._fee_bps()
+        fee_bps = await self._fee_bps(row.get("asset_class"))
         pos = ShadowPosition(
             strategy=strategy, position_key=position_key, symbol=row["symbol"],
             asset_class=row["asset_class"], side=side,

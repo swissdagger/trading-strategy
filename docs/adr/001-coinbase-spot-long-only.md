@@ -229,11 +229,20 @@ Each phase is independently mergeable and leaves the system runnable.
 | D6 | Flat 5%-of-available sizing, count-capped; no vol scaling, no correlation awareness | Adequate for paper and minimum-size live | Before scaling capital |
 | D7 | No entry TTL / cancel path | Dormant while entries are crossing limits | Required the moment post-only entries are tried |
 | D8 | Shadow book is an upper bound (touch fill, no impact) | Only short-side data available | Treat P&L as "at most this"; refine with a slippage model if it drives Option B |
-| D9 | `service2_machine.py` is a copy of CausaView's chain machine (sync obligation) | Diverges by one change: the monotonic bar guard in `on_bar` (PR 3); port it to CausaView or keep it in mind when syncing | Shared library extraction, if CausaView and this repo converge |
+| D9 | `service2_machine.py` is a copy of CausaView's chain machine (sync obligation) | Diverges by two changes: the monotonic bar guard (PR 3) and the prepare/forecast/apply split of `on_bar` (PR 8). `_run_state_machine` is verbatim CausaView; port changes to it both ways | Shared library extraction, if CausaView and this repo converge |
 | D10 | Equities scaffolding (`is_market_open`, `exchange_calendars`, `asset_class` plumbing, by-class caps) | Deliberately retained | N/A — intentional |
 | D11 | Single-broker Kafka on one box; Supabase over the network; `statement_cache_size=0` pgbouncer convention | Operational, not architectural | Revisit with the capacity work |
 | D12 | Capacity sizing deferred (top-of-hour burst: ~70 simultaneous forecasts across 12 symbols × 6 rungs at `FORECAST_CONCURRENCY=6`) | Parked by decision | Benchmark `ForecastGate` p50/p95 before adding symbols or rungs |
 | D13 | Orphan-balance allowlist is manual config | Dedicated portfolio makes orphans rare | Keep; document |
+| D14 | Equities (PR 9) have no venue: the executor shadows every equity signal at `decision_price`; `execution_caps` has no equity rows; no equity sizing or fees | The DL ladder is a research direction, not a trading universe | An equity venue adapter (and caps/fees seed) before any equity goes live |
+| D15 | `chain_recorder` is a placeholder owner for DL; depth stats on a 12-rung ladder are not comparable to the research population's | Owner's strategy pending | Replace in `STRATEGIES` when it lands; benchmark against the per-symbol base rate, not prior depth tables |
+| D17 | The chain rules' session functions does not model exchange holidays; its "broker rejects, retry next session" branch is never exercised because the shadow book fills immediately, so a holiday P2 is shadow-filled at the last 1m close | No venue to reject (D14) | With an equity venue, route rejects to `Rule1.reject()`; or gate the adapter's drain on `feeds.base.is_market_open` |
+| D18 | The chain rules' 1m closes come from Polygon 1m aggregates (extended session) rather than the research `prices` table; `vol_ratio_from_closes` is verbatim | Live bars are not persisted here | If a replay-vs-live ratio comparison shows drift, persist 1m bars and read those instead |
+| D19 | The chain rules bypass the runtime's open-position tracking (it keeps its own); after a restart the runtime still lists its ENTERs and sweeps a no-op exit per event | `Rule1._drain` emits for any symbol, the runtime tracks one key per on_event | Harmless; a `tracks_own_positions` flag on Strategy would silence it |
+| D20 | CN's 30s/45s rungs are REST-polled trades every 15 s (one source for warmup and live); a websocket `market_trades` stream would cut the ~15 s poll latency | Simplest same-source design; the poll is well within capacity | If sub-minute signal latency matters, add the ws stream with the REST walk as backfill, as the Polygon feed does |
+| D22 | The Exchange trades endpoint (`api.exchange.coinbase.com`) is used unauthenticated with cursor pagination; verified by test fakes against the documented shape, not by a real call in this session | No network here | `verify_crypto_subminute.py` on the first run |
+| D21 | The package's PaperBroker fill model (next 1m price ± half-spread) is not replicated; shadow fills are at decision_price + a per-class fee, and the measured spread is applied in `docs/rule_review.sql` from `research_quotes` | One fill model per repo; the measured spread is the better number | If the review needs next-bar fills exactly, add them from `research_bars_1m` in the query |
+| D16 | Polygon 15m/30m/hour rungs trust Polygon's bucket alignment; only 2m/3m are re-bucketed locally from 1-minute bars | Fetching 1-minute constituents for hour rungs is thousands of requests per symbol | Verify alignment on one real warmup (every bar `timestamp % tf_ms == 0`); extend `DERIVE_FROM_MINUTE` if not |
 
 ---
 
@@ -330,3 +339,191 @@ Each phase is independently mergeable and leaves the system runnable.
   It skips trades already CLOSING for good (the ladder owns them), HALTED trades, and shadow positions. `make_set_kill_switch` now accepts `flatten`.
 - **Exit bug fixed: a normal EXIT now cancels a still-working entry first.** Before, an EXIT on a trade whose entry had not filled (or had filled only partly) closed what was recorded and left the buy order working. A trade with no fills was marked CLOSED outright. A late entry fill then became a position nobody managed, and the next boot refused it as an orphan or HALTed the symbol. Final EXITs and flatten now share `_request_close`, so the same entry-cancel safety applies to both. When the entry can't be settled at once, the close is queued in `_close_requests`, retried every tick by `run_close_requests_once` (which replaced `run_flatten_once`), and made durable through `trades.exit_reason`. `start()` re-queues it after a restart. A final EXIT that supersedes a working SCALE tranche cancels the tranche and returns the trade to OPEN before recording the final reason. An EXIT on a fully filled entry is unchanged and makes no extra venue call.
 
+### PR 8 (forecast/apply split — dense ladders)
+
+- **Why.** Per-symbol serial processing capped one symbol at `1 / wall-latency`
+  of a Sumtyme call (~8 s at N=1, ~16 s wall at N=6). A dense ladder such as
+  `[30s, 45s, 1m, 90s, 2m, 3m, 15m, 30m, 1h, 2h, 4h, 6h]` needs a forecast
+  every ~6 s for *one* symbol, so no symbol count made it fit; the
+  serialisation itself was the ceiling.
+- **What is serial and what is not.** Only two things touch machine state:
+  appending to a `(symbol, timeframe)` buffer (buffer order *is* Sumtyme's
+  step), and applying a forecast (`_latest_signals[idx]` + the
+  INIT/PROPAGATE/TERMINATE sweep). The Sumtyme call between them reads a
+  frozen snapshot and writes nothing. `ServiceTwoChainMachine.on_bar` is now
+  `prepare()` (sync, append + `tuple(buf)` snapshot, under the symbol lock) →
+  `forecast()` (no lock; gate/memo; builds the frame only once the permit is
+  held) → `apply()` (under the lock). `on_bar()` composes the three serially
+  and is unchanged in meaning; `_run_state_machine` is untouched.
+- **Ordering mechanism.** `SymbolWorkerPool` runs a stager + applier per
+  symbol. The stager prepares bars in arrival order and pushes
+  `(routed, forecast_task)` onto a FIFO; the applier awaits the *head's* task
+  and applies, so apply order == prepare order == arrival order while
+  forecasts complete in any order. Offsets are retired after apply (or
+  immediately when prepare says there is nothing to do), so the commit point
+  still tracks consumption. `tests/test_forecast_apply_split.py` checks that a
+  pipelined run with scrambled completions emits exactly the serial run's
+  events.
+- **Memo.** `ForecastMemo` now holds an in-flight future per slot
+  (`claim/resolve/fail`): two ladders sharing a timeframe prepare back-to-back
+  and forecast concurrently, so the second joins the first's call instead of
+  both missing. Failures are never shared (the joiner retries itself); the
+  owner settles the future in a `finally`, so a cancelled owner cannot strand
+  a joiner.
+- **Fairness.** Serial processing meant one forecast in flight per symbol. A
+  12-rung boundary now prepares a dozen bars at once; `SYMBOL_INFLIGHT_MAX`
+  (default 4, below `FORECAST_CONCURRENCY`) stops one symbol from taking every
+  gate permit. `queue_depths()` reports input + apply backlog.
+- **Known cost.** Head-of-line latency: a bar's apply waits for the slowest
+  earlier forecast of that symbol. With a 30s baseline and ~16 s wall latency
+  at N=6, baseline signals land roughly one bar late. Accepted.
+
+### PR 9 (dense equity ladder on Polygon)
+
+- **What.** `ASSET_CONFIGS["equity"]` (AAPL to start) on the 12-rung ladder
+  `EXTRA_LADDERS["DL"] = [30s, 45s, 1m, 90s, 2m, 3m, 15m, 30m, 1h, 2h, 4h, 6h]`,
+  owned by the record-only `chain_recorder` strategy until the DL strategy
+  lands. 15s was dropped from the original set.
+- **Feeds restored from the pre-ADR-001 tree** (`feeds/polygon_aggs.py`,
+  `polygon_stocks.py`, `polygon_ws.py`; fx/options not restored) with three
+  source rules: seconds-rungs from raw `/v3/trades` (warmup session walk as
+  before; REST live gained a forward trade poll, `_poll_trades_once`, because
+  the old live loop served `/v2/aggs` second aggregates, which are T+1 stale
+  and were never usable live); 2m/3m from 1-minute bars re-bucketed with the
+  live aggregator's epoch-aligned floor; the rest from Polygon's buckets.
+- **Session** is the extended 04:00–20:00 ET envelope already in
+  `feeds/base.py` (owner's decision). Warmup and live share it; in step mode
+  the bar sequence is the step.
+- **Transport** is `ws` (per-second aggregates, every rung via
+  `BarAggregator`) with runtime fallback: `StreamingFeedBase.start_live`
+  raises `StreamingUnavailable` after `FIRST_CONNECT_MAX_ATTEMPTS` cold-start
+  failures and `feed_process._run_feed` swaps in the REST sibling for the
+  process lifetime. `POLYGON_WS_HOST` overrides the entitlement host.
+- **Executor asset-class gate.** `_on_enter` now routes a signal whose
+  `asset_class` is not in the adapter's `supported_classes` to the shadow
+  book (or skips it with a counter when there is none), before sizing, kill
+  switch and cap — the same path as an unsupported side. Without it an equity
+  ENTER would have reached `get_touch("AAPL", "equity")` on Coinbase.
+- **Capacity.** ~5,700 forecasts/symbol/session-day, ~0.1/s while open: ~3
+  symbols at 0.36 calls/s. Fits only because of PR 8.
+- **Tests.** `tests/test_polygon_dense_ladder.py` (derived 3m alignment,
+  trades-forward poll and settle rule, live loop, `StreamingUnavailable`,
+  feed-process fallback, recorder ownership), `test_feed_wiring.py` updated
+  to the two-class topology, executor class-gate tests in
+  `test_executor_hardening.py` with a supported-class control.
+
+### PR 10 (Rule 1 on the dense ladder)
+
+- **Owner's files, verbatim.** `strategy/rule1.py` is byte-identical to the
+  upload; `strategy/vol.py` keeps `vol_ratio_from_closes` byte-identical and
+  drops only `fetch_closes` (it read a `prices` table this repo lacks).
+- **Adapter** (`strategy/rule1_adapter.py`): events in with `now` = wall
+  clock (the rule's timing rule), `on_clock` every 15 s from a ticker task in
+  `signal_process`, intents → `trade_signals` (OPEN→ENTER at trigger_level
+  P2; CLOSE→EXIT with `stall_no_L3_1h`→`TIME`, `opposing_P1`→`STOP`),
+  immediate acks because equities are shadow-filled, `reject()` on a failed
+  write so the rule retries. Clock-driven intents are priced at the latest
+  1m close the vol source holds and stamped `decided_at = now`.
+- **Vol filter** (`strategy/vol_source.py`): per-symbol 1m closes from
+  Polygon, 17-day seed then one small refill per clock hour; ratio cached
+  per (symbol, evaluation hour); `prefetch` awaited before a P2 event so the
+  rule's sync `vol_ratio_fn` hits the cache; a failed fetch yields None and
+  the rule skips with its own "no vol history".
+- **Restart**: `make_load_strategy_open_entries` returns open rule1 ENTERs
+  with `created_at`; `start()` rebuilds `Rule1.trades` with `p2_at =
+  created_at` and `l3_seen = age > 60 min`, so the stall clock and the
+  opposing-P1 failsafe keep working.
+- **Levels.** On DL the rule's P2/L3 are 45s/1m. `entry_level` (default 2)
+  shifts the numbering the rule sees without editing the rule; e.g. 6 makes
+  3m its P2 and 15m its L3. Which rung corresponds to the research P2 is the
+  owner's call (D15).
+- **Universe**: SPCX, XOM, NVDA. `chain_recorder` stays enabled beside rule1
+  for the depth counters. Capacity: ~0.3/s while open at three symbols,
+  against a measured 0.36/s peak — tight; re-benchmark (D12) before a fourth.
+- **Tests**: `tests/test_rule1_adapter.py` — ENTER/ack, vol filter, queue to
+  the open and the drop-before-fill case, stall `TIME`, L3 prevents stall,
+  opposing-P1 `STOP` at event price, write failure → reject → retry,
+  hydration and stall clock, level shift, vol source seed/refill/cache,
+  research function sanity on a stationary series.
+
+### PR 11 (research collection)
+
+- **Why a fifth process.** The four research questions (spread paid per
+  trade, liquidity/market reference bars, earnings-day confound, forward
+  vol) are answerable from `trade_signals` plus Polygon reads the live path
+  never makes. A separate process with its own client, limiter, pool and
+  cursor cannot delay a bar, a forecast or a signal; the one tempting
+  alternative — fetching the NBBO inside the rule adapter's write path, under
+  the symbol lock — was rejected on both latency and measurement grounds
+  (a quote as of the decision timestamp is the right number; a quote as of
+  whenever the fetch returned is not).
+- **Mechanism.** `execution/signal_listener.py` reused unchanged with a
+  `research_cursor` row; `QuoteCapture.handle` is idempotent on `signal_id`.
+  `research_bars_1m` is refreshed every 15 min with a 60-min overlap so late
+  prints are absorbed by the upsert. Earnings: CSV now, `EarningsProvider`
+  protocol for a provider later (Polygon's core API has no earnings
+  calendar; an unverified integration was not shipped).
+- **Tests.** `tests/test_research_process.py`: as-of quote selection,
+  no-quote and entitlement-denied paths, non-equity skip, bars initial
+  lookback / overlap / revision absorption / per-symbol isolation, CSV
+  parsing, backfill termination, and a real-Postgres round trip of the 025
+  upserts (CI).
+
+### PR 12 (the strategy package: four frozen chain rules)
+
+- **Engine.** `strategy/rules.py` is the package's file, verbatim (it
+  supersedes the earlier `rule1.py`, which it reproduces: the owner's replay
+  validated 216/216 Rule 1 trades through it). `strategy/vol.py` keeps both
+  research functions verbatim bar the `VolState` import path.
+- **Adapter** (`strategy/chain_rules.py`) generalises PR 10's: `params.rule`
+  names a frozen config; the effective config is that config retagged with
+  the strategy name and this repo's ladder name, with levels resolved against
+  the actual ladder (`entry_tf`/`confirm_tf` pin rungs by name). Exit reasons
+  `stall_*` → `TIME`, `opposing_P1` → `STOP`. Restart hydration now also
+  reconciles against `chains` (an opposing chain initiated while down marks
+  the trade for exit), as the package's service does.
+- **Ladders.** ED (the equity research ladder; P2 = 5m) and CN (the spec's
+  crypto new ladder; P2 = 45s, levels 5/6 = 3m/5m) registered. Equity
+  timeframes are now DL ∪ ED (adds 5m, ~288 forecasts/symbol/day).
+- **What runs.** `rule1_v1` on ED, `rule1_new_literal_v1` on DL (the former
+  `rule1` strategy, renamed because it is a different pre-registered rule),
+  `rule3_v1` on FC. The CN rules are disabled (D20).
+- **Safety.** `SHADOW_ONLY_STRATEGIES`: the executor routes these strategies'
+  ENTERs to the shadow book in every trade mode (the package: "nothing here
+  places real orders"; crypto LONGs would otherwise reach Coinbase).
+  `SHADOW_FEE_BPS_BY_CLASS` gives equities the package's 5 bps half-spread.
+- **Events.** `detected_at` added to every tagged chain event (spec §2.4),
+  additive; makes the Kafka audit stream replayable with live timing.
+- **Migration 026**: `chains.ladder` — written and read by
+  `producer/persistence.py` but never created by a migration in the tree
+  (a fresh DB failed on the first chain init). `IF NOT EXISTS`, so a no-op
+  on a database that has it.
+- **Review.** `docs/rule_review.sql` per strategy: net at the assumed fee
+  (shadow_trades) and net at the measured spread (research_quotes).
+- **Tests.** `tests/test_chain_rules.py` (21): level resolution per ladder
+  including the DL-has-no-5m refusal, the spec's §5.2 unit cases and §5.4
+  Friday→Monday session case, stall at exactly `stall_minutes`, restart
+  reconcile, rule3's three filters and 30-min stall, `vol_state` sanity,
+  `detected_at`; executor shadow-only gate + control and per-class fee.
+
+### PR 13 (ED corrected; crypto seconds rungs)
+
+- **ED is `1m,3m,5m,15m,30m,1h,2h,4h`** (owner). PR 12 had taken ED from a
+  comment in the deleted `polygon_stocks.py` — a feed file, not the research —
+  which omitted 3m, putting Rule 1's P2 at 5m. Corrected: P2 = 3m, L3 = 5m.
+- **Crypto 30s/45s from trades.** `CoinbaseSpotFeed` gained a trades source
+  (public Exchange endpoint, `after=<trade_id>` pagination): a backward walk
+  for warmup (`fetch_subminute_history`, which `warmup_process` already
+  routes seconds rungs to), a forward poll for live with a 2 s settle, and
+  `2m` as a derived rung. Both from the same source so the step definition
+  is identical across warmup and live. Served only for
+  `ASSET_CONFIGS["crypto"]["subminute_symbols"]` (`config.serves` filters
+  warmup streams; the feed filters its pollers).
+- **CN enabled** for BTC-USD only: `rule3_new_literal_v1` (45s → 1m) and
+  `rule3_new_equiv_v1` (3m → 5m, pinned by rung). Capacity: +0.064/s on top
+  of FC's ~0.27/s against 0.36/s measured; one symbol fits.
+- **Tests.** `tests/test_coinbase_subminute.py` (7): paged walk builds
+  aligned contiguous bars and drops the forming tail; `fetch_history` routes
+  seconds rungs to trades; universe restriction (no request for others);
+  live poll settle/cursor and paging back to an old cursor; `start_live`
+  serves seconds rungs only for the universe.

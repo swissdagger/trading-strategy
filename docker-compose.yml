@@ -108,5 +108,20 @@ services:
       warmup:
         condition: service_completed_successfully
 
+  # Research collection (migration 025): NBBO at each equity signal, 1m bars
+  # with volume/VWAP/count for the research symbols, earnings dates. Reads
+  # trade_signals via pg_notify + its own cursor; needs the DB and the Polygon
+  # key only. Deliberately a separate process so nothing it does can touch
+  # the feed, signal or executor paths.
+  research:
+    build: .
+    image: trading-system:latest
+    restart: unless-stopped
+    command: ["python", "research_process.py"]
+    env_file: .env
+    depends_on:
+      warmup:
+        condition: service_completed_successfully
+
 volumes:
   kafka_data:

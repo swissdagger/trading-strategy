@@ -47,6 +47,7 @@ import asyncio
 import hashlib
 import logging
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -58,6 +59,29 @@ from producer.forecast_gate import ForecastGate, ForecastMemo
 log = logging.getLogger("producer.service2_machine")
 
 WINDOW_SIZE = 5000   # same gate as service_2: no forecast until the buffer fills
+
+
+@dataclass
+class PendingForecast:
+    """One bar that has been APPENDED but not yet APPLIED.
+
+    Produced by `prepare()` (under the symbol lock), filled in by `forecast()`
+    (no lock), consumed by `apply()` (under the symbol lock). It carries
+    everything `apply()` needs, so `apply()` never reads the buffer — which is
+    what lets bars N+1, N+2 be appended while bar N's forecast is in flight.
+
+    `snapshot` is the buffer EXACTLY as it stood when this bar was appended:
+    the window Sumtyme must see for this bar, frozen. Tick dicts are never
+    mutated after creation, so sharing references is safe and the tuple is
+    5000 pointers, not 5000 copies.
+    """
+    idx: int                         # level index of bar.timeframe in the ladder
+    bar: OHLCPoint
+    snapshot: tuple                  # tick dicts, len == len(buffer) at append
+    memo_key: Optional[tuple]
+    forecast: Any = None             # usable forecast dict after forecast(); None => skip
+    placeholder_dt: Any = None       # the bar the forecast predicts (from prepare_df)
+    memo_hit: bool = False
 
 
 def _tf_seconds(timeframe: str) -> Optional[int]:
@@ -387,16 +411,46 @@ class ServiceTwoChainMachine(ChainMachine):
                     i, i + 1, eta)
 
     async def on_bar(self, bar: OHLCPoint) -> List[ChainEvent]:
-        """Feed one closed bar. Append to its buffer; if the buffer is full, run
-        the forecast and the state-machine sweep. Returns the resulting events.
+        """Feed one closed bar, serially: prepare -> forecast -> apply.
 
-        Faithful to process_forecast: forecast in a thread, persist the raw
-        signal, update the level-indexed cache, then (under the lock) run
-        INIT/PROPAGATE/TERMINATE. The only behavioral change is RETURNING events
-        instead of emitting to Kafka."""
+        This is the ORIGINAL contract (ChainMachine.on_bar) and the standalone/
+        test entry point. It is now a composition of the three stages below;
+        the live router calls those stages separately so that the slow middle
+        stage (the Sumtyme call) runs OUTSIDE the per-symbol lock and
+        concurrently across bars, while the two stages that touch machine state
+        still run under the lock, strictly in arrival order. See prepare(),
+        forecast(), apply() — and producer/symbol_workers.py for the ordering
+        mechanism.
+
+        Behaviour-faithful to process_forecast: forecast in a thread, persist
+        the raw signal, update the level-indexed cache, then (under the lock)
+        run INIT/PROPAGATE/TERMINATE. Returns events instead of emitting."""
+        pending = self.prepare(bar)
+        if pending is None:
+            return []
+        await self.forecast(pending)
+        return await self.apply(pending)
+
+    # ---------------------------------------------------------------
+    # STAGE 1 — prepare: append + snapshot. Caller holds the symbol lock.
+    # ---------------------------------------------------------------
+    def prepare(self, bar: OHLCPoint) -> Optional[PendingForecast]:
+        """Append `bar` to its buffer and, if the buffer is full, return a
+        PendingForecast carrying a frozen snapshot of that buffer.
+
+        SYNCHRONOUS ON PURPOSE. There is no await between the monotonic guard
+        and the append, so two bars for the same (symbol, timeframe) cannot
+        interleave here even in principle: buffer order == the order prepare()
+        was called in == arrival order. The caller (the router) invokes this
+        under the symbol lock in arrival order, which is what makes the buffer
+        — Sumtyme's definition of "one step" — correct.
+
+        Returns None when there is nothing to forecast: timeframe not in this
+        ladder, duplicate/out-of-order bar (dropped), or buffer not yet full.
+        """
         idx = self._level_index(bar.timeframe)
         if idx is None:
-            return []   # not in this ladder (router shouldn't send it, but guard)
+            return None   # not in this ladder (router shouldn't send it, but guard)
 
         # Append to the per-timeframe buffer. (Gap-fill is handled upstream in the
         # original via _append_with_fill; if needed it can be injected, but the
@@ -419,37 +473,108 @@ class ServiceTwoChainMachine(ChainMachine):
             else:
                 log.warning("drop out-of-order bar %s/%s ts=%s (newest buffered %s)",
                             self.symbol, bar.timeframe, bar.timestamp, newest)
-            return []
+            return None
         buf.append(self._tick_dict(bar))
 
         # >= not == : an over-filled buffer from a race-y warmup must still
         # forecast (service_2's explicit inline note).
         if len(buf) < WINDOW_SIZE:
-            return []
+            return None
 
-        df = self._build_df(buf)
-        api_ready_df, placeholder_dt = self._prepare_df(df, bar.timeframe)
-        interval, interval_unit = self._to_interval(bar.timeframe)
-
-        # CROSS-LADDER MEMO. Sumtyme is deterministic, so if another machine
-        # (a different ladder sharing this timeframe) already forecast this
-        # EXACT window — same symbol, timeframe, first/last bar ts, length —
-        # its result is our result, and the API call (the pipeline bottleneck)
-        # is skipped. The router runs a symbol's ladders sequentially under the
-        # symbol lock, so the sharing machine has fully completed before we ask.
-        # Everything downstream (persist, signal cache, state machine) runs
-        # identically on a hit — only the call itself is elided.
+        # CROSS-LADDER MEMO KEY. Sumtyme is deterministic, so another machine
+        # (a different ladder sharing this timeframe) forecasting this EXACT
+        # window — same symbol, timeframe, first/last bar ts, length — gets our
+        # result and skips the API call. Pinning first/last ts + length means
+        # two machines whose buffers ever diverge simply miss. The claim itself
+        # happens in forecast(), because that is where the in-flight future
+        # lives (the ladders no longer run one after the other; see ForecastMemo).
         memo_key = None
-        forecast = None
         if self._forecast_memo is not None:
             memo_key = (
                 self.asset_class, self.symbol, bar.timeframe,
                 buf[0]["timestamp"], bar.timestamp, len(buf),
             )
-            forecast = self._forecast_memo.get(memo_key)
-            if forecast is not None:
+
+        # SNAPSHOT NOW. By the time forecast() runs, later bars may have been
+        # appended; the forecast for THIS bar must see the window as of THIS
+        # append. The DataFrame itself is built later, after the gate permit
+        # is acquired, so a bar queued for a permit holds 5000 references, not
+        # a 5001-row frame (this is what bounds peak memory under backlog).
+        return PendingForecast(idx=idx, bar=bar, snapshot=tuple(buf), memo_key=memo_key)
+
+    # ---------------------------------------------------------------
+    # STAGE 2 — forecast: the slow part. NO lock held. Touches no machine state.
+    # ---------------------------------------------------------------
+    async def forecast(self, pending: PendingForecast) -> None:
+        """Obtain the Sumtyme forecast for `pending`, via the memo if another
+        ladder's machine already has (or is computing) it, else via the gate.
+
+        Sets pending.forecast to a USABLE forecast dict, or leaves it None —
+        a timeout, SDK error, Exception-object or empty result all mean "skip
+        this bar", exactly as before. Never raises for those; apply() turns a
+        None into a no-op. Reads only `pending` (and the shared memo/gate);
+        never self._buffers / _latest_signals / _active_chains, so it is safe
+        to run concurrently with prepare() and apply() of other bars.
+        """
+        bar = pending.bar
+        memo = self._forecast_memo
+        claim = None
+
+        # The frame is needed on EVERY path (placeholder_dt comes from it, and
+        # the signal is persisted against placeholder_dt). Built lazily so the
+        # API path builds it only once the permit is held.
+        frame: dict = {}
+
+        def _frame():
+            if not frame:
+                df = self._build_df(pending.snapshot)
+                frame["api_df"], frame["placeholder_dt"] = self._prepare_df(df, bar.timeframe)
+            return frame
+
+        forecast = None
+        if memo is not None and pending.memo_key is not None:
+            claim = memo.claim(pending.memo_key)
+            if claim.value is not None:
+                forecast = claim.value
+                pending.memo_hit = True
                 log.debug("forecast memo HIT %s/%s ts=%s — Sumtyme call skipped",
                           self.symbol, bar.timeframe, bar.timestamp)
+            elif not claim.owner:
+                # Another ladder's machine is forecasting this exact window
+                # right now. Wait for it rather than paying for the same answer
+                # twice. A None result means it FAILED — failures are never
+                # shared (the memo's standing rule), so fall through and call
+                # the API ourselves.
+                forecast = await claim.future
+                if forecast is not None:
+                    pending.memo_hit = True
+                    log.debug("forecast memo JOIN %s/%s ts=%s — Sumtyme call skipped",
+                              self.symbol, bar.timeframe, bar.timestamp)
+
+        try:
+            if forecast is None:
+                forecast = await self._call_api(pending, _frame)
+            if forecast is not None:
+                pending.forecast = forecast
+                pending.placeholder_dt = _frame()["placeholder_dt"]
+                if memo is not None and pending.memo_key is not None:
+                    # Store for the other ladder's machine — only USABLE results
+                    # reach this line, so a failure is never replayed cross-ladder.
+                    # Resolving a hit/join is an idempotent same-value overwrite.
+                    memo.resolve(pending.memo_key, forecast)
+        finally:
+            # OWNER CONTRACT: the owner of an in-flight claim must settle it on
+            # every exit (including cancellation during shutdown), or a joiner
+            # awaits forever. fail() is a no-op once resolved.
+            if claim is not None and claim.owner and pending.forecast is None:
+                memo.fail(pending.memo_key)
+
+    async def _call_api(self, pending: PendingForecast, _frame) -> Any:
+        """The gated, bounded, blocking Sumtyme call. Returns a usable forecast
+        or None (logged). Factored out of forecast() so the memo logic above
+        reads straight; the error handling is the original on_bar's, verbatim."""
+        bar = pending.bar
+        interval, interval_unit = self._to_interval(bar.timeframe)
 
         # Blocking Sumtyme call off the event loop — never await it directly, and
         # BOUND it. Without a timeout, a hung forecast call wedges the consume loop
@@ -461,68 +586,69 @@ class ServiceTwoChainMachine(ChainMachine):
         # Sumtyme, and the last one waits ~N x the single-call latency, blows the
         # timeout, and gets discarded AFTER Sumtyme already spent the compute. That
         # is strictly worse than serial (observed: 1145 timeouts, ZERO errors — the
-        # signature of queueing, not failure). The gate holds ONE global permit, so
-        # the queue lives here, where waiting is free and cancellable.
+        # signature of queueing, not failure). The gate holds the permits, so the
+        # queue lives here, where waiting is free and cancellable.
         #
         # The gate also measures single-call latency L and logs the resulting
-        # CAPACITY (1/L forecasts/sec). If demand exceeds that, no client-side
-        # change can help — it is a product decision (fewer symbols/rungs, or more
-        # parallelism from Sumtyme).
+        # CAPACITY (concurrency/L forecasts/sec). If demand exceeds that, no
+        # client-side change can help — it is a product decision (fewer
+        # symbols/rungs, or more parallelism from Sumtyme).
         #
         # NOTE: wait_for cancels the AWAIT, not the underlying thread. The SDK
         # exposes no request-timeout kwarg (signal_process logs a warning at
         # startup), so a genuinely hung socket still occupies a thread-pool worker
-        # until the OS returns. Serialising via the gate bounds the damage: at most
-        # `concurrency` such calls can ever be stuck at once, instead of one per
-        # symbol.
-        if forecast is None:
-            try:
-                if self._forecast_gate is not None:
-                    forecast = await self._forecast_gate.run(
+        # until the OS returns. The gate bounds the damage: at most `concurrency`
+        # such calls can ever be stuck at once.
+        try:
+            if self._forecast_gate is not None:
+                forecast = await self._forecast_gate.run(
+                    self._forecast_fn,
+                    interval=interval,
+                    interval_unit=interval_unit,
+                    reasoning_mode="reactive",
+                    timeframe_dependent=False,
+                    time_series_type="ohlc",
+                    timeout_s=self._forecast_timeout_s,
+                    # Built AFTER the permit is acquired (see prepare()).
+                    prepare=lambda: {"data_input": _frame()["api_df"]},
+                )
+            else:
+                # Ungated path: standalone/test use only. In the live process every
+                # machine is given the shared gate.
+                forecast = await asyncio.wait_for(
+                    asyncio.to_thread(
                         self._forecast_fn,
                         time_series_type="ohlc",
-                        data_input=api_ready_df,
+                        data_input=_frame()["api_df"],
                         interval=interval,
                         interval_unit=interval_unit,
                         reasoning_mode="reactive",
                         timeframe_dependent=False,
-                        timeout_s=self._forecast_timeout_s,
-                    )
-                else:
-                    # Ungated path: standalone/test use only. In the live process every
-                    # machine is given the shared gate.
-                    forecast = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._forecast_fn,
-                            time_series_type="ohlc",
-                            data_input=api_ready_df,
-                            interval=interval,
-                            interval_unit=interval_unit,
-                            reasoning_mode="reactive",
-                            timeframe_dependent=False,
-                        ),
-                        timeout=self._forecast_timeout_s,
-                    )
-            except asyncio.TimeoutError:
-                # The hang path. LOUD on purpose: this is the failure that silently
-                # froze the pipeline for days. One per stuck bar; a burst of these
-                # means Sumtyme is down/degraded, not a one-off.
-                log.warning(
-                    "forecast TIMEOUT after %ss for %s/%s ts=%s — skipping bar "
-                    "(repeated timeouts = Sumtyme unreachable/degraded)",
-                    self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
+                    ),
+                    timeout=self._forecast_timeout_s,
                 )
-                return []
-            except Exception:
-                # The SDK raised (network, 4xx/5xx, bad payload). Previously a raised
-                # exception here would unwind out of on_bar -> run() and stop the
-                # consume loop entirely (silent DB freeze). Catch, log with traceback,
-                # skip the bar — the loop keeps draining.
-                log.exception(
-                    "forecast ERROR for %s/%s ts=%s — skipping bar",
-                    self.symbol, bar.timeframe, bar.timestamp,
-                )
-                return []
+        except asyncio.TimeoutError:
+            # The hang path. LOUD on purpose: this is the failure that silently
+            # froze the pipeline for days. One per stuck bar; a burst of these
+            # means Sumtyme is down/degraded, not a one-off.
+            log.warning(
+                "forecast TIMEOUT after %ss for %s/%s ts=%s — skipping bar "
+                "(repeated timeouts = Sumtyme unreachable/degraded)",
+                self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
+            )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The SDK raised (network, 4xx/5xx, bad payload). Previously a raised
+            # exception here would unwind out of on_bar -> run() and stop the
+            # consume loop entirely (silent DB freeze). Catch, log with traceback,
+            # skip the bar — the loop keeps draining.
+            log.exception(
+                "forecast ERROR for %s/%s ts=%s — skipping bar",
+                self.symbol, bar.timeframe, bar.timestamp,
+            )
+            return None
 
         # Sumtyme returned but the result is unusable. The SDK can hand back an
         # Exception object or a falsy/empty dict instead of raising; that used to
@@ -534,21 +660,33 @@ class ServiceTwoChainMachine(ChainMachine):
                 "forecast returned an Exception object for %s/%s ts=%s: %r — skipping bar",
                 self.symbol, bar.timeframe, bar.timestamp, forecast,
             )
-            return []
+            return None
         if not forecast:
             log.warning(
                 "forecast returned empty/falsy result (%r) for %s/%s ts=%s — skipping bar",
                 forecast, self.symbol, bar.timeframe, bar.timestamp,
             )
+            return None
+        return forecast
+
+    # ---------------------------------------------------------------
+    # STAGE 3 — apply: cache + state machine. Caller holds the symbol lock.
+    # ---------------------------------------------------------------
+    async def apply(self, pending: PendingForecast) -> List[ChainEvent]:
+        """Apply one forecast to machine state and run INIT/PROPAGATE/TERMINATE.
+
+        MUST be called in the same order prepare() was called for this symbol
+        (the router/worker pool guarantee this), because the state machine's
+        only notion of "newer" is the last write to _latest_signals[idx]. A
+        pending with forecast None (skipped bar) is a no-op: nothing is cached,
+        no watermark moves, no events fire — the bar is simply absent, as before.
+        """
+        if pending.forecast is None:
             return []
 
-        # Store for the other ladder's machine — only USABLE results reach this
-        # line, so a failure is never replayed cross-ladder. Re-putting a memo
-        # hit is an idempotent same-value overwrite.
-        if memo_key is not None:
-            self._forecast_memo.put(memo_key, forecast)
-
-        signal_value = list(forecast.values())[0]
+        bar = pending.bar
+        idx = pending.idx
+        signal_value = list(pending.forecast.values())[0]
         current_price = bar.close
         bar_iso = _epoch_ms_to_iso(bar.timestamp)
 
@@ -562,7 +700,7 @@ class ServiceTwoChainMachine(ChainMachine):
         # the next bar's UPSERT re-writes it — so log-and-continue, not raise.
         try:
             await self._persist_signal(
-                self.symbol, bar.timeframe, placeholder_dt,
+                self.symbol, bar.timeframe, pending.placeholder_dt,
                 int(signal_value), self.asset_class, current_price,
             )
         except Exception as e:

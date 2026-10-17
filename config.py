@@ -53,10 +53,52 @@ ASSET_CONFIGS = {
         # at ~tf/2, complete windows only, relaunched on error by
         # feed_process). 3m has no Coinbase granularity and is derived from
         # 1m. No websocket feed exists for Coinbase yet.
-        "timeframes": ["1m", "3m", "5m", "15m", "1h"],
+        # FC ∪ CN. The seconds rungs (30s/45s) are built from trades and
+        # served ONLY for subminute_symbols (warmup and live); 2m/30m come
+        # from candles for every symbol but are owned only by CN strategies.
+        "timeframes": ["30s", "45s", "1m", "2m", "3m", "5m", "15m", "30m", "1h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "rest",
+        # CAPACITY. CN adds ~5,570 forecasts/symbol/day beyond FC (30s 2,880 +
+        # 45s 1,920 + 2m 720 + 30m 48; the rest is memo-shared with FC) ≈
+        # 0.064/s per symbol, on top of FC's ~0.27/s for ten symbols, against
+        # the measured 0.36/s peak. ONE symbol fits; a second needs the D12
+        # re-benchmark first. This list is the CN universe.
+        "subminute_symbols": ["BTC-USD"],
+    },
+    # US equities via Polygon (PR 9). The DENSE LADDER (EXTRA_LADDERS["DL"]):
+    # a 30s baseline with two more seconds-rungs, so the chain machine sees
+    # directional change earlier than the 1m crypto ladder can. Research
+    # direction, not a trading universe: the executor has no equity venue and
+    # routes equity signals to the shadow book (execution/signal_executor).
+    #
+    # CAPACITY (do this arithmetic before adding a symbol). Over the extended
+    # 04:00–20:00 ET session the ladder needs ~5,700 forecasts/symbol/day,
+    # ~0.1/s/symbol while the market is open. At the measured 0.36 calls/s
+    # peak that is ~3 symbols. The forecast/apply split (PR 8) is what makes
+    # even ONE symbol fit: serial per-symbol processing capped a symbol at
+    # one forecast per ~8 s, and 30s+45s+1m+90s+2m+3m need one every ~6 s.
+    #
+    # SESSION: feeds/base.is_market_open('equity') is the extended envelope,
+    # per product decision. Warmup's trade walk and the live feed use that
+    # same definition — in step mode the bar sequence IS the step, so the two
+    # must not differ.
+    #
+    # SOURCES (feeds/polygon_aggs.py): 30s/45s/90s from raw trades (history:
+    # session walk; REST live: forward poll; ws live: 1s aggregates), 2m/3m
+    # from 1-minute bars re-bucketed locally, the rest from Polygon's own
+    # buckets. Transport 'ws' with automatic fallback to 'rest' if the socket
+    # cannot be established on a cold start (feed_process._run_feed).
+    "equity": {
+        "symbols": ["SPCX", "XOM", "NVDA"],
+        # Union of the DL ladder and the ED ladder (rule1_v1's research
+        # ladder adds 5m); the memo dedupes the rungs they share.
+        "timeframes": ["30s", "45s", "1m", "90s", "2m", "3m", "5m",
+                       "15m", "30m", "1h", "2h", "4h", "6h"],
+        "points": 5000,
+        "baseline_timeframe": "30s",
+        "transport": "ws",
     },
 }
 
@@ -69,6 +111,40 @@ def all_tracked_symbols() -> list[str]:
     out: list[str] = []
     for cfg in ASSET_CONFIGS.values():
         out.extend(cfg.get("symbols", []))
+    return out
+
+
+def serves(asset_class: str, symbol: str, timeframe: str) -> bool:
+    """Whether a (symbol, timeframe) stream exists for this class. Seconds
+    rungs are served only for the class's `subminute_symbols` (if set)."""
+    cfg = ASSET_CONFIGS.get(asset_class, {})
+    if timeframe not in cfg.get("timeframes", []):
+        return False
+    if timeframe.endswith("s"):
+        sub = cfg.get("subminute_symbols")
+        return sub is None or symbol in sub
+    return True
+
+
+def equity_symbols() -> list[str]:
+    """The configured equity universe (Polygon tickers), for strategy symbol
+    lists. Empty when no equities are configured."""
+    return list(ASSET_CONFIGS.get("equity", {}).get("symbols", []))
+
+
+# Research collection (research_process.py, migration 025). The traded
+# equities plus market references and the VIX proxy — bars with volume/VWAP/
+# trade count are collected for all of these; NBBO quotes only for symbols
+# that produce trade_signals. Collecting bars costs no Sumtyme capacity, so
+# this list can be wider than the ladder universe.
+RESEARCH_EXTRA_SYMBOLS = ["SPY", "QQQ", "VIXY"]
+
+
+def research_symbols() -> list[str]:
+    out = list(ASSET_CONFIGS.get("equity", {}).get("symbols", []))
+    for s in RESEARCH_EXTRA_SYMBOLS:
+        if s not in out:
+            out.append(s)
     return out
 
 
@@ -277,6 +353,82 @@ STRATEGIES = {
 STRATEGIES["confirmed_15m"]["symbols"] = crypto_symbols()
 STRATEGIES["prior_failure_scaleout"]["symbols"] = crypto_symbols()
 
+# chain_recorder — a record-only OWNER for the dense equity ladder. The router
+# only computes chains for (symbol, ladder) pairs some enabled strategy owns,
+# so a ladder being evaluated as data still needs an owner; this one emits no
+# trade_signals (chains and signals rows are the product). Replace it with the
+# real DL strategy when that lands: same 'symbols'/'ladders', different key.
+STRATEGIES["chain_recorder"] = {
+    "enabled": True,              # kept on beside rule1: depth counters on /health, no signals
+    "symbols": equity_symbols(),
+    "ladders": ["DL"],
+    "params": {},
+}
+
+# ---------------------------------------------------------------------------
+# The owner's frozen chain-following rules (strategy/rules.py, run verbatim
+# through strategy/chain_rules.py). Each is its OWN pre-registered 200-trade
+# review; the package is explicit that trades are never pooled across ladders
+# or rules, which is why a rule on two ladders is two strategies.
+#
+# LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is 5m;
+# on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is 45s. The
+# adapter logs the resolved (level, rung) pairs at start. `entry_tf` /
+# `confirm_tf` pin a rule to rungs by name when a level number would land
+# somewhere else on a different ladder.
+#
+# All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the executor
+# never sends their signals to a venue, in paper or live mode. Crypto LONGs
+# would otherwise reach Coinbase.
+# ---------------------------------------------------------------------------
+STRATEGIES["rule1_v1"] = {                       # the research rule, on the research ladder
+    "enabled": True,
+    "symbols": equity_symbols(),
+    "ladders": ["ED"],
+    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 3m, L3 = 5m
+}
+STRATEGIES["rule1_new_literal_v1"] = {           # the same rule's level numbers on the dense ladder
+    "enabled": True,
+    "symbols": equity_symbols(),
+    "ladders": ["DL"],
+    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
+}
+STRATEGIES["rule3_v1"] = {                       # crypto, pre-registered 2026-10-17
+    "enabled": True,
+    "symbols": crypto_symbols(),
+    "ladders": ["FC"],                           # FC's P2 = 3m, L3 = 5m: the research ladder's
+    "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
+}
+# The two new-ladder crypto rules, on the CN universe only (the seconds rungs
+# are built from trades for ASSET_CONFIGS["crypto"]["subminute_symbols"]).
+STRATEGIES["rule3_new_literal_v1"] = {
+    "enabled": True,
+    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+    "ladders": ["CN"],
+    "params": {"rule": "RULE3_NEW_LITERAL", "tick_seconds": 15},  # P2 = 45s, L3 = 1m
+}
+STRATEGIES["rule3_new_equiv_v1"] = {
+    "enabled": True,
+    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+    "ladders": ["CN"],
+    "params": {"rule": "RULE3_NEW_EQUIV", "entry_tf": "3m", "confirm_tf": "5m",
+               "tick_seconds": 15},                               # pinned by rung, not level
+}
+
+# Strategies whose signals the executor must NEVER route to a venue, in any
+# trade mode: they go to the shadow book (virtual fills at decision_price).
+# The chain rules are paper-only by their own spec.
+SHADOW_ONLY_STRATEGIES = frozenset({
+    "rule1_v1", "rule1_new_literal_v1", "rule3_v1",
+    "rule3_new_literal_v1", "rule3_new_equiv_v1",
+})
+
+# Shadow-book fee per leg (bps) by asset class, overriding the venue's fee
+# tier where the venue does not trade the class. Equity CFD half-spread 0.05%
+# per side is the package's paper assumption; set it from the real ticket
+# (research_quotes has the measured spread per signal).
+SHADOW_FEE_BPS_BY_CLASS = {"equity": 5}
+
 # Extra ladders to register beyond the built-in A and B (name -> timeframes).
 # A strategy referencing a ladder name not here (and not A/B) fails at startup.
 EXTRA_LADDERS = {
@@ -290,6 +442,23 @@ EXTRA_LADDERS = {
     # (Sumtyme is deterministic), so PF's marginal Sumtyme demand is only its
     # five new rungs (~70 calls/day/symbol), not a doubling of the shared ones.
     "PF": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h"],
+    # DL — the dense equity ladder (ASSET_CONFIGS["equity"]). 12 rungs; a
+    # chain climbs one rung at a time (no skipping), so 3m→15m is one step
+    # like any other. Levels: 30s=L1 .. 6h=L12. Shares 1m/3m/15m/1h LABELS
+    # with FC, but the memo keys on asset class, so equity and crypto windows
+    # never collide; ownership (chain_recorder on equities, confirmed_15m on
+    # crypto) keeps the router from building DL machines for crypto symbols.
+    "DL": ["30s", "45s", "1m", "90s", "2m", "3m",
+           "15m", "30m", "1h", "2h", "4h", "6h"],
+    # ED — the equity DEFAULT ladder (1m base), on which rule1_v1's 216
+    # research trades were validated: P2 = 3m, L3 = 5m — the same rungs as
+    # the crypto research ladder's P2/L3. Every rung but 5m is in DL, so its
+    # marginal Sumtyme demand is ~288 forecasts/symbol/day.
+    "ED": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"],
+    # CN — the crypto NEW ladder from the strategy package (30s base, 5m rung,
+    # no 90s): the ladder rule3_new_literal/equiv are defined against. The
+    # seconds rungs are built from Coinbase trades (feeds/coinbase_spot.py).
+    "CN": ["30s", "45s", "1m", "2m", "3m", "5m", "15m", "30m", "1h"],
 }
 
 # Rungs whose short/unwarmed buffer is EXPECTED and acceptable, per ladder
@@ -299,4 +468,8 @@ EXTRA_LADDERS = {
 # nothing in prior_failure_scaleout depends on it (schedule tops at 6h).
 LADDER_OPTIONAL_TIMEFRAMES = {
     "PF": ["12h"],
+    # 5000 × 6h of EQUITY session time is years of history; a young listing
+    # cannot warm these and they fill live. Logging only.
+    "DL": ["4h", "6h"],
+    "ED": ["4h"],
 }

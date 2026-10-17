@@ -449,6 +449,47 @@ def make_insert_signal(pool):
         return newly
     return insert_signal
 
+def make_load_strategy_open_entries(pool, strategy: str):
+    """Open ENTERs for ONE strategy, with created_at — for a strategy that
+    keeps its own position state (Rule 1) and must restore the time its
+    position opened (the stall clock runs from it). Same open-position rule
+    as make_load_open_positions: an ENTER with no closing (non-SCALE) EXIT."""
+    async def load() -> list:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT e.position_key, e.symbol, e.chain_id,
+                       e.direction::text AS direction, e.created_at
+                FROM trade_signals e
+                WHERE e.strategy = $1 AND e.action = 'ENTER'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_signals x
+                      WHERE x.strategy = e.strategy
+                        AND x.position_key = e.position_key
+                        AND x.action = 'EXIT'
+                        AND x.exit_reason <> 'SCALE'
+                  )
+                ORDER BY e.created_at
+                """, strategy)
+        return [dict(r) for r in rows]
+    return load
+
+
+def make_load_opposing_chain_since(pool):
+    """Restart reconcile for the chain rules: did a chain in `direction` on
+    `symbol` (any ladder — an opposing P1 is an opposing P1) initiate after
+    `since`? The package's load_open_trades asks the same of `chains`."""
+    async def load(symbol: str, direction: int, since) -> bool:
+        async with pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """
+                SELECT 1 FROM chains
+                WHERE symbol = $1 AND direction = $2 AND origin_time > $3
+                LIMIT 1
+                """, symbol, int(direction), since))
+    return load
+
+
 def make_load_open_positions(pool):
     """Load positions currently OPEN per the trade_signals log. Used by the
     signal process to rebuild the runtime's open-position watch set on restart

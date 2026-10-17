@@ -316,10 +316,13 @@ class SignalExecutor:
         max_open_positions: Optional[int] = None,
         enter_max_age_ms: Optional[int] = None,
         orphan_allowlist: FrozenSet[str] = frozenset(),
+        shadow_only_strategies: FrozenSet[str] = frozenset(),
     ):
         """
         shadow_book: where SHORT signals go when the adapter cannot short
             (adapter.supports_short is False). None => such signals are skipped.
+        shadow_only_strategies: strategies whose ENTERs always go to the shadow
+            book, in every trade mode (paper rules that must never reach a venue).
         max_open_positions: cap on non-terminal trades across all symbols,
             checked before every ENTER. None => no cap.
         enter_max_age_ms: an ENTER whose row was written (created_at) longer
@@ -331,6 +334,7 @@ class SignalExecutor:
         self.adapter = adapter
         self.hooks = hooks
         self.shadow_book = shadow_book
+        self.shadow_only_strategies = frozenset(shadow_only_strategies or ())
         self._max_open_positions = max_open_positions
         self._enter_max_age_ms = enter_max_age_ms
         self._orphan_allowlist = frozenset(orphan_allowlist)
@@ -624,6 +628,29 @@ class SignalExecutor:
             return
 
         side = TradeSide.LONG if row["direction"] == "LONG" else TradeSide.SHORT
+
+        # Gate: asset class. A signal for a class this venue does not trade
+        # (equities on the Coinbase adapter — the DL ladder is research data)
+        # must never reach sizing: get_touch/get_step_size would fail or, worse,
+        # succeed on a mis-mapped symbol. Same destination as an unsupported
+        # side — the shadow book, which falls back to decision_price when the
+        # venue has no touch — so the strategy still gets virtual round trips.
+        # Before kill switch and cap: the shadow book takes no risk.
+        supported = getattr(self.adapter, "supported_classes", None)
+        shadow_only = strategy in self.shadow_only_strategies
+        if shadow_only or (supported and row.get("asset_class") not in supported):
+            # Also the gate for SHADOW-ONLY strategies (config): paper rules
+            # whose signals must never reach a venue in ANY trade mode. Same
+            # destination, same position in the gate order.
+            if self.shadow_book is not None:
+                self._mincr("entries_shadowed_strategy" if shadow_only else "entries_shadowed_class")
+                await self.shadow_book.on_enter(row)
+            else:
+                self._mincr("entries_class_unsupported")
+                log.warning("ENTER %s/%s: %s and no shadow book — skipped", strategy, position_key,
+                            "shadow-only strategy" if shadow_only
+                            else f"venue does not trade asset class {row.get('asset_class')!r}")
+            return
 
         # Gate: side. A venue that cannot short never sizes or sees a SHORT; the
         # signal goes to the shadow book (virtual fills) instead. Before the

@@ -577,3 +577,82 @@ async def test_failed_cursor_save_does_not_break_delivery():
     t = datetime(2026, 1, 2, tzinfo=timezone.utc)
     await lst._dispatch_row({"signal_id": "s1", "created_at": t})
     assert handled == ["s1"] and lst.cursor == t
+
+
+# --------------------------------------------------------------------
+# Asset-class gate (PR 9): a class the venue does not trade is shadowed
+# --------------------------------------------------------------------
+# The fixtures' SpotAdapter declares supported_classes = {"equity"} and the
+# row helpers default to equity, so "unsupported" here is a CRYPTO row on
+# that adapter — the mirror image of production (equity rows on Coinbase).
+
+def _crypto(row: dict) -> dict:
+    return {**row, "symbol": "BTC-USD", "asset_class": "crypto"}
+
+
+@pytest.mark.asyncio
+async def test_unsupported_asset_class_long_enter_goes_to_shadow_never_to_venue():
+    hooks, state = make_hooks()
+    ex, adapter, store = await shadow_executor(hooks=hooks)
+    await ex.handle_signal(_crypto(enter_row(direction="LONG")))
+    assert adapter.submitted == []                  # never sized, never sent
+    assert state["trades"] == {}
+    row = store.rows[("two_ladder", "chainX:L")]
+    assert row["side"] == "LONG" and row["symbol"] == "BTC-USD"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_asset_class_exit_closes_the_shadow_position():
+    ex, adapter, store = await shadow_executor()
+    await ex.handle_signal(_crypto(enter_row(direction="LONG")))
+    await ex.handle_signal(_crypto(exit_row(direction="LONG")))
+    row = store.rows[("two_ladder", "chainX:L")]
+    assert row["exit_px"] is not None
+    assert adapter.submitted == []
+    assert not ex.shadow_book.holds("two_ladder", "chainX:L")
+
+
+@pytest.mark.asyncio
+async def test_unsupported_asset_class_without_shadow_book_is_skipped():
+    ex, adapter = await booted()
+    await ex.handle_signal(_crypto(enter_row(direction="LONG")))
+    assert adapter.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_supported_asset_class_is_not_shadowed():
+    # Control: the same LONG on the adapter's own class reaches the venue.
+    ex, adapter, store = await shadow_executor()
+    await ex.handle_signal(enter_row(direction="LONG"))
+    assert adapter.submitted != []
+    assert ("two_ladder", "chainX:L") not in store.rows
+
+
+# --------------------------------------------------------------------
+# Shadow-only strategies (PR 12): never a venue order, in any mode
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_shadow_only_strategy_long_on_supported_class_is_shadowed():
+    ex, adapter, store = await shadow_executor(shadow_only_strategies=frozenset({"two_ladder"}))
+    await ex.handle_signal(enter_row(direction="LONG"))           # equity on the equity adapter
+    assert adapter.submitted == []
+    assert ("two_ladder", "chainX:L") in store.rows
+
+
+@pytest.mark.asyncio
+async def test_non_shadow_only_strategy_still_reaches_venue():
+    ex, adapter, store = await shadow_executor(shadow_only_strategies=frozenset({"rule3_v1"}))
+    await ex.handle_signal(enter_row(direction="LONG"))
+    assert adapter.submitted != [] and ("two_ladder", "chainX:L") not in store.rows
+
+
+@pytest.mark.asyncio
+async def test_shadow_fee_per_asset_class_override():
+    from decimal import Decimal
+    from execution.shadow_book import ShadowBook
+    store = MemShadowStore()
+    book = ShadowBook(store.hooks(), taker_fee_bps=Decimal("120"), fee_bps_by_class={"equity": 5})
+    assert await book._fee_bps("equity") == Decimal("5")
+    assert await book._fee_bps("crypto") == Decimal("120")
+    assert await book._fee_bps(None) == Decimal("120")

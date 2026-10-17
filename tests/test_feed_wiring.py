@@ -72,12 +72,31 @@ def test_binance_form_symbol_is_rejected(monkeypatch):
         _build_feeds(config.ASSET_CONFIGS)
 
 
-@pytest.mark.parametrize("asset_class", ["equity", "fx"])
+@pytest.mark.parametrize("asset_class", ["fx"])
 def test_class_without_feed_is_skipped(monkeypatch, asset_class):
-    # ADR-001 Phase 1 deleted the Polygon feeds; a stray equity/fx entry must
-    # not crash the feed process, just be skipped with a warning.
+    # ADR-001 Phase 1 deleted the Polygon fx feed (equity was restored in
+    # PR 9); a stray fx entry must not crash the feed process, just be
+    # skipped with a warning.
     monkeypatch.setattr(config, "ASSET_CONFIGS", _cfg(asset_class, symbols=("AAPL",)))
     assert _build_feeds(config.ASSET_CONFIGS) == {}
+
+
+def test_equity_requires_polygon_key(monkeypatch):
+    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    monkeypatch.setattr(config, "ASSET_CONFIGS", _cfg("equity", symbols=("AAPL",)))
+    with pytest.raises(RuntimeError, match="POLYGON_API_KEY"):
+        _build_feeds(config.ASSET_CONFIGS)
+
+
+def test_equity_ws_transport_wraps_rest_sibling(monkeypatch):
+    from feeds.polygon_stocks import PolygonStocksFeed
+    from feeds.polygon_ws import PolygonStocksWSFeed
+    monkeypatch.setenv("POLYGON_API_KEY", "k")
+    monkeypatch.setattr(config, "ASSET_CONFIGS",
+                        _cfg("equity", transport="ws", symbols=("AAPL",)))
+    feeds = _build_feeds(config.ASSET_CONFIGS)
+    assert isinstance(feeds["equity"], PolygonStocksWSFeed)
+    assert isinstance(feeds["equity"].rest_feed, PolygonStocksFeed)   # the fallback
 
 
 def test_empty_symbols_skipped(monkeypatch):
@@ -86,9 +105,15 @@ def test_empty_symbols_skipped(monkeypatch):
     assert "crypto" not in feeds
 
 
-def test_shipped_config_builds_one_crypto_feed():
-    # The real config: crypto only, Coinbase product ids, REST transport.
+def test_shipped_config_builds_crypto_and_equity_feeds(monkeypatch):
+    # The real config: Coinbase crypto (REST) + Polygon equities (ws over REST).
+    from feeds.polygon_ws import PolygonStocksWSFeed
+    monkeypatch.setenv("POLYGON_API_KEY", "k")
     feeds = _build_feeds(config.ASSET_CONFIGS)
-    assert list(feeds) == ["crypto"]
+    assert sorted(feeds) == ["crypto", "equity"]
     assert isinstance(feeds["crypto"], CoinbaseSpotFeed)
     assert all("-" in s for s in feeds["crypto"].symbols)
+    assert isinstance(feeds["equity"], PolygonStocksWSFeed)
+    # Equity timeframes are the union of the ladders equities run (DL + ED).
+    assert set(config.ASSET_CONFIGS["equity"]["timeframes"]) == \
+        set(config.EXTRA_LADDERS["DL"]) | set(config.EXTRA_LADDERS["ED"])

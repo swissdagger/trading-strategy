@@ -75,12 +75,37 @@ _NATIVE: Dict[str, str] = {
 
 # Derived timeframe -> the native timeframe it is built from.
 _DERIVED: Dict[str, str] = {
+    "2m": "1m",
     "3m": "1m",
     "4h": "1h",
     "12h": "6h",
 }
 
-_SUPPORTED: Set[str] = set(_NATIVE) | set(_DERIVED)
+# SECONDS rungs (the CN ladder's 30s/45s). Coinbase candles have no sub-minute
+# granularity, so these are built from raw TRADES — history (a backward walk
+# of the Exchange trades endpoint) and live (a forward poll of the same
+# endpoint) from the SAME source, so warmup and live define "one step"
+# identically (in Sumtyme's step mode the bar sequence IS the step).
+_SECONDS: Set[str] = {"30s", "45s"}
+
+_SUPPORTED: Set[str] = set(_NATIVE) | set(_DERIVED) | _SECONDS
+
+# Public, unauthenticated trades with cursor pagination by trade_id
+# (`after=<trade_id>` pages OLDER). The Advanced Trade host's /ticker returns
+# only a recent page and cannot walk back, which warmup needs.
+TRADES_URL = "https://api.exchange.coinbase.com/products"
+TRADES_PAGE = 1000
+# Trades carry only reporting latency (no candle-style revision): hold a
+# seconds-window this long past its close before emitting it live.
+TRADE_SETTLE_MS = 2_000
+# Backward-walk budget per (symbol, rung) at warmup: pages × TRADES_PAGE
+# trades. 5000 × 45s ≈ 62 h of a liquid book is a few hundred thousand
+# trades; a thin book degrades to a partial buffer (fills live).
+TRADES_MAX_PAGES = 600
+
+
+def is_seconds_tf(tf: str) -> bool:
+    return tf in _SECONDS
 
 # Candles per request. The API caps a request at 350; stay under it so an
 # inclusive start/end boundary can never push a page over the limit.
@@ -122,12 +147,17 @@ class CoinbaseSpotFeed(AssetFeed):
         *,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         now_ms: Optional[Callable[[], int]] = None,
+        subminute_symbols: Optional[List[str]] = None,
     ):
         """
         requests_per_second: Coinbase's public market endpoints allow about
             10 req/s per IP; 8 leaves headroom for retries.
         transport / now_ms: injection points for tests (an httpx MockTransport
             and a fixed clock). Production leaves both None.
+        subminute_symbols: the symbols for which SECONDS rungs (30s/45s) are
+            served, from trades. None = all configured symbols. Restrict this:
+            every symbol on the seconds rungs is ~5,500 forecasts/day of
+            Sumtyme demand (ASSET_CONFIGS has the arithmetic).
         """
         unsupported = [tf for tf in timeframes if tf not in _SUPPORTED]
         if unsupported:
@@ -143,6 +173,8 @@ class CoinbaseSpotFeed(AssetFeed):
                 f"'BTC-USD'; got {bad}")
         self.symbols = symbols
         self.timeframes = timeframes
+        self.subminute_symbols: Set[str] = set(
+            subminute_symbols if subminute_symbols is not None else symbols)
         self.rate_limiter = RateLimiter(
             requests_per_second=requests_per_second, max_concurrent=max_concurrent)
         self._transport = transport
@@ -208,6 +240,118 @@ class CoinbaseSpotFeed(AssetFeed):
         return None
 
     # ------------------------------------------------------------------
+    # TRADES (seconds rungs: history + live, one source)
+    # ------------------------------------------------------------------
+    def has_subminute_source(self) -> bool:
+        """warmup_process probes this before calling fetch_subminute_history."""
+        return bool(self.subminute_symbols)
+
+    async def _fetch_trades_page(self, product_id: str,
+                                 after_trade_id: Optional[int] = None) -> Optional[List[dict]]:
+        """One page of the Exchange trades endpoint, NEWEST FIRST, as
+        {t (ms), price, trade_id}. `after_trade_id` pages OLDER than that id.
+        None on a non-retryable failure; [] when there is nothing older."""
+        client = await self._get_client()
+        url = f"{TRADES_URL}/{product_id}/trades"
+        params: Dict[str, str] = {"limit": str(TRADES_PAGE)}
+        if after_trade_id is not None:
+            params["after"] = str(after_trade_id)
+        for attempt in range(4):
+            try:
+                async with self.rate_limiter:
+                    resp = await client.get(url, params=params)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                if resp.status_code in (400, 404):
+                    logger.error("coinbase trades %s: HTTP %d %s", product_id,
+                                 resp.status_code, resp.text[:200])
+                    return None
+                resp.raise_for_status()
+                out = []
+                for r in resp.json():
+                    t = r.get("time")
+                    if not t:
+                        continue
+                    dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+                    out.append({"t": int(dt.timestamp() * 1000), "price": float(r["price"]),
+                                "trade_id": int(r["trade_id"])})
+                out.sort(key=lambda r: r["trade_id"], reverse=True)
+                return out
+            except (httpx.HTTPError, ValueError, KeyError) as e:
+                logger.warning("coinbase trades %s attempt %d failed: %r", product_id, attempt + 1, e)
+                await asyncio.sleep(2 ** attempt)
+        logger.error("coinbase trades %s: giving up after retries", product_id)
+        return None
+
+    @staticmethod
+    def _trades_to_windows(trades: List[dict], tf: str) -> List[dict]:
+        ticks = [{"t": r["t"], "o": r["price"], "h": r["price"], "l": r["price"], "c": r["price"]}
+                 for r in trades]
+        return _resample_to_timeframe(ticks, tf)   # ascending, epoch-aligned
+
+    async def fetch_subminute_history(self, symbol: str, timeframe: str,
+                                      target_bars: int) -> List[OHLCPoint]:
+        """Up to `target_bars` closed seconds-bars built from trades, walking
+        the Exchange trades endpoint BACKWARD (newest page first, then
+        `after=<oldest id>`), bounded by TRADES_MAX_PAGES. Ascending. The
+        still-forming (or unsettled) newest window is dropped. Empty for a
+        symbol not in subminute_symbols — such a symbol has no seconds rungs."""
+        if timeframe not in _SECONDS:
+            raise ValueError(f"fetch_subminute_history is for {sorted(_SECONDS)}, got {timeframe!r}")
+        if symbol not in self.subminute_symbols:
+            logger.info("coinbase %s: %s not in subminute_symbols; no seeds", timeframe, symbol)
+            return []
+        tf_ms = timeframe_to_ms(timeframe)
+        now = self._now_ms()
+        trades: List[dict] = []
+        after: Optional[int] = None
+        for _ in range(TRADES_MAX_PAGES):
+            page = await self._fetch_trades_page(symbol, after)
+            if page is None:
+                break                                    # keep what we have
+            if not page:
+                break                                    # history exhausted
+            trades.extend(page)
+            after = page[-1]["trade_id"]
+            span_windows = (now - page[-1]["t"]) // tf_ms
+            if span_windows >= target_bars + 2:
+                break
+        windows = [w for w in self._trades_to_windows(trades, timeframe)
+                   if w["t"] + tf_ms + TRADE_SETTLE_MS <= now]
+        windows = windows[-target_bars:]
+        return [self._point(symbol, timeframe, w) for w in windows]
+
+    async def _poll_trades_once(self, symbol: str, tf: str, cursor_ms: int,
+                                now_ms: int) -> "tuple[List[OHLCPoint], int]":
+        """One live poll for a seconds rung: trades since `cursor_ms`
+        (newest page, then older pages until the cursor is covered), bucketed
+        to `tf`; emits windows closed at least TRADE_SETTLE_MS ago; the cursor
+        advances to the start of the first unclosed window (re-read next poll
+        so late prints land in the right bar)."""
+        tf_ms = timeframe_to_ms(tf)
+        trades: List[dict] = []
+        after: Optional[int] = None
+        for _ in range(20):                               # 20k trades per poll, plenty
+            page = await self._fetch_trades_page(symbol, after)
+            if not page:
+                break
+            trades.extend(page)
+            after = page[-1]["trade_id"]
+            if page[-1]["t"] < cursor_ms:
+                break
+        points: List[OHLCPoint] = []
+        new_cursor = cursor_ms
+        for w in self._trades_to_windows(trades, tf):
+            if w["t"] < cursor_ms:
+                continue
+            if w["t"] + tf_ms + TRADE_SETTLE_MS > now_ms:
+                break
+            points.append(self._point(symbol, tf, w))
+            new_cursor = max(new_cursor, w["t"] + tf_ms)
+        return points, new_cursor
+
+    # ------------------------------------------------------------------
     # HISTORY (warmup)
     # ------------------------------------------------------------------
     async def fetch_history(self, symbol: str, timeframe: str,
@@ -215,6 +359,8 @@ class CoinbaseSpotFeed(AssetFeed):
         """Up to points_needed CLOSED candles for (symbol, timeframe), oldest
         first. Pages backwards from now until enough target bars exist, the
         product's history runs out (an empty page), or the page budget is spent."""
+        if timeframe in _SECONDS:
+            return await self.fetch_subminute_history(symbol, timeframe, points_needed)
         if timeframe not in _SUPPORTED:
             raise ValueError(f"unsupported timeframe {timeframe!r}")
         base_tf = base_timeframe(timeframe)
@@ -333,14 +479,28 @@ class CoinbaseSpotFeed(AssetFeed):
         async def poll_one_tf(tf: str) -> None:
             tf_ms = timeframe_to_ms(tf)
             interval = min(max(tf_ms // 2000, 8), 600)
+            tf_symbols = [s for s in symbols if s in self.subminute_symbols] \
+                if tf in _SECONDS else list(symbols)
+            if not tf_symbols:
+                logger.info("[%s:%s] no symbols serve this rung; poller idle", self.name, tf)
+                return
             cursors = {sym: self.initial_cursor(initial_cursors, sym, tf)
-                       for sym in symbols}
-            logger.info("[%s:%s] REST polling every %ss", self.name, tf, interval)
+                       for sym in tf_symbols}
+            logger.info("[%s:%s] REST polling every %ss (%s)", self.name, tf, interval,
+                        "trades" if tf in _SECONDS else "candles")
             while self._running:
                 try:
                     now = datetime.now(timezone.utc)
                     if is_market_open(self.asset_class, now):   # crypto: always
-                        batch = await self.poll_once(symbols, tf, cursors)
+                        if tf in _SECONDS:
+                            batch = []
+                            now_ms = self._now_ms()
+                            for sym in tf_symbols:
+                                pts, cursors[sym] = await self._poll_trades_once(
+                                    sym, tf, cursors[sym], now_ms)
+                                batch.extend(pts)
+                        else:
+                            batch = await self.poll_once(tf_symbols, tf, cursors)
                         if batch:
                             await callback(batch)
                 except asyncio.CancelledError:

@@ -68,6 +68,8 @@ from producer.persistence import (
     make_persist_chain_init,
     make_load_buffers,
     make_load_last_base_signal,
+    make_load_strategy_open_entries,
+    make_load_opposing_chain_since,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -76,6 +78,8 @@ from strategy.registry import StrategyRegistry, Strategy
 from strategy.multi_runtime import MultiStrategyRuntime, RuntimeHooks, OpenPosition
 from strategy.two_ladder_strategy import TwoLadderEntry, TwoLadderExit
 from strategy.confirmed_15m_adapter import make_confirmed_15m
+from strategy.chain_recorder import make_chain_recorder
+from strategy.chain_rules import make_chain_rule
 from strategy.prior_failure_adapter import make_prior_failure_scaleout
 
 log = logging.getLogger("signal_process")
@@ -101,6 +105,13 @@ class Config:
         # machine's input, unlike a shed audit row).
         self.symbol_queue_max = int(
             os.environ.get("SYMBOL_QUEUE_MAX", "1000"))
+        # How many of ONE symbol's forecasts may be in flight at once (below
+        # the global FORECAST_CONCURRENCY). Since the forecast/apply split a
+        # symbol no longer serialises its own forecasts; this cap stops a
+        # multi-rung boundary (12 bars for one symbol at a 6h close) from
+        # grabbing every gate permit and starving other symbols' baselines.
+        self.symbol_inflight_max = int(
+            os.environ.get("SYMBOL_INFLIGHT_MAX", "4"))
         # How often the consume loop commits the contiguous low-water offset.
         self.commit_interval_s = float(
             os.environ.get("COMMIT_INTERVAL_S", "5.0"))
@@ -355,6 +366,59 @@ class SignalProcess:
                 view_registry=self.ladders, writer_factory=make_writer,
             ),
         )
+        # chain_recorder: record-only owner for a ladder evaluated as data (the
+        # dense equity ladder DL until its strategy lands). Same factory shape.
+        self.strategies.register_factory(
+            "chain_recorder",
+            lambda *, name, symbols, ladders, params: make_chain_recorder(
+                name=name, symbols=symbols, ladders=ladders, params=params,
+                view_registry=self.ladders, writer_factory=make_writer,
+            ),
+        )
+        # The owner's frozen chain rules (strategy/rules.py via chain_rules.py).
+        # Their volatility filters need 1m closes per asset class, from the
+        # same feeds that serve the ladders: Polygon for equities, Coinbase
+        # for crypto. One closes source per class, built lazily on first use
+        # so a config without that class never needs its key here.
+        self._closes_feeds: dict = {}
+        self._vol_providers: dict = {}
+        self._closes_sources: dict = {}
+
+        def _closes_source(asset_class: str):
+            if asset_class not in self._closes_sources:
+                from strategy.vol_source import FeedClosesSource, VolStateProvider
+                syms = list(ASSET_CONFIGS.get(asset_class, {}).get("symbols", []))
+                if asset_class == "equity":
+                    from feeds.polygon_stocks import PolygonStocksFeed
+                    feed = PolygonStocksFeed(_require("POLYGON_API_KEY"), syms, ["1m"])
+                elif asset_class == "crypto":
+                    from feeds.coinbase_spot import CoinbaseSpotFeed
+                    feed = CoinbaseSpotFeed(syms, ["1m"])
+                else:
+                    raise RuntimeError(f"no 1m closes source for asset class {asset_class!r}")
+                self._closes_feeds[asset_class] = feed
+                src = FeedClosesSource(feed)
+                self._closes_sources[asset_class] = src
+                self._vol_providers[asset_class] = VolStateProvider(src)
+            return self._closes_sources[asset_class]
+
+        def _vol_for(asset_class: str):
+            _closes_source(asset_class)
+            return self._vol_providers[asset_class]
+
+        def _latest_close_for(asset_class: str):
+            return _closes_source(asset_class).latest_close
+
+        chain_rule_factory = lambda *, name, symbols, ladders, params: make_chain_rule(
+            name=name, symbols=symbols, ladders=ladders, params=params,
+            view_registry=self.ladders, writer_factory=make_writer,
+            vol_provider_for=_vol_for, latest_close_for=_latest_close_for,
+            load_open=make_load_strategy_open_entries(self.pool, name),
+            load_opposing_since=make_load_opposing_chain_since(self.pool),
+        )
+        for key in ("rule1_v1", "rule1_new_literal_v1", "rule3_v1",
+                    "rule3_new_literal_v1", "rule3_new_equiv_v1"):
+            self.strategies.register_factory(key, chain_rule_factory)
         # All tracked symbols across the enabled strategies feed 'symbols: "*"'.
         all_symbols = _all_configured_symbols()
         self.strategies.build_from_config(STRATEGIES, all_symbols=all_symbols)
@@ -382,6 +446,21 @@ class SignalProcess:
             locks=self.router._locks,   # SHARE the router's lock map
         )
         await self.runtime.start()
+
+        # --- Strategies with their own state/clock (Rule 1) ---
+        # start(): restore open trades from trade_signals. tick(): the rule's
+        # clock (stall exit, session-open drain), on a timer independent of
+        # events — a symbol with no events still has to exit on time.
+        self._strategy_tickers: list[asyncio.Task] = []
+        for strat in self.strategies.active():
+            comp = strat.entry
+            if hasattr(comp, "start"):
+                await comp.start()
+            if hasattr(comp, "tick"):
+                period = float((STRATEGIES.get(strat.name, {}).get("params") or {})
+                               .get("tick_seconds", 15))
+                self._strategy_tickers.append(asyncio.create_task(
+                    self._tick_loop(comp, period), name=f"tick-{strat.name}"))
 
         # --- Audit + health endpoint ---
         # Started LAST, so a 200 from /health means the whole pipeline is up, not
@@ -493,6 +572,14 @@ class SignalProcess:
             )
         return factory
 
+    async def _tick_loop(self, comp, period: float) -> None:
+        while not self._stop.is_set():
+            try:
+                await comp.tick()
+            except Exception:
+                log.exception("strategy tick failed (continuing)")
+            await asyncio.sleep(period)
+
     def _runtime_hooks(self):
         """Persistence for the multi-strategy open-position watch set.
 
@@ -582,6 +669,18 @@ class SignalProcess:
         have no reason to serialise across symbols. With N symbols this is an
         ~N-fold throughput increase, which is what closes the lag.
 
+        ROUND TWO (dense ladders). Per-symbol serial processing caps ONE
+        symbol at 1 / wall-latency of a Sumtyme call, which a sub-minute ladder
+        exceeds on its own. So the chain machine is now split into
+        prepare (append + snapshot, under the lock) / forecast (no lock) /
+        apply (cache + state machine, under the lock), and the pool runs each
+        symbol as a stager + applier pipeline: prepares in arrival order,
+        forecasts concurrently (capped by SYMBOL_INFLIGHT_MAX below the global
+        gate), and applies STRICTLY in arrival order through a FIFO of
+        futures. The ordering invariant the paragraph above protects is
+        unchanged — it now lives in the apply stage — and _run_state_machine
+        itself is untouched. See producer/symbol_workers.py.
+
         WHY THE LAG HAPPENED (for the next person): per-bar cost (one forecast +
         its DB round-trips, in series) exceeded the bar arrival rate across the
         universe, so consumer lag grew monotonically — 38k messages and ~39h
@@ -602,8 +701,11 @@ class SignalProcess:
         assert self.consumer is not None and self.router is not None
 
         self.workers = SymbolWorkerPool(
-            self.router.on_bar,
+            prepare=self.router.prepare,
+            forecast=self.router.forecast,
+            apply=self.router.apply,
             max_queue_per_symbol=self.cfg.symbol_queue_max,
+            max_inflight_per_symbol=self.cfg.symbol_inflight_max,
         )
         last_commit = time.monotonic()
 
@@ -708,6 +810,8 @@ class SignalProcess:
             self._health_server.stop()
         if self._audit_task is not None:
             self._audit_task.cancel()
+        for t in getattr(self, "_strategy_tickers", []):
+            t.cancel()
 
         if self.workers is not None:
             await self.workers.drain()
@@ -724,6 +828,14 @@ class SignalProcess:
 
         if self.audit_writer is not None:
             await self.audit_writer.stop()    # flushes; needs the pool alive
+
+        for feed in getattr(self, "_closes_feeds", {}).values():
+            close = getattr(feed, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    pass
 
         if self.pool is not None:
             await self.pool.close()

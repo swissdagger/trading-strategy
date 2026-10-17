@@ -199,8 +199,11 @@ async def _warmup_all(pool: asyncpg.Pool) -> Dict[str, Dict[str, int]]:
         # shared across Set A and Set B (30s/1m/2m) is ONE buffer; the loader
         # filters per-set on read. Seeding per-set here would double-fetch.
         timeframes = cfg.get("timeframes", [])
+        from config import serves
         for symbol in symbols:
             for tf in timeframes:
+                if not serves(asset_class, symbol, tf):
+                    continue    # e.g. a seconds rung for a symbol outside subminute_symbols
                 tasks.append(asyncio.create_task(
                     _seed_one_stream(
                         feed, asset_class, symbol, tf,
