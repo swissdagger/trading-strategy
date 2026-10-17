@@ -203,7 +203,7 @@ Each table fills from the one before it. The first empty one is where the
 pipeline stalls.
 
 ```
-warmup_bars → feed_cursors (advancing) → signals → chains → trade_signals
+warmup_bars (advancing: the bar store) → signals → chains → trade_signals
     → trades / orders / fills (+ paper_fills in paper) and shadow_trades (shorts)
 ```
 
@@ -328,7 +328,8 @@ The next executor start re-seeds `config.PAPER_STARTING_CASH`.
 | Outage | Action |
 |---|---|
 | executor, any length | restart. Missed EXITs replay from the persisted cursor; stale ENTERs are skipped |
-| feed, up to 100 h | restart. The feed catches up from `feed_cursors` |
+| feed, up to 100 h | restart. The feed catches up from the newest stored bar (`warmup_bars`) |
+| signal, any length | restart. Buffers hydrate from `warmup_bars`; Kafka replays the rest |
 | feed, over 100 h | stop feed + signal, `docker compose run --rm warmup`, start them again |
 
 ---

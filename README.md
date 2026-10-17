@@ -77,7 +77,7 @@ fees — the only short-side data available.
 | Producer | bars | tagged chain events | `service2_machine.py`, `fanout_router_multi.py`, `ladder_registry.py` |
 | Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `confirmed_15m_*.py`, `signal_writer.py` |
 | Execution | trade signals | venue orders | `signal_listener.py`, `signal_executor.py`, `sizing.py`, `shadow_book.py`, `gated_adapter.py`, `coinbase_adapter.py`, `paper_adapter.py` |
-| Schema | — | the trading DB | `migrations/001…024` |
+| Schema | — | the trading DB | `migrations/001…026` |
 
 Dependencies point downward only. The executor never imports the strategy; both
 sides share only the DB contract and the event shape.
@@ -267,7 +267,6 @@ Two probes drive synthetic chain events through the **real** gates, writer,
 insert, NOTIFY and listener — nothing is hand-inserted:
 
 ```bash
-python write_path_probe.py    --i-understand-live-listeners   # two_ladder
 python write_path_probe_fc.py --i-understand-live-listeners   # confirmed_15m
 ```
 
@@ -289,8 +288,9 @@ unroutable by design.
   in arrival order (`producer/symbol_workers.py`).
 - **Crypto seconds rungs.** The CN ladder's 30s/45s bars are built from
   Coinbase Exchange trades for `subminute_symbols` only (BTC-USD): a
-  backward trade walk at warmup, a 15 s forward poll live, one source for
-  both. ~5,570 extra forecasts/symbol/day; one symbol fits the measured
+  backward trade walk at warmup, a forward poll at each window close live,
+  one source for both. Live, they wait for the 1m candles' settle (see Bar
+  ordering). ~5,570 extra forecasts/symbol/day; one symbol fits the measured
   capacity beside the ten-symbol FC ladder, a second needs the D12
   re-benchmark.
 - **Equities capacity.** The DL ladder needs ~5,700 forecasts/symbol/day over
@@ -303,8 +303,21 @@ unroutable by design.
 - **Bar latency.** Coinbase revises a closed candle for up to ~36 s, so the feed
   emits a bar 60 s after its window closes. Thin books omit no-trade minutes; the
   gaps pass through.
-- **Restart hydration.** Machines restore buffers, active chains and the last
-  baseline signal, and drop any bar not newer than their buffer (Kafka replays).
+- **Bar ordering.** The Coinbase feed publishes each symbol's bars in
+  CLOSE-TIME order across all its rungs, the shorter rung first on a tie
+  (`CloseOrderMerge` in `feeds/coinbase_spot.py`): a bar waits until every rung
+  of its symbol has been read past its close. The chain machines apply bars in
+  arrival order, so without this the poll timing decided whether a chain
+  propagated or terminated. The chain sweep compares signals by the moment they
+  forecast (the bar's window end), so a 1h bar at 11:00 extends a chain whose
+  top rung is a 30m bar at 11:30 — both forecast 12:00.
+- **Restart hydration.** Every bar a machine appends is written to
+  `warmup_bars` (the bar store) once applied, so a restarted signal process
+  hydrates its buffers to where the last run got; Kafka replays the rest and
+  machines drop any bar not newer than their buffer. A new consumer group reads
+  the topic from the earliest offset. The feed resumes from the newest stored
+  bar (or warmup's cursor, if newer). The store grows by every live bar
+  (~15k rows/day for the crypto universe).
 - **State-machine sync.** The chain machine is copied from CausaView, not shared
   as a library, and differs by two changes: the monotonic bar guard, and the
   prepare/forecast/apply split of `on_bar` (ADR-001 debt D9). The

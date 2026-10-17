@@ -306,7 +306,7 @@ def make_chain_audit_refresher(pool, cache: AuditCache,
                 "unwritable. Non-zero means that index is missing — check "
                 "dedupe_index_present.",
             "legacy_uuid_ids":
-                "Chains retained across migration 019 keep their original uuid4. "
+                "Chains created before deterministic ids keep their original uuid4. "
                 "They are valid; only their ids predate deterministic chain_id. "
                 "This count drains to 0 as they terminate.",
             "shape_violations":

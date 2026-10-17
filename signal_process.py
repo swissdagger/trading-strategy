@@ -555,7 +555,7 @@ class SignalProcess:
                 # oblivious to whether its writes are sync or deferred.
                 persist_chain_propagate=self.audit_writer.persist_chain_propagate,
                 persist_chain_terminate=self.audit_writer.persist_chain_terminate,
-                # Filters on the ladder NAME (migration 019). The old baseline-
+                # Filters on the ladder NAME (migration 026). The old baseline-
                 # timeframe discriminator conflated FC and PF, whose baselines are
                 # both 1m on the same crypto symbols: each machine adopted the
                 # other's chains on restart and advanced them under its own level

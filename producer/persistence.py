@@ -81,7 +81,7 @@ def make_persist_chain_init(pool):
     its initiation step (hydrate reconstructs current_level from the step
     count, so a missing step-0 would under-report the level by one).
  
-    Per migration 019 the row also carries `ladder`, the registered ladder name.
+    Per migration 026 the row also carries `ladder`, the registered ladder name.
     ON CONFLICT (chain_id) DO NOTHING has been here since 002 but was dead code:
     chain_id was a fresh uuid4 per call, so the conflict could never fire and a
     replayed initiation wrote a duplicate row. chain_id is now derived from the
@@ -217,16 +217,16 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
     """Hydrate active chains for one (symbol, ladder) on restart, so chain state
     survives a restart.
  
-    THE DISCRIMINATOR IS THE LADDER NAME (migration 019). It used to be the
+    THE DISCRIMINATOR IS THE LADDER NAME (migration 026). It used to be the
     chain's baseline timeframe (history[0].timeframe == ladder[0]), which is not
     unique across ladders: FC and PF both baseline at 1m and both run on
     crypto_symbols(), so each machine adopted the other's chains on restart and
     advanced them under its own level numbering — 1h is level 5 in FC and level 6
     in PF. Ownership is now explicit and filtered in SQL.
  
-    No legacy branch: migration 019 retired every chain that predates the
-    `ladder` column, and ck_chains_ladder_required makes the column mandatory on
-    anything live, so a NULL ladder cannot reach this query.
+    No legacy branch: ck_chains_ladder_required (migration 026) makes the
+    column mandatory on anything live, so a NULL ladder cannot reach this
+    query.
  
     Per migration 008 the per-step history is reconstructed from chain_steps
     (authoritative, append-only) rather than the chains.history column. One
