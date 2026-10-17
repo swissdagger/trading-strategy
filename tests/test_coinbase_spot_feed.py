@@ -336,44 +336,69 @@ async def test_start_live_does_not_reemit_warmups_newest_bar():
 from feeds.coinbase_spot import CloseOrderMerge
 from producer.bar import OHLCPoint
 
-_TF_MS = {"30s": 30_000, "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000}
+_TF_MS = {"30s": 30_000, "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+          "1h": 3_600_000}
 
 
-def _pt(start_ms, tf):
-    return OHLCPoint(symbol="BTC-USD", timestamp=start_ms, open=1, high=1, low=1, close=1,
+def _pt(start_ms, tf, symbol="BTC-USD"):
+    return OHLCPoint(symbol=symbol, timestamp=start_ms, open=1, high=1, low=1, close=1,
                      timeframe=tf, asset_class="crypto")
 
 
-def test_merge_holds_a_bar_until_every_rung_is_read_past_its_close():
-    m = CloseOrderMerge({"BTC-USD": ["1m", "3m"]}, {("BTC-USD", "1m"): 0, ("BTC-USD", "3m"): 0})
-    m.offer("BTC-USD", "1m", [_pt(0, "1m"), _pt(60_000, "1m"), _pt(120_000, "1m")], 180_000)
-    # 3m not yet read past 0: nothing may go, a 3m bar closing at 180s could still come.
-    assert m.release() == []
-    m.offer("BTC-USD", "3m", [_pt(0, "3m")], 180_000)
-    out = m.release()
-    # Close order; on the 180s tie the shorter rung first.
-    assert [(p.timeframe, p.timestamp) for p in out] == [
-        ("1m", 0), ("1m", 60_000), ("1m", 120_000), ("3m", 0)]
+def test_merge_holds_a_bar_until_no_rung_can_produce_an_earlier_one():
+    # Next unread close: 1m at 60 s, 3m at 180 s.
+    m = CloseOrderMerge({"BTC-USD": ["1m", "3m"]},
+                        {("BTC-USD", "1m"): 60_000, ("BTC-USD", "3m"): 180_000})
+    m.offer("BTC-USD", "1m", [_pt(0, "1m"), _pt(60_000, "1m"), _pt(120_000, "1m")], 240_000)
+    # The 1m bars closing at 60 s and 120 s cannot be preceded by any 3m bar
+    # (none closes before 180 s); the one closing at 180 s ties with the
+    # unread 3m window, and the shorter rung goes first — so all three go.
+    assert [p.timestamp for p in m.release()] == [0, 60_000, 120_000]
+    m.offer("BTC-USD", "3m", [_pt(0, "3m")], 360_000)
+    m.offer("BTC-USD", "1m", [_pt(180_000, "1m")], 300_000)
+    # 3m (close 180 s) before the 1m closing at 240 s.
+    assert [(p.timeframe, p.timestamp) for p in m.release()] == [("3m", 0), ("1m", 180_000)]
+
+
+def test_merge_ties_go_shorter_rung_first():
+    m = CloseOrderMerge({"BTC-USD": ["1m", "5m"]},
+                        {("BTC-USD", "1m"): 60_000, ("BTC-USD", "5m"): 300_000})
+    m.offer("BTC-USD", "5m", [_pt(0, "5m")], 600_000)             # closes 300 s
+    assert m.release() == []                                       # a 1m bar closing by 300 s may still come
+    m.offer("BTC-USD", "1m", [_pt(t, "1m") for t in range(0, 300_000, 60_000)], 360_000)
+    out = [(p.timeframe, p.timestamp + _TF_MS[p.timeframe]) for p in m.release()]
+    assert out == [("1m", 60_000), ("1m", 120_000), ("1m", 180_000), ("1m", 240_000),
+                   ("1m", 300_000), ("5m", 300_000)]
+
+
+def test_a_slow_rung_does_not_hold_bars_closing_before_its_next_window():
+    # The 1h rung was read just after 13:00: its next unread window closes at
+    # 14:00. 1m bars closing at 13:05 must not wait for the next 1h read.
+    h13 = 13 * 3_600_000
+    m = CloseOrderMerge({"BTC-USD": ["1m", "1h"]},
+                        {("BTC-USD", "1m"): h13 + 60_000, ("BTC-USD", "1h"): h13 + 3_600_000})
+    m.offer("BTC-USD", "1m", [_pt(h13 + 4 * 60_000, "1m")], h13 + 6 * 60_000)
+    assert [p.timestamp for p in m.release()] == [h13 + 4 * 60_000]
 
 
 def test_merge_does_not_advance_a_rung_whose_read_failed():
-    m = CloseOrderMerge({"BTC-USD": ["1m", "5m"]}, {("BTC-USD", "1m"): 0, ("BTC-USD", "5m"): 0})
-    m.offer("BTC-USD", "1m", [_pt(0, "1m")], 60_000)
-    m.offer("BTC-USD", "5m", [], None)          # failed read: not caught up
+    m = CloseOrderMerge({"BTC-USD": ["1m", "5m"]},
+                        {("BTC-USD", "1m"): 60_000, ("BTC-USD", "5m"): 300_000})
+    m.offer("BTC-USD", "1m", [_pt(300_000, "1m")], 420_000)       # closes 360 s
+    m.offer("BTC-USD", "5m", [], None)                            # failed read
     assert m.release() == []
-    m.offer("BTC-USD", "5m", [], 0)             # complete read, no new window yet
-    assert m.release() == []
-    m.offer("BTC-USD", "5m", [], 300_000)
-    assert [p.timestamp for p in m.release()] == [0]
+    m.offer("BTC-USD", "5m", [_pt(0, "5m")], 600_000)
+    assert [p.timeframe for p in m.release()] == ["5m", "1m"]
 
 
 def test_merge_symbols_are_independent():
     m = CloseOrderMerge({"A-USD": ["1m"], "B-USD": ["1m", "5m"]},
-                        {("A-USD", "1m"): 0, ("B-USD", "1m"): 0, ("B-USD", "5m"): 0})
-    a = OHLCPoint(symbol="A-USD", timestamp=0, open=1, high=1, low=1, close=1,
-                  timeframe="1m", asset_class="crypto")
-    m.offer("A-USD", "1m", [a], 60_000)
-    m.offer("B-USD", "1m", [_pt(0, "1m")], 60_000)   # B held by its 5m rung
+                        {("A-USD", "1m"): 360_000, ("B-USD", "1m"): 360_000,
+                         ("B-USD", "5m"): 300_000})
+    a = _pt(300_000, "1m", "A-USD")
+    m.offer("A-USD", "1m", [a], 420_000)
+    # B's 5m window closing at 300 s is unread, so B's 1m bar closing at 360 s waits.
+    m.offer("B-USD", "1m", [_pt(300_000, "1m", "B-USD")], 420_000)
     assert m.release() == [a]
 
 
@@ -403,13 +428,12 @@ async def test_start_live_emits_in_close_time_order_across_rungs(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    closes = [(p.timestamp + _TF_MS[p.timeframe], _TF_MS[p.timeframe]) for p in got]
-    assert closes == sorted(closes)                    # close order, shorter first on ties
-    assert len(closes) == len(set(closes))             # nothing emitted twice
-    # The 5m window closing after T0-240 is not complete, so nothing closing
-    # after its start may be released yet; everything up to it is.
-    cutoff = (T0 - 240) * 1000
-    assert max(c for c, _ in closes) == cutoff
+    keys = [(p.timestamp + _TF_MS[p.timeframe], _TF_MS[p.timeframe]) for p in got]
+    assert keys == sorted(keys)                        # close order, shorter first on ties
+    assert len(keys) == len(set(keys))                 # nothing emitted twice
+    # Everything that closed by T0 is complete and released: the 5m window
+    # still forming closes after T0, so nothing waits on it.
+    cutoff = T0 * 1000
     expected = {(t + _TF_MS[tf], _TF_MS[tf]) for tf in ("1m", "3m", "5m")
                 for t in range(s, cutoff, _TF_MS[tf]) if t + _TF_MS[tf] <= cutoff}
-    assert set(closes) == expected
+    assert set(keys) == expected
