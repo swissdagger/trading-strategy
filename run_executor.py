@@ -64,7 +64,7 @@ from execution.persistence import (
 )
 from execution.shadow_book import ShadowBook
 from execution.sizing import make_size_position
-from ops.alerts import alert, install_alerting, start_heartbeat
+from ops.alerts import AlertDigest, alert, install_alerting, start_heartbeat
 from ops.summary import daily_summary_loop, kill_switch_monitor
 
 logging.basicConfig(
@@ -216,9 +216,13 @@ async def main() -> None:
     async def _fee_bps():
         fn = getattr(current["adapter"], "get_taker_fee_bps", None)
         return await fn() if fn is not None else None
+    # Shadow opens are routine one at a time: they go to Slack batched, one
+    # message per SHADOW_DIGEST_INTERVAL_S listing every open in it.
+    shadow_digest = AlertDigest("SHADOW trades opened", "shadow-digest")
     shadow = ShadowBook(make_shadow_hooks(pool, _get_touch),
                         taker_fee_bps=config.SHADOW_TAKER_FEE_BPS, fee_bps_fn=_fee_bps,
-                        fee_bps_by_class=getattr(config, "SHADOW_FEE_BPS_BY_CLASS", {}))
+                        fee_bps_by_class=getattr(config, "SHADOW_FEE_BPS_BY_CLASS", {}),
+                        opened_digest=shadow_digest)
     await shadow.start()
 
     executor = SignalExecutor(
@@ -269,6 +273,8 @@ async def main() -> None:
         executor.run_escalation_loop(), name="escalation-loop")
     ops_tasks = [
         asyncio.create_task(kill_switch_monitor(pool), name="kill-switch-monitor"),
+        asyncio.create_task(shadow_digest.run(
+            float(os.getenv("SHADOW_DIGEST_INTERVAL_S", "900"))), name="shadow-digest"),
         asyncio.create_task(daily_summary_loop(
             pool, int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "7")),
             lambda: mode.mode().value), name="daily-summary"),

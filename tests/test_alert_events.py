@@ -141,3 +141,26 @@ async def test_daily_summary_reports_real_and_shadow_trades(pool):
         await pool.execute("DELETE FROM shadow_trades WHERE position_key = $1", pk)
     assert "trade mode *paper*" in text and "kill switch off" in text
     assert "rule3_v1: 1 trade(s), mean -140.0" in text
+
+
+@pytest.mark.asyncio
+async def test_shadow_opens_batch_into_one_message(caplog):
+    from decimal import Decimal
+    from execution.shadow_book import ShadowBook
+    from ops.alerts import AlertDigest
+    from test_executor_hardening import MemShadowStore
+
+    caplog.set_level(logging.INFO)
+    digest = AlertDigest("SHADOW trades opened", "shadow-digest")
+    book = ShadowBook(MemShadowStore().hooks(), taker_fee_bps=Decimal("120"),
+                      opened_digest=digest)
+    await book.start()
+    ex, _ = await booted(shadow_book=book)
+    await ex.handle_signal(enter_row(chain="c1", direction="SHORT"))
+    await ex.handle_signal(enter_row(chain="c2", direction="SHORT", symbol="MSFT"))
+    assert not _alerts(caplog)                            # nothing per open
+    assert digest.flush() == 2
+    (key, msg), = _alerts(caplog)
+    assert key.startswith("shadow-digest:")
+    assert msg.startswith("SHADOW trades opened (2):") and "AAPL" in msg and "MSFT" in msg
+    assert digest.flush() == 0 and len(_alerts(caplog)) == 1   # empty interval: no post

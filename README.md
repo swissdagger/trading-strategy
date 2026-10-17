@@ -231,7 +231,7 @@ risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
 - **HALTs** are logged at ERROR and stay visible in `trades` (`state = 'HALTED'`,
   `halt_reason`); a refused boot is logged and retried every few minutes.
 - **Alerts** go to Slack (`SLACK_WEBHOOK_URL`, `ops/alerts.py`): every trade
-  opened (paper, live or shadow), HALTs, boot failures and crashes, stuck
+  opened (paper or live one by one; shadow batched every 15 min), HALTs, boot failures and crashes, stuck
   signals, kill-switch and trade-mode changes, pipeline stalls, and a daily
   summary. Each process also pings a dead-man's switch (`HEARTBEAT_URL_*`) while
   healthy, so a dead or wedged process alerts by going quiet. RUNBOOK §5.

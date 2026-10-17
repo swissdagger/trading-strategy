@@ -98,7 +98,8 @@ def _ms_to_dt(ms: int) -> datetime:
 class ShadowBook:
     def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal,
                  fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None,
-                 fee_bps_by_class: Optional[dict] = None):
+                 fee_bps_by_class: Optional[dict] = None,
+                 opened_digest=None):
         """taker_fee_bps: the fallback fee per leg. fee_bps_fn: optional async
         source of the account's real taker fee (the venue's fee tier); when it
         returns a value, that is what a new virtual entry is charged."""
@@ -109,6 +110,9 @@ class ShadowBook:
         # not trade, its fee tier is meaningless (an equity CFD's cost is the
         # half-spread, not Coinbase's taker fee).
         self.fee_bps_by_class = {k: Decimal(str(v)) for k, v in (fee_bps_by_class or {}).items()}
+        # Where "shadow trade opened" alerts collect for a batched Slack post
+        # (ops.alerts.AlertDigest); None alerts once per open.
+        self.opened_digest = opened_digest
         self._open: Dict[Tuple[str, str], ShadowPosition] = {}
 
     async def _fee_bps(self, asset_class: Optional[str] = None) -> Decimal:
@@ -190,10 +194,15 @@ class ShadowBook:
             log.info("shadow ENTER %s/%s already recorded", strategy, position_key)
         self._open[(strategy, position_key)] = pos
         if inserted:
-            log.info("SHADOW trade OPENED: %s %s %s @ %s (%s; fee %s bps/leg; strategy %s, "
-                     "position %s)", side.value, pos.symbol, pos.asset_class, px, source,
-                     fee_bps, strategy, position_key,
-                     extra=alert(f"shadow-open:{strategy}:{position_key}", every=0))
+            line = (f"{side.value} {pos.symbol} {pos.asset_class} @ {px} ({source}; fee "
+                    f"{fee_bps} bps/leg; strategy {strategy}, position {position_key})")
+            if self.opened_digest is not None:
+                # Batched: one Slack message per interval lists every open.
+                self.opened_digest.add(line)
+                log.info("SHADOW trade OPENED: %s", line)
+            else:
+                log.info("SHADOW trade OPENED: %s", line,
+                         extra=alert(f"shadow-open:{strategy}:{position_key}", every=0))
         else:
             log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
                      pos.symbol, px, source)

@@ -158,6 +158,37 @@ def install_alerting(source: str) -> Optional[SlackAlertHandler]:
     return handler
 
 
+class AlertDigest:
+    """Collects lines and posts them as ONE alert per interval — for events
+    that are routine one at a time but worth seeing together (shadow trades
+    opening). Nothing is posted for an empty interval."""
+
+    def __init__(self, title: str, key: str):
+        self._title = title
+        self._key = key
+        self._lines: list = []
+
+    def add(self, line: str) -> None:
+        self._lines.append(line)
+
+    def flush(self) -> int:
+        """Post what has collected (if anything); return how many lines."""
+        lines, self._lines = self._lines, []
+        if lines:
+            log.info("%s (%d):\n%s", self._title, len(lines),
+                     "\n".join(f"• {l}" for l in lines),
+                     extra=alert(f"{self._key}:{time.time():.0f}", every=0))
+        return len(lines)
+
+    async def run(self, interval_s: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                self.flush()
+        finally:
+            self.flush()   # cancelled at shutdown: post the remainder
+
+
 async def heartbeat_loop(url: str, interval_s: float, healthy: Callable[[], bool],
                          *, client: Optional[httpx.AsyncClient] = None) -> None:
     """Ping `url` every interval_s while healthy() is true. Runs on the event

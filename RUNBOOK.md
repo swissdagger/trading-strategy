@@ -236,7 +236,7 @@ blocks trading; repeats of the same condition are limited to one per 10 min.
 | Process | Alert | When |
 |---|---|---|
 | executor | `PAPER`/`LIVE trade OPENED` | a real entry's first fill (side, symbol, class, qty, avg price, strategy) |
-| executor | `SHADOW trade OPENED` | a shadow position opens (side, symbol, price and its source, fee, strategy) |
+| executor | `SHADOW trades opened (n)` | one message per `SHADOW_DIGEST_INTERVAL_S` (default 15 min) listing every shadow position opened in it (side, symbol, price and its source, fee, strategy); nothing for an empty interval |
 | executor | `HALTED` | a trade needs a human (§6.2) |
 | executor | `cannot start` / `executor failed` | boot refused, or a crash (§6.3) |
 | executor | `STUCK` | a signal has failed 10 times; still retried, cursor held at it |
