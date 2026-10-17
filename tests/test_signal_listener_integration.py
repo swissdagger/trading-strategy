@@ -70,7 +70,7 @@ async def _insert(pool, row) -> bool:
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
     # Clean slate for each test.
-    await p.execute("TRUNCATE trade_signals")
+    await p.execute("TRUNCATE trade_signals CASCADE")
     yield p
     await p.close()
 

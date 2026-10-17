@@ -219,7 +219,7 @@ async def test_paper_round_trip_through_real_persistence_and_review_queries(pape
     chain_id = str(uuid.uuid4())
     await pool.execute(
         """INSERT INTO chains (chain_id, symbol, asset_class, direction, origin_time,
-                               active_timeframes) VALUES ($1, 'BTC-USD', 'crypto', 1, now(), '{1m}')""",
+                               active_timeframes, ladder) VALUES ($1, 'BTC-USD', 'crypto', 1, now(), '{1m}', 'FC')""",
         chain_id)
 
     market = FakeMarket()
