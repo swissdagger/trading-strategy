@@ -332,8 +332,9 @@ unroutable by design.
   hydrates its buffers to where the last run got; Kafka replays the rest and
   machines drop any bar not newer than their buffer. A new consumer group reads
   the topic from the earliest offset. The feed resumes from the newest stored
-  bar (or warmup's cursor, if newer). The store grows by every live bar
-  (~15k rows/day for the crypto universe).
+  bar (or warmup's cursor, if newer). The signal process prunes the store
+  hourly to the newest `BAR_STORE_KEEP_PER_STREAM` (6000) rows per (symbol,
+  timeframe); a machine only ever reads the newest 5000.
 - **State-machine sync.** The chain machine is copied from CausaView's
   `service_2_sumtyme_bridge.process_forecast`, not shared as a library (ADR-001
   debt D9). The INIT condition, the one-rung-at-a-time PROPAGATE loop and both

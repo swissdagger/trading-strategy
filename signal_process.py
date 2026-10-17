@@ -68,6 +68,7 @@ from producer.persistence import (
     make_persist_chain_init,
     make_load_buffers,
     make_persist_live_bar,
+    make_prune_bar_store,
     make_load_last_base_signal,
     make_load_strategy_open_entries,
     make_load_opposing_chain_since,
@@ -308,6 +309,7 @@ class SignalProcess:
         self.audit_cache = AuditCache()
         self.metrics = Metrics()
         self._audit_task: Optional[asyncio.Task] = None
+        self._prune_task: Optional[asyncio.Task] = None
         self._health_server: Optional[HealthServer] = None
 
         # --- Batched audit writer: research/audit writes OFF the hot path ---
@@ -485,6 +487,11 @@ class SignalProcess:
         # just the process. Threaded (stdlib http.server on a daemon thread), NOT
         # async: a wedged event loop is precisely the failure this must report, so
         # the server must not share it.
+        from config import BAR_STORE_KEEP_PER_STREAM, BAR_STORE_PRUNE_INTERVAL_S
+        self._prune_task = asyncio.create_task(
+            self._prune_loop(make_prune_bar_store(self.pool, BAR_STORE_KEEP_PER_STREAM),
+                             BAR_STORE_PRUNE_INTERVAL_S),
+            name="bar-store-prune")
         self._audit_task = asyncio.create_task(
             make_chain_audit_refresher(
                 self.pool, self.audit_cache,
@@ -589,6 +596,18 @@ class SignalProcess:
                 watermarks=self.watermarks,
             )
         return factory
+
+    async def _prune_loop(self, prune, period: float) -> None:
+        """Keep warmup_bars bounded: it gains every live bar (config:
+        BAR_STORE_KEEP_PER_STREAM). First run one period after start, so a
+        restart is not slowed by it."""
+        while not self._stop.is_set():
+            await asyncio.sleep(period)
+            try:
+                deleted = await prune()
+                log.info("bar store pruned: %d row(s) deleted", deleted)
+            except Exception:
+                log.exception("bar store prune failed (retried next period)")
 
     async def _tick_loop(self, comp, period: float) -> None:
         while not self._stop.is_set():
@@ -831,6 +850,8 @@ class SignalProcess:
             self._health_server.stop()
         if self._audit_task is not None:
             self._audit_task.cancel()
+        if self._prune_task is not None:
+            self._prune_task.cancel()
         for t in getattr(self, "_strategy_tickers", []):
             t.cancel()
 

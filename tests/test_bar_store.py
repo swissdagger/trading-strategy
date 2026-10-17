@@ -131,3 +131,30 @@ async def test_restart_hydrates_the_bars_the_last_run_appended(pool):
     assert [t["timestamp"] for t in second._buffers["1m"]] == [i * M for i in range(15)]
     assert second._buffers["1m"][-1]["close"] == 100.0
     assert (await read_bar_store_cursors(pool))[SYM]["1m"] == 14 * M
+
+
+@pytest.mark.skipif(not DSN, reason="QISS_TEST_DSN not set; needs real Postgres")
+@pytest.mark.asyncio
+async def test_prune_keeps_each_streams_newest_rows_only(pool):
+    from producer.persistence import (make_load_buffers, make_persist_warmup_bars,
+                                      make_prune_bar_store)
+    seed = make_persist_warmup_bars(pool)
+    await seed(SYM, "crypto", "1m", [bar(i * M) for i in range(WINDOW_SIZE + 300)])
+    await seed(SYM, "crypto", "3m", [bar(i * 3 * M, "3m") for i in range(40)])   # short: untouched
+    deleted = await make_prune_bar_store(pool, WINDOW_SIZE + 100)()
+    assert deleted == 200
+    counts = {r["timeframe"]: (r["n"], r["lo"]) for r in await pool.fetch(
+        "SELECT timeframe, count(*) AS n, min(timestamp_ms) AS lo FROM warmup_bars "
+        "WHERE symbol = $1 GROUP BY timeframe", SYM)}
+    assert counts["1m"] == (WINDOW_SIZE + 100, 200 * M)       # the newest rows kept
+    assert counts["3m"][0] == 40
+    # A restart still hydrates a full window.
+    m = _machine([], load_buffers=make_load_buffers(pool, SYM, LADDER))
+    await m.hydrate()
+    assert len(m._buffers["1m"]) == WINDOW_SIZE
+
+
+def test_prune_refuses_to_keep_less_than_a_window():
+    from producer.persistence import make_prune_bar_store
+    with pytest.raises(ValueError):
+        make_prune_bar_store(None, WINDOW_SIZE - 1)

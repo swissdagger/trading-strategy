@@ -228,6 +228,17 @@ VENUE_ENDPOINTS = {
 }
 
 # ---------------------------------------------------------------------------
+# Bar store (warmup_bars). Warmup seeds it and the signal process appends every
+# bar it applies, so a restart hydrates to where the last run got. A machine
+# only ever reads the newest WINDOW_SIZE (5000) rows per (symbol, timeframe),
+# so the signal process prunes each stream to its newest
+# BAR_STORE_KEEP_PER_STREAM rows every BAR_STORE_PRUNE_INTERVAL_S. The margin
+# above 5000 is headroom, not a requirement.
+# ---------------------------------------------------------------------------
+BAR_STORE_KEEP_PER_STREAM = 6000
+BAR_STORE_PRUNE_INTERVAL_S = 3600
+
+# ---------------------------------------------------------------------------
 # Executor risk and safety settings (ADR-001 Phase 3). Read by run_executor.py
 # and injected into the executor; execution/ never imports config directly.
 # ---------------------------------------------------------------------------

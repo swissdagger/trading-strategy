@@ -664,6 +664,43 @@ def make_persist_live_bar(pool):
     return persist_live_bar
 
 
+def make_prune_bar_store(pool, keep: int):
+    """Delete all but the newest `keep` rows of every (symbol, timeframe) in
+    warmup_bars. Returns the number of rows deleted. `keep` must cover
+    WINDOW_SIZE: make_load_buffers reads the newest WINDOW_SIZE rows, and
+    nothing reads older ones.
+
+    One statement: per stream, the (keep+1)-th newest timestamp is found down
+    the (symbol, timeframe, timestamp_ms DESC) index, and every row at or
+    before it goes. A stream with `keep` rows or fewer is untouched."""
+    from producer.service2_machine import WINDOW_SIZE
+    if keep < WINDOW_SIZE:
+        raise ValueError(f"keep={keep} is below WINDOW_SIZE={WINDOW_SIZE}: a restart "
+                         f"would hydrate short buffers")
+
+    async def prune_bar_store() -> int:
+        async with pool.acquire() as conn:
+            status = await conn.execute(
+                """
+                DELETE FROM warmup_bars w
+                 USING (
+                    SELECT s.symbol, s.timeframe, c.ts
+                      FROM (SELECT DISTINCT symbol, timeframe FROM warmup_bars) s
+                      CROSS JOIN LATERAL (
+                          SELECT b.timestamp_ms AS ts
+                            FROM warmup_bars b
+                           WHERE b.symbol = s.symbol AND b.timeframe = s.timeframe
+                           ORDER BY b.timestamp_ms DESC
+                          OFFSET $1 LIMIT 1
+                      ) c
+                 ) cut
+                 WHERE w.symbol = cut.symbol AND w.timeframe = cut.timeframe
+                   AND w.timestamp_ms <= cut.ts
+                """, keep)
+        return int(status.split()[-1])   # "DELETE <n>"
+    return prune_bar_store
+
+
 async def read_bar_store_cursors(pool) -> dict:
     """The newest stored bar per (symbol, timeframe), as
     cursors[symbol][timeframe] = epoch ms — the feed's resume point: everything
