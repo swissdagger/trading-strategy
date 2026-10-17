@@ -71,6 +71,7 @@ from producer.persistence import (
     make_load_last_base_signal,
     make_load_strategy_open_entries,
     make_load_opposing_chain_since,
+    make_load_chain_confirmed,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -412,8 +413,17 @@ class SignalProcess:
             _closes_source(asset_class)
             return self._vol_providers[asset_class]
 
+        # The price a rule records for a clock-driven intent: the newest close
+        # in the bar stream (fed from the consume loop), falling back to the
+        # vol source's cache before the first bar for a symbol arrives.
+        from strategy.vol_source import LiveCloses
+        self._live_closes: dict = {}
+
         def _latest_close_for(asset_class: str):
-            return _closes_source(asset_class).latest_close
+            if asset_class not in self._live_closes:
+                self._live_closes[asset_class] = LiveCloses(
+                    fallback=_closes_source(asset_class).latest_close)
+            return self._live_closes[asset_class].latest_close
 
         chain_rule_factory = lambda *, name, symbols, ladders, params: make_chain_rule(
             name=name, symbols=symbols, ladders=ladders, params=params,
@@ -421,6 +431,7 @@ class SignalProcess:
             vol_provider_for=_vol_for, latest_close_for=_latest_close_for,
             load_open=make_load_strategy_open_entries(self.pool, name),
             load_opposing_since=make_load_opposing_chain_since(self.pool),
+            load_confirmed=make_load_chain_confirmed(self.pool),
         )
         for key in ("rule1_v1", "rule1_new_literal_v1", "rule3_v1",
                     "rule3_new_literal_v1", "rule3_new_equiv_v1"):
@@ -739,6 +750,9 @@ class SignalProcess:
                     continue
 
                 self._observe_lag(bar)
+                closes = self._live_closes.get(bar.asset_class)
+                if closes is not None:
+                    closes.observe(bar)
                 # Hand off. This AWAITS only if the symbol's queue is full
                 # (backpressure); otherwise it returns immediately and the loop
                 # goes straight back to Kafka. That is the whole speedup.

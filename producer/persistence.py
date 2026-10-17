@@ -477,16 +477,37 @@ def make_load_strategy_open_entries(pool, strategy: str):
 
 def make_load_opposing_chain_since(pool):
     """Restart reconcile for the chain rules: did a chain in `direction` on
-    `symbol` (any ladder — an opposing P1 is an opposing P1) initiate after
-    `since`? The package's load_open_trades asks the same of `chains`."""
-    async def load(symbol: str, direction: int, since) -> bool:
+    `symbol` initiate on the rule's own `ladder` after `since`? The live rule
+    exits only on an opposing initiation on its ladder, and its clock is when
+    an event REACHED the process — so this compares the initiation step's
+    recorded_at (wall time), not the chain's market-time origin."""
+    async def load(symbol: str, direction: int, since, ladder: str) -> bool:
         async with pool.acquire() as conn:
             return bool(await conn.fetchval(
                 """
-                SELECT 1 FROM chains
-                WHERE symbol = $1 AND direction = $2 AND origin_time > $3
+                SELECT 1 FROM chains c
+                JOIN chain_steps s ON s.chain_id = c.chain_id AND s.step_index = 0
+                WHERE c.symbol = $1 AND c.direction = $2 AND c.ladder = $4
+                  AND s.recorded_at > $3
                 LIMIT 1
-                """, symbol, int(direction), since))
+                """, symbol, int(direction), since, ladder))
+    return load
+
+
+def make_load_chain_confirmed(pool):
+    """Restart reconcile for the chain rules: did `chain_id` reach `level`
+    by wall time `by` (entry + stall window)? A trade restored from
+    trade_signals has lost its in-memory `confirmed` flag; without this, a
+    trade that confirmed before a restart inside its stall window was
+    stalled out."""
+    async def load(chain_id: str, level: int, by) -> bool:
+        async with pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """
+                SELECT 1 FROM chain_steps
+                WHERE chain_id = $1 AND level >= $2 AND recorded_at <= $3
+                LIMIT 1
+                """, chain_id, int(level), by))
     return load
 
 

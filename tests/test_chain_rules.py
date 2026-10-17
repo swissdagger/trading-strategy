@@ -84,7 +84,8 @@ def registry():
 
 
 def build(name="rule1_v1", rule="RULE1_EQUITY", ladder="ED", *, states=None, now=IN_SESSION,
-          params=None, load_open=None, load_opposing=None, closes=None, symbols=("NVDA", "XOM", "SPCX")):
+          params=None, load_open=None, load_opposing=None, load_confirmed=None, closes=None,
+          symbols=("NVDA", "XOM", "SPCX")):
     writer = FakeWriter()
     vol = FakeVol(states if states is not None else {s: VolState(1.0, 0.5, 0.9) for s in symbols})
     clock = Clock(now)
@@ -93,7 +94,8 @@ def build(name="rule1_v1", rule="RULE1_EQUITY", ladder="ED", *, states=None, now
     strat = make_chain_rule(name=name, symbols=list(symbols), ladders=[ladder], params=p,
                             view_registry=registry(), writer_factory=lambda n: writer,
                             vol_provider_for=lambda ac: vol, latest_close_for=lambda ac: closes.get,
-                            load_open=load_open, load_opposing_since=load_opposing, clock=clock)
+                            load_open=load_open, load_opposing_since=load_opposing,
+                            load_confirmed=load_confirmed, clock=clock)
     return strat, writer, vol, clock
 
 
@@ -260,13 +262,14 @@ async def test_restart_restores_open_trade_and_reconciles_against_chains():
                  "position_key": "c2:S"}]
     asked = []
 
-    async def opposing(symbol, direction, since):
-        asked.append((symbol, direction, since))
+    async def opposing(symbol, direction, since, ladder):
+        asked.append((symbol, direction, since, ladder))
         return symbol == "XOM"                                # an opposing chain started while down
 
     strat, writer, _, clock = build(load_open=load_open, load_opposing=opposing)
     await strat.entry.start()
-    assert sorted(asked) == [("NVDA", -1, opened), ("XOM", 1, opened)]
+    # On the rule's own ladder only: the live rule never sees another ladder's chains.
+    assert sorted(asked) == [("NVDA", -1, opened, "ED"), ("XOM", 1, opened, "ED")]
     assert strat.entry.rule.trades["c1"].state == "open" and strat.entry.rule.trades["c1"].confirmed
     # The reconciled one was marked and, in session, drained at once.
     assert [(k, kw["chain_id"], kw["reason"]) for k, kw in writer.rows] == [("EXIT", "c2", ExitReason.STOP)]
@@ -278,7 +281,8 @@ async def test_restart_restores_open_trade_and_reconciles_against_chains():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_rule3_filters_and_stall():
+async def test_rule3_filters_and_stall(caplog):
+    caplog.set_level("INFO", logger="strategy.chain_rules")
     states = {
         "BTC-USD": VolState(ratio=0.9, level=0.5, short=0.8),     # accept
         "ETH-USD": VolState(ratio=0.71, level=0.5, short=0.8),    # ratio <= 0.71: skip
@@ -294,7 +298,9 @@ async def test_rule3_filters_and_stall():
                                       asset_class="crypto", ladder="FC"))
     opened = sorted(kw["symbol"] for k, kw in writer.rows if k == "ENTER")
     assert opened == ["BTC-USD", "XRP-USD"]                     # 03:00 UTC Saturday: 24/7
-    assert any("squeeze-release" in m for m in strat.entry.rule.log)
+    # Skip reasons reach the log (Rule.log is drained, not left to grow).
+    assert any("squeeze-release" in r.getMessage() for r in caplog.records)
+    assert strat.entry.rule.log == []
     clock.now += timedelta(minutes=31)
     await strat.entry.tick()
     exits = [(kw["symbol"], kw["reason"]) for k, kw in writer.rows if k == "EXIT"]
@@ -325,3 +331,37 @@ def test_tagged_events_carry_detected_at():
     raw = MultiLadderRouter._tag(None, ce, "ED")
     assert raw["ladder"] == "ED" and raw["detected_at"] is not None
     datetime.fromisoformat(raw["detected_at"])                 # parseable
+
+
+@pytest.mark.asyncio
+async def test_restart_inside_the_stall_window_keeps_a_confirmation_made_before_it():
+    opened = IN_SESSION - timedelta(minutes=20)              # stall window is 60 min
+
+    async def load_open():
+        return [{"chain_id": "c1", "symbol": "NVDA", "direction": "LONG", "created_at": opened,
+                 "position_key": "c1:L"},
+                {"chain_id": "c2", "symbol": "XOM", "direction": "LONG", "created_at": opened,
+                 "position_key": "c2:L"}]
+    asked = []
+
+    async def confirmed(chain_id, level, by):
+        asked.append((chain_id, level, by))
+        return chain_id == "c1"                               # c1 reached L3 before the restart
+
+    strat, writer, _, clock = build(load_open=load_open, load_confirmed=confirmed)
+    await strat.entry.start()
+    assert sorted(asked) == [("c1", 3, opened + timedelta(minutes=60)),
+                             ("c2", 3, opened + timedelta(minutes=60))]
+    clock.now = opened + timedelta(minutes=61)
+    await strat.entry.tick()
+    # Only the unconfirmed one stalls out.
+    assert [(k, kw["chain_id"], kw["reason"]) for k, kw in writer.rows] == [
+        ("EXIT", "c2", ExitReason.TIME)]
+
+
+@pytest.mark.asyncio
+async def test_start_warms_vol_for_every_symbol_in_the_background():
+    strat, _, vol, clock = build()
+    await strat.entry.start()
+    await strat.entry._warm_task
+    assert sorted(sym for sym, _ in vol.prefetched) == ["NVDA", "SPCX", "XOM"]
