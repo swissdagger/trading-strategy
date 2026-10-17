@@ -96,6 +96,16 @@ def _tf_seconds(timeframe: str) -> Optional[int]:
         return None
 
 
+def _forecast_ts_ms(bar: OHLCPoint) -> int:
+    """Epoch ms of the bar a forecast on `bar` predicts: bar.timestamp (window
+    start) + one timeframe — the same instant service2_utils computes as
+    placeholder_dt."""
+    secs = _tf_seconds(bar.timeframe)
+    if secs is None:
+        raise ValueError(f"cannot parse timeframe {bar.timeframe!r}")
+    return bar.timestamp + secs * 1000
+
+
 def _epoch_ms_to_iso(ms: int) -> str:
     """OHLCPoint.timestamp is epoch milliseconds (int); the state machine compares
     timestamps with >= and parses them with datetime.fromisoformat, so the signal
@@ -688,7 +698,14 @@ class ServiceTwoChainMachine(ChainMachine):
         idx = pending.idx
         signal_value = list(pending.forecast.values())[0]
         current_price = bar.close
-        bar_iso = _epoch_ms_to_iso(bar.timestamp)
+        # The signal's time is the bar it FORECASTS (its window end, the same
+        # placeholder_dt the signal is persisted against), not the window start
+        # of the bar it was computed from. The sweep compares these across
+        # rungs, so two signals forecasting the same moment must compare
+        # equal: a 1h bar at 11:00 and a 30m bar at 11:30 both forecast 12:00,
+        # and the 1h one may extend a chain whose top rung is that 30m signal.
+        # Window starts would order the 1h signal an hour earlier and refuse.
+        bar_iso = _epoch_ms_to_iso(_forecast_ts_ms(bar))
 
         # Success path is observable at DEBUG: a healthy pipeline emits a steady
         # stream of these; sudden silence (with bars still arriving) localises a

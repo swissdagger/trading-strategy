@@ -149,7 +149,7 @@ consumer.
 | `direction`, `symbol`, `asset_class` | symbol is the Coinbase product id (`BTC-USD`) |
 | `trigger_level`, `decision_price` | the level and price the strategy saw |
 | `exit_reason` | `STOP` \| `TARGET` (\| `SCALE` \| `TERMINAL`) on EXIT, NULL on ENTER |
-| `decided_at` | the deciding bar's timestamp (market time, window start) |
+| `decided_at` | the time the deciding signal forecasts: its bar's window END (market time) |
 | `created_at` | when the row was written (wall time) |
 
 **Idempotency.** `signal_id` hashes `(strategy, position_key, action, discriminator)`,

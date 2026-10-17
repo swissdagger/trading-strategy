@@ -250,6 +250,8 @@ async def pool():
     import asyncpg
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=2, statement_cache_size=0)
     await p.execute("TRUNCATE research_quotes, research_bars_1m, research_earnings, research_cursor")
+    # Other integration tests leave trade_signals rows; this test counts them.
+    await p.execute("TRUNCATE trade_signals CASCADE")
     yield p
     await p.close()
 

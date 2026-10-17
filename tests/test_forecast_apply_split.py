@@ -228,7 +228,7 @@ async def test_skipped_bar_retires_offset_and_does_not_touch_cache():
     ok = [b for b in bars if b.timestamp % 120_000 != 0]
     failed = [b for b in bars if b.timestamp % 120_000 == 0]
     assert ok and failed
-    assert m._latest_signals[0]["timestamp"] == _epoch_ms_to_iso(ok[-1].timestamp)
+    assert m._latest_signals[0]["timestamp"] == _epoch_ms_to_iso(ok[-1].timestamp + 60_000)
     assert [t["timestamp"] for t in m._buffers["1m"]][-4:] == [b.timestamp for b in bars]
 
 
