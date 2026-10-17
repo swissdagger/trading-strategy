@@ -14,8 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install Python deps first (layer caching: deps change less often than code).
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# From the hashed lock (scripts/lock.sh), so every dependency, transitive ones
+# included, is the exact version CI tested; a tampered download fails.
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Then the application code.
 COPY . .

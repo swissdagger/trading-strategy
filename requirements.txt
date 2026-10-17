@@ -1,6 +1,8 @@
-# Trading system runtime dependencies. Exact pins so deploys are reproducible;
-# verified together on Python 3.12 (the Dockerfile base) by the CI test run.
-# Bump deliberately, one dependency at a time, with a green suite.
+# Trading system runtime dependencies: the DIRECT ones, exactly pinned. Every
+# dependency (transitive ones too) is pinned with hashes in requirements.lock,
+# which the Dockerfile installs; CI installs requirements-dev.lock. After
+# editing this file run scripts/lock.sh and commit both .lock files (CI fails
+# otherwise). Bump deliberately, one dependency at a time, with a green suite.
 
 # Async Postgres driver — the DB pool and all persistence (signals, chains,
 # trade_signals, trades/orders/fills).

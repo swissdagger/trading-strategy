@@ -264,18 +264,26 @@ then `trade_signals`, then `trades` / `paper_fills` (and `shadow_trades` for
 shorts). Those tables are the pipeline's stage gates — whichever earlier table is
 empty localizes a stall.
 
+**Dependencies.** `requirements.txt` lists the direct dependencies, exactly
+pinned; `requirements.lock` pins every package, transitive ones included, with
+hashes, and is what the image installs (`requirements-dev.lock` adds the test
+tools; CI installs it). After editing either `.txt` file run `scripts/lock.sh`
+(needs [uv](https://docs.astral.sh/uv/)) and commit the `.lock` files; CI fails
+if they are out of date. Local tests:
+`pip install --require-hashes -r requirements-dev.lock && python -m pytest -q`.
+
 ---
 
 ## 9. Verification
 
-Two probes drive synthetic chain events through the **real** gates, writer,
+A probe drives synthetic chain events through the **real** gates, writer,
 insert, NOTIFY and listener — nothing is hand-inserted:
 
 ```bash
 python write_path_probe_fc.py --i-understand-live-listeners   # confirmed_15m
 ```
 
-`pg_notify` fans out to **every** listener, so run them with the executor stopped
+`pg_notify` fans out to **every** listener, so run it with the executor stopped
 or in `off` — hence the required acknowledgement flag. The probe symbols are
 unroutable by design.
 

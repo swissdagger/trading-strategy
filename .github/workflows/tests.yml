@@ -32,10 +32,16 @@ jobs:
         with:
           python-version: "3.12"   # matches the Dockerfile base image
           cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-      - run: pip install -r requirements-dev.txt
+          cache-dependency-path: requirements-dev.lock
+      # The lock files must match requirements*.txt: re-locking (keeping the
+      # existing pins) must change nothing. Fails when a .txt edit was not
+      # followed by scripts/lock.sh.
+      - name: Lock files up to date
+        run: |
+          pip install uv==0.11.32
+          scripts/lock.sh
+          git diff --exit-code -- requirements.lock requirements-dev.lock
+      - run: pip install --require-hashes -r requirements-dev.lock
       - name: Apply migrations
         run: |
           # Supabase roles referenced by 003_lockdown_rls.sql.
