@@ -1,5 +1,5 @@
 """
-Tests for execution/sizing.py — the 5%-of-equity position-sizing policy.
+Tests for execution/sizing.py — the 10%-of-available-equity position-sizing policy.
 
 Uses a fake adapter exposing only the three reads sizing depends on
 (get_account_equity, get_touch, get_step_size), so the policy's arithmetic and
@@ -73,12 +73,12 @@ def touch(bid, ask):
 # --------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_five_percent_notional_is_exact():
-    # $100k equity, mid 60001 -> 5% = $5000 notional / 60001 ≈ 0.083331...
+async def test_ten_percent_notional_is_exact():
+    # $100k equity, mid 60001 -> 10% = $10000 notional / 60001 ≈ 0.166663...
     a = FakeAdapter(equity=eq(100_000), touch=touch(60_000, 60_002), step=None)
     qty = await _sizer(a)("BTCUSDT", "crypto", TradeSide.LONG, None)
-    # Notional reconciles to exactly 5% of equity (un-floored path).
-    assert qty * Decimal("60001") == Decimal("5000")
+    # Notional reconciles to exactly 10% of equity (un-floored path).
+    assert qty * Decimal("60001") == Decimal("10000")
     assert qty == (EQUITY_FRACTION * Decimal("100000")) / Decimal("60001")
 
 
@@ -103,18 +103,18 @@ async def test_custom_equity_fraction():
 
 @pytest.mark.asyncio
 async def test_floors_to_step_size():
-    # 0.083331... floored to a 0.001 step -> 0.083.
+    # 0.166663... floored to a 0.001 step -> 0.166.
     a = FakeAdapter(equity=eq(100_000), touch=touch(60_000, 60_002), step=Decimal("0.001"))
     qty = await _sizer(a)("BTCUSDT", "crypto", TradeSide.LONG, None)
-    assert qty == Decimal("0.083")
+    assert qty == Decimal("0.166")
 
 
 @pytest.mark.asyncio
 async def test_whole_share_step():
-    # ~$220 stock, 5% of 100k = $5000 / 220 = 22.7 -> floored to 22 whole shares.
+    # ~$220 stock, 10% of 100k = $10000 / 220 = 45.4 -> floored to 45 whole shares.
     a = FakeAdapter(equity=eq(100_000), touch=touch(219.98, 220.02), step=Decimal("1"))
     qty = await _sizer(a)("AAPL", "equity", TradeSide.LONG, None)
-    assert qty == Decimal("22")
+    assert qty == Decimal("45")
 
 
 @pytest.mark.asyncio
@@ -165,8 +165,8 @@ async def test_zero_equity_is_no_order():
 
 @pytest.mark.asyncio
 async def test_sub_step_quantity_is_no_order():
-    # Equity so small that 5% buys less than one step: $100 * 5% = $5 /
-    # 60001 = 0.0000833, floored to a 0.001 step -> 0 -> no order (rather than
+    # Equity so small that 10% buys less than one step: $100 * 10% = $10 /
+    # 60001 = 0.000167, floored to a 0.001 step -> 0 -> no order (rather than
     # sending a sub-minimum qty the venue would reject).
     a = FakeAdapter(equity=eq(100), touch=touch(60_000, 60_002), step=Decimal("0.001"))
     qty = await _sizer(a)("BTCUSDT", "crypto", TradeSide.LONG, None)
@@ -207,8 +207,8 @@ async def test_follows_adapter_swap():
     current = {"adapter": FakeAdapter(equity=eq(100_000), touch=touch(100, 100), step=None)}
     size = make_size_position(lambda: current["adapter"])
     first = await size("X", "crypto", TradeSide.LONG, None)
-    assert first == Decimal("5000") / Decimal("100")
+    assert first == Decimal("10000") / Decimal("100")
     # Swap to a different account; same hook must now size off the new equity.
     current["adapter"] = FakeAdapter(equity=eq(200_000), touch=touch(100, 100), step=None)
     second = await size("X", "crypto", TradeSide.LONG, None)
-    assert second == Decimal("10000") / Decimal("100")
+    assert second == Decimal("20000") / Decimal("100")

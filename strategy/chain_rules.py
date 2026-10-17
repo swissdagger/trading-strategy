@@ -39,13 +39,18 @@ The adapter, and only this:
      decided_at: the event timestamp (the deciding bar's open label), or now;
      decided_bar_close: that bar's close for an event-driven intent, else None.
 
-  5. ACKS. These strategies are shadow-only (config.SHADOW_ONLY_STRATEGIES
-     and the executor's class gate): the shadow book fills at decision_price
-     immediately, so a successful write is confirm_open/confirm_close(now)
-     and a failed write is reject(), which the rule retries on its next
-     drain. The package's PaperBroker (fill at the NEXT 1m price minus a
-     half-spread) is not replicated; the real spread at each signal is in
-     research_quotes and the review query applies it (docs/rule_review.sql).
+  5. ACKS. A successful write is confirm_open/confirm_close(now) and a
+     failed write is reject(), which the rule retries on its next drain: the
+     rule's state follows its SIGNALS. For a shadow rule that is exact (the
+     shadow book fills at decision_price). For a TRADED rule
+     (config.TRADED_STRATEGIES, e.g. rule3_v1) the executor may not fill an
+     ENTER (stale, kill switch, position cap, an unfilled limit; a SHORT goes
+     to the shadow book on spot); the rule still tracks it, and its later
+     EXIT finds no position and is logged as a reconciliation gap. Judge a
+     traded rule's results from `trades`, not from its signals. The
+     package's PaperBroker (fill at the NEXT 1m price minus a half-spread)
+     is not replicated; the real spread at each signal is in research_quotes
+     and the review query applies it (docs/rule_review.sql).
 
   6. OWN STATE. The rule keeps all position state; the runtime's open-set
      tracking is bypassed (on_event returns None, exit component is a

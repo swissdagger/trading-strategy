@@ -431,8 +431,10 @@ async def test_short_on_a_venue_strategy_still_fills_at_the_touch():
 
 
 @pytest.mark.asyncio
-async def test_rule_strategy_missing_from_the_set_is_still_shadow_only(caplog):
-    ex, adapter, store = await shadow_executor(shadow_only_strategies=frozenset())
+async def test_only_traded_strategies_reach_the_venue(caplog):
+    # Fail closed: with an allowlist, a strategy not on it is shadowed, even
+    # one the config never named (one ERROR each); a listed one trades.
+    ex, adapter, store = await shadow_executor(traded_strategies=frozenset({"rule3_v1"}))
     with caplog.at_level(logging.ERROR, logger="executor.signal"):
         await ex.handle_signal(enter_row(strategy="rule9_v1", direction="LONG"))
         await ex.handle_signal(enter_row(strategy="rule9_v1", chain="chainY", direction="LONG"))
@@ -440,12 +442,44 @@ async def test_rule_strategy_missing_from_the_set_is_still_shadow_only(caplog):
     assert ("rule9_v1", "chainX:L") in store.rows
     assert sum("rule9_v1" in r.getMessage() for r in caplog.records
                if r.levelno == logging.ERROR) == 1
+    await ex.handle_signal(enter_row(strategy="rule3_v1", chain="chainZ", direction="LONG"))
+    assert len(adapter.submitted) == 1 and ("rule3_v1", "chainZ:L") not in store.rows
 
 
-def test_launcher_refuses_a_config_without_shadow_only_strategies():
+@pytest.mark.asyncio
+async def test_a_listed_shadow_strategy_never_trades_even_if_also_traded():
+    ex, adapter, store = await shadow_executor(
+        traded_strategies=frozenset({"confirmed_15m"}),
+        shadow_only_strategies=frozenset({"confirmed_15m"}))
+    await ex.handle_signal(enter_row(strategy="confirmed_15m", direction="LONG"))
+    assert adapter.submitted == [] and ("confirmed_15m", "chainX:L") in store.rows
+
+
+def test_launcher_requires_a_consistent_traded_allowlist():
     import types
     import run_executor
-    with pytest.raises(RuntimeError):
-        run_executor.shadow_only_strategies(types.SimpleNamespace())
-    assert run_executor.shadow_only_strategies(
-        types.SimpleNamespace(SHADOW_ONLY_STRATEGIES={"rule3_v1"})) == frozenset({"rule3_v1"})
+    ok = types.SimpleNamespace(
+        STRATEGIES={"rule3_v1": {}, "rule1_v1": {}, "confirmed_15m": {}},
+        TRADED_STRATEGIES={"rule3_v1"},
+        SHADOW_ONLY_STRATEGIES={"rule1_v1", "confirmed_15m"},
+        MANUAL_TRADE_STRATEGIES={"rule1_v1": "Trading 212"})
+    assert run_executor.strategy_routing(ok) == (
+        frozenset({"rule3_v1"}), frozenset({"rule1_v1", "confirmed_15m"}),
+        {"rule1_v1": "Trading 212"})
+    for bad in (
+        types.SimpleNamespace(SHADOW_ONLY_STRATEGIES=set()),                 # no allowlist
+        types.SimpleNamespace(**{**vars(ok), "SHADOW_ONLY_STRATEGIES": {"rule3_v1"}}),
+        types.SimpleNamespace(**{**vars(ok), "TRADED_STRATEGIES": {"rule3_v2"}}),
+        types.SimpleNamespace(**{**vars(ok), "MANUAL_TRADE_STRATEGIES": {"rule3_v1": "x"}}),
+    ):
+        with pytest.raises(RuntimeError):
+            run_executor.strategy_routing(bad)
+
+
+def test_shipped_config_trades_only_rule3_v1():
+    import config
+    import run_executor
+    traded, shadow, manual = run_executor.strategy_routing(config)
+    assert traded == frozenset({"rule3_v1"})
+    assert shadow == frozenset(config.STRATEGIES) - {"rule3_v1"}
+    assert "confirmed_15m" in shadow and manual == {"rule1_v1": "Trading 212"}

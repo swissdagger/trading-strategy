@@ -62,7 +62,7 @@ from execution.persistence import (
     make_shadow_hooks,
 )
 from execution.shadow_book import ShadowBook
-from execution.sizing import make_size_position
+from execution.sizing import EQUITY_FRACTION, make_size_position
 from ops.alerts import AlertDigest, alert, install_alerting, start_heartbeat
 from ops.summary import daily_summary_loop, kill_switch_monitor
 
@@ -113,15 +113,30 @@ def build_raw_adapter(mode: TradeMode, pool):
     return adapter
 
 
-def shadow_only_strategies(cfg) -> frozenset:
-    """config.SHADOW_ONLY_STRATEGIES, required. Fails closed: a config without
-    it must not boot an executor that would send paper-only rules to a venue
-    (the executor also treats rule* strategies as shadow-only by name)."""
-    names = getattr(cfg, "SHADOW_ONLY_STRATEGIES", None)
-    if names is None:
-        raise RuntimeError("config.SHADOW_ONLY_STRATEGIES is missing; refusing to start "
-                           "rather than route shadow-only strategies to the venue")
-    return frozenset(names)
+def strategy_routing(cfg) -> tuple:
+    """(traded, shadow_only, manual) from config, all required and checked.
+    Fails closed: without TRADED_STRATEGIES the executor would have no
+    allowlist, so it refuses to start; a strategy both traded and shadow-only,
+    or traded but not configured, is a config error, not a guess."""
+    traded = getattr(cfg, "TRADED_STRATEGIES", None)
+    shadow = getattr(cfg, "SHADOW_ONLY_STRATEGIES", None)
+    if traded is None or shadow is None:
+        raise RuntimeError("config.TRADED_STRATEGIES / SHADOW_ONLY_STRATEGIES missing; "
+                           "refusing to start without a traded allowlist")
+    traded, shadow = frozenset(traded), frozenset(shadow)
+    manual = dict(getattr(cfg, "MANUAL_TRADE_STRATEGIES", {}) or {})
+    problems = []
+    if traded & shadow:
+        problems.append(f"both traded and shadow-only: {sorted(traded & shadow)}")
+    unknown = traded - set(getattr(cfg, "STRATEGIES", {}))
+    if unknown:
+        problems.append(f"traded but not in STRATEGIES: {sorted(unknown)}")
+    if set(manual) & traded:
+        problems.append(f"manual-trade strategies must not be traded: "
+                        f"{sorted(set(manual) & traded)}")
+    if problems:
+        raise RuntimeError("strategy routing config is inconsistent: " + "; ".join(problems))
+    return traded, shadow, manual
 
 
 def make_on_mode_change(current: dict, stop: asyncio.Event, restart_required: dict):
@@ -201,12 +216,13 @@ async def main() -> None:
         return await current["adapter"].get_touch(symbol, asset_class)
     hooks.get_touch = _get_touch
 
-    # size_position -> 5%-of-equity policy (execution/sizing.py), reading live
+    # size_position -> 10%-of-available-equity policy (execution/sizing.py), reading live
     # equity + touch from the adapter, and flooring the quantity to the venue's
     # LOT_SIZE/contract step via adapter.get_step_size (cached per symbol). No
     # separate step map to maintain — the adapter owns it.
     hooks.size_position = make_size_position(_adapter)
-    log.info("get_touch and size_position (5%% equity) wired to venue adapter")
+    log.info("get_touch and size_position (%s of available equity) wired to venue adapter",
+             EQUITY_FRACTION)
 
     # Shadow book: SHORT signals the venue can't take (spot has no short side)
     # get virtual fills at the live touch instead (migration 019).
@@ -218,16 +234,20 @@ async def main() -> None:
     # Shadow opens are routine one at a time: they go to Slack batched, one
     # message per SHADOW_DIGEST_INTERVAL_S listing every open in it.
     shadow_digest = AlertDigest("SHADOW trades opened", "shadow-digest")
+    traded, shadow_only, manual = strategy_routing(config)
+    log.info("strategies traded at the venue: %s; shadow-only: %s; placed by hand: %s",
+             sorted(traded), sorted(shadow_only), manual or "none")
     shadow = ShadowBook(make_shadow_hooks(pool, _get_touch),
                         taker_fee_bps=config.SHADOW_TAKER_FEE_BPS, fee_bps_fn=_fee_bps,
                         fee_bps_by_class=getattr(config, "SHADOW_FEE_BPS_BY_CLASS", {}),
-                        opened_digest=shadow_digest)
+                        opened_digest=shadow_digest, manual_strategies=manual)
     await shadow.start()
 
     executor = SignalExecutor(
         adapter, hooks,
         shadow_book=shadow,
-        shadow_only_strategies=shadow_only_strategies(config),
+        shadow_only_strategies=shadow_only,
+        traded_strategies=traded,
         max_open_positions=config.MAX_OPEN_POSITIONS,
         enter_max_age_ms=config.ENTER_MAX_AGE_SECONDS * 1000,
         orphan_allowlist=config.ORPHAN_BALANCE_ALLOWLIST,

@@ -91,7 +91,7 @@ Strategies are registered in `STRATEGIES` (config) and built by
 runtime fans every chain event to every strategy subscribed to that ladder, with
 per-strategy exception isolation.
 
-**`confirmed_15m`** (enabled; formerly `four_chain`) — on the FC ladder
+**`confirmed_15m`** (enabled, **shadow-only**; formerly `four_chain`) — on the FC ladder
 (`1m,3m,5m,15m,1h`). Enters when a chain propagates to 15m, provided an earlier
 same-direction chain reached 15m first with an opposing 1m failure starting
 between the two, and a finished same-direction chain that started earlier
@@ -105,15 +105,22 @@ review and trades are never pooled across rules or ladders):
 
 | Strategy | Asset | Ladder | Entry → confirm | Stall | Filters | Status |
 |---|---|---|---|---|---|---|
-| `rule1_v1` | equity | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 60 min | vol_ratio ≤ 1.46; US regular session | enabled |
+| `rule1_v1` | equity | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 60 min | vol_ratio ≤ 1.46; US regular session | enabled, **placed by hand** |
 | `rule1_new_literal_v1` | equity | DL (30s base) | L2 = 45s → L3 = 1m | 60 min | same | enabled |
-| `rule3_v1` | crypto | FC `1m,3m,5m,15m,1h` | P2 = 3m → L3 = 5m | 30 min | vol_ratio > 0.71, not squeeze-release; 24/7 | enabled |
+| `rule3_v1` | crypto | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 30 min | vol_ratio > 0.71, not squeeze-release; 24/7 | enabled, **traded** |
 | `rule3_new_literal_v1` | crypto | CN `30s,45s,1m,2m,3m,5m,15m,30m,1h` | L2 = 45s → L3 = 1m | 30 min | same | enabled, BTC-USD only |
 | `rule3_new_equiv_v1` | crypto | CN | 3m → 5m (pinned by rung) | 30 min | same | enabled, BTC-USD only |
 
-All are **shadow-only** (`SHADOW_ONLY_STRATEGIES`): the executor never sends
-their signals to a venue in any trade mode; they fill in the shadow book at
-`decision_price` with `SHADOW_FEE_BPS_BY_CLASS` per leg. The pre-registered
+**What reaches the venue.** Only the strategies in `TRADED_STRATEGIES`
+(`rule3_v1`) send orders: paper orders in paper mode, real ones in live. Its
+SHORT signals still go to the shadow book (spot has no short side). Every other
+strategy is shadow-only (`SHADOW_ONLY_STRATEGIES`, the complement), and the
+executor shadows any strategy missing from the allowlist, so nothing trades by
+being forgotten. Shadow strategies fill in the shadow book at `decision_price`
+with `SHADOW_FEE_BPS_BY_CLASS` per leg. `rule1_v1` is also in
+`MANUAL_TRADE_STRATEGIES`: each of its opens and closes posts to Slack at once
+(`MANUAL TRADE — OPEN/CLOSE …`) to be placed by hand on Trading 212, where
+equity CFDs cannot be traded by API. The pre-registered
 review is `docs/rule_review.sql`, at the assumed fee and at the spread measured
 by the research process. Volatility filters read 1m closes from the feeds
 (Polygon for equities, Coinbase for crypto; `strategy/vol_source.py`).
@@ -203,8 +210,10 @@ Environment (`.env`; every variable is listed in `.env.example`):
 | `SUMTYME_TIMEOUT_S`, `SYMBOL_QUEUE_MAX`, `SYMBOL_INFLIGHT_MAX`, `LAG_WARN_S` | signal | backpressure, per-symbol forecast fairness, lag alarms |
 
 In `config.py`: `CRYPTO_BASES` × `QUOTE_CURRENCY` (the symbols), `ASSET_CONFIGS`
-(timeframes), `STRATEGIES`, `EXTRA_LADDERS`, `VENUE_ENDPOINTS`, and the executor's
-risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
+(timeframes), `STRATEGIES`, `EXTRA_LADDERS`, `VENUE_ENDPOINTS`, which strategies
+reach the venue (`TRADED_STRATEGIES`; everything else is shadow-only) and which
+are placed by hand (`MANUAL_TRADE_STRATEGIES`), and the executor's risk
+settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
 `ORPHAN_BALANCE_ALLOWLIST`, `PAPER_STARTING_CASH`, `SHADOW_TAKER_FEE_BPS`.
 
 ---
@@ -224,14 +233,16 @@ risk settings: `MAX_OPEN_POSITIONS`, `ENTER_MAX_AGE_SECONDS`,
   be able to transfer funds, and (live) must be able to trade.
 - **Boot reconcile**: venue positions vs. DB trades, **netted per symbol**;
   mismatches HALT the symbol's trades, and unknown non-dust balances refuse boot.
-- **Position cap and sizing**: `MAX_OPEN_POSITIONS`; 5% of *available* balance per
-  entry; venue minimums enforced before submit.
+- **Position cap and sizing**: `MAX_OPEN_POSITIONS` (10; shadow positions don't
+  count); 10% of *available* balance per entry; venue minimums enforced before
+  submit.
 - **Execution caps** (`execution_caps`): marketable-limit caps per class and
   intent, with an exit escalation ladder that HALTs at the top. Hot-reloadable.
 - **HALTs** are logged at ERROR and stay visible in `trades` (`state = 'HALTED'`,
   `halt_reason`); a refused boot is logged and retried every few minutes.
 - **Alerts** go to Slack (`SLACK_WEBHOOK_URL`, `ops/alerts.py`): every trade
-  opened (paper or live one by one; shadow batched every 15 min), HALTs, boot failures and crashes, stuck
+  opened (paper or live one by one; shadow batched every 15 min; manual-trade
+  opens and closes one by one), HALTs, boot failures and crashes, stuck
   signals, kill-switch and trade-mode changes, pipeline stalls, and a daily
   summary. Each process also pings a dead-man's switch (`HEARTBEAT_URL_*`) while
   healthy, so a dead or wedged process alerts by going quiet. RUNBOOK §5.

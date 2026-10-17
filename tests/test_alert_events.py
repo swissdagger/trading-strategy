@@ -164,3 +164,31 @@ async def test_shadow_opens_batch_into_one_message(caplog):
     assert key.startswith("shadow-digest:")
     assert msg.startswith("SHADOW trades opened (2):") and "AAPL" in msg and "MSFT" in msg
     assert digest.flush() == 0 and len(_alerts(caplog)) == 1   # empty interval: no post
+
+
+@pytest.mark.asyncio
+async def test_a_manual_trade_strategy_alerts_each_open_and_close_at_once(caplog):
+    # rule1_v1's trades are placed by hand: open and close each post to Slack
+    # immediately, naming the venue, and never join the batched digest.
+    from decimal import Decimal
+    from execution.shadow_book import ShadowBook
+    from ops.alerts import AlertDigest
+    from test_executor_hardening import MemShadowStore
+    from test_signal_executor import exit_row
+
+    caplog.set_level(logging.INFO)
+    digest = AlertDigest("SHADOW trades opened", "shadow-digest")
+    book = ShadowBook(MemShadowStore().hooks(), taker_fee_bps=Decimal("5"),
+                      opened_digest=digest, manual_strategies={"rule1_v1": "Trading 212"})
+    await book.start()
+    ex, _ = await booted(shadow_book=book, shadow_only_strategies=frozenset({"rule1_v1"}))
+    await ex.handle_signal(enter_row(strategy="rule1_v1", symbol="NVDA", direction="LONG"))
+    (key, msg), = _alerts(caplog)
+    assert key.startswith("manual-open:rule1_v1:")
+    assert msg.startswith("MANUAL TRADE — OPEN LONG NVDA @ 100.0 on Trading 212")
+    assert "rule1_v1" in msg and "signal " in msg
+    assert digest.flush() == 0                       # not batched
+    await ex.handle_signal(exit_row(strategy="rule1_v1", symbol="NVDA", direction="LONG"))
+    (key, msg), = [(k, m) for k, m in _alerts(caplog) if k.startswith("manual-close:")]
+    assert msg.startswith("MANUAL TRADE — CLOSE LONG NVDA @ 101.0 on Trading 212")
+    assert "bps net" in msg

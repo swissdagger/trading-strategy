@@ -6,8 +6,8 @@ persistence.py) and reads live venue state (equity + touch) rather than the DB.
 The executor calls it through the ExecutorHooks.size_position hook; this module
 provides the concrete policy the launcher wires in.
 
-CURRENT POLICY: 5% of AVAILABLE equity per position (notional). For a signal to
-open a position in `symbol`, target notional = 0.05 * equity.available;
+CURRENT POLICY: 10% of AVAILABLE equity per position (notional). For a signal
+to open a position in `symbol`, target notional = 0.10 * equity.available;
 quantity = notional / reference_price, where reference_price is the mid of the
 current touch. The quantity is then floored to the venue's step size.
 
@@ -30,8 +30,8 @@ from execution.types import AccountEquity, Touch, TradeSide
 
 log = logging.getLogger("executor.sizing")
 
-# Fraction of account equity to commit per position. 5% for now.
-EQUITY_FRACTION = Decimal("0.05")
+# Fraction of available equity to commit per position.
+EQUITY_FRACTION = Decimal("0.10")
 
 
 def make_size_position(

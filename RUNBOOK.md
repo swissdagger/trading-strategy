@@ -16,7 +16,7 @@ One server runs everything under `docker compose`:
 | `kafka` | always | single broker; `trading-bars` and `chain-events` topics |
 | `warmup` | once | seeds `warmup_bars` + `feed_cursors`, then exits 0 |
 | `feed` | unless-stopped | Coinbase candles (crypto) and Polygon (equities) → `trading-bars` |
-| `signal` | unless-stopped | bars → Sumtyme chains → strategies (`confirmed_15m`, the shadow-only chain rules) → `trade_signals` |
+| `signal` | unless-stopped | bars → Sumtyme chains → strategies (`rule3_v1` traded; `rule1_v1` placed by hand; the rest shadow-only) → `trade_signals` |
 | `executor` | unless-stopped | `trade_signals` → paper or live orders; shadow book for the rest |
 | `research` | unless-stopped | `trade_signals` + Polygon → `research_*` tables (off the live path) |
 
@@ -239,6 +239,7 @@ blocks trading; repeats of the same condition are limited to one per 10 min.
 |---|---|---|
 | executor | `PAPER`/`LIVE trade OPENED` | a real entry's first fill (side, symbol, class, qty, avg price, strategy) |
 | executor | `SHADOW trades opened (n)` | one message per `SHADOW_DIGEST_INTERVAL_S` (default 15 min) listing every shadow position opened in it (side, symbol, price and its source, fee, strategy); nothing for an empty interval |
+| executor | `MANUAL TRADE — OPEN` / `CLOSE` | at once, for each open and close of a `MANUAL_TRADE_STRATEGIES` strategy (`rule1_v1` → Trading 212): side, symbol, price, when the signal was written, and on close the reason and shadow P&L. Place it by hand; these never join the digest |
 | executor | `HALTED` | a trade needs a human (§6.2) |
 | executor | `cannot start` / `executor failed` | boot refused, or a crash (§6.3) |
 | executor | `STUCK` | a signal has failed 10 times; still retried, cursor held at it |
@@ -415,7 +416,7 @@ Go live only when every step passes, in order:
 5. **Pre-flight.**
    - Fund the bot portfolio with the intended capital only.
    - Set `CRYPTO_BASES` to **one** symbol.
-   - Confirm that 5% of available balance exceeds the product's minimum order
+   - Confirm that 10% of available balance exceeds the product's minimum order
      size.
 6. **Drain paper.** Engage the kill switch (`halt_new` to let positions exit on
    their own signals, or `flatten` to close them now) and wait until

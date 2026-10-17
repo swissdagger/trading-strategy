@@ -56,10 +56,12 @@ ASSET_CONFIGS = {
         # close, merged per symbol into close-time order, relaunched on error by
         # feed_process). 3m has no Coinbase granularity and is derived from
         # 1m. No websocket feed exists for Coinbase yet.
-        # FC ∪ CN. The seconds rungs (30s/45s) are built from trades and
-        # served ONLY for subminute_symbols (warmup and live); 2m/30m come
-        # from candles for every symbol but are owned only by CN strategies.
-        "timeframes": ["30s", "45s", "1m", "2m", "3m", "5m", "15m", "30m", "1h"],
+        # FC ∪ CN ∪ ED. The seconds rungs (30s/45s) are built from trades and
+        # served ONLY for subminute_symbols (warmup and live); 2m comes from
+        # candles for every symbol but is owned only by CN strategies; 30m,
+        # 2h (native) and 4h (built from 1h) serve rule3_v1's ED ladder.
+        "timeframes": ["30s", "45s", "1m", "2m", "3m", "5m", "15m", "30m", "1h",
+                       "2h", "4h"],
         "points": 5000,
         "baseline_timeframe": "1m",
         "transport": "rest",
@@ -79,7 +81,10 @@ ASSET_CONFIGS = {
     # CAPACITY (do this arithmetic before adding a symbol). Over the extended
     # 04:00–20:00 ET session the ladder needs ~5,700 forecasts/symbol/day,
     # ~0.1/s/symbol while the market is open. At the measured 0.36 calls/s
-    # peak that is ~3 symbols. The forecast/apply split (PR 8) is what makes
+    # peak that is ~3 symbols on their own, and crypto already uses most of
+    # it (FC ~0.27/s + CN ~0.06/s, 24/7), so two symbols run over the peak
+    # during the session; most of an equity's demand is DL's seconds rungs.
+    # The forecast/apply split (PR 8) is what makes
     # even ONE symbol fit: serial per-symbol processing capped a symbol at
     # one forecast per ~8 s, and 30s+45s+1m+90s+2m+3m need one every ~6 s.
     #
@@ -94,7 +99,8 @@ ASSET_CONFIGS = {
     # buckets. Transport 'ws' with automatic fallback to 'rest' if the socket
     # cannot be established on a cold start (feed_process._run_feed).
     "equity": {
-        "symbols": ["SPCX", "XOM", "NVDA"],
+        # Cut from three (SPCX dropped) for latency; see CAPACITY above.
+        "symbols": ["NVDA", "XOM"],
         # Union of the DL ladder and the ED ladder (rule1_v1's research
         # ladder adds 5m); the memo dedupes the rungs they share.
         "timeframes": ["30s", "45s", "1m", "90s", "2m", "3m", "5m",
@@ -244,8 +250,10 @@ BAR_STORE_PRUNE_INTERVAL_S = 3600
 
 # Hard cap on concurrently open positions across all symbols and strategies
 # (non-terminal trades, HALTED included: a halted trade may still hold capital).
-# Checked under a lock before every ENTER. Placeholder — tune in paper.
-MAX_OPEN_POSITIONS = 5
+# Checked under a lock before every ENTER. Shadow positions don't count. With
+# 10% of AVAILABLE equity each (execution/sizing.py), ten positions commit
+# about 65% of the starting cash. Tune in paper.
+MAX_OPEN_POSITIONS = 10
 
 # An ENTER signal written longer ago than this (trade_signals.created_at ->
 # now) is skipped, never acted on: after executor downtime the catch-up sweep
@@ -320,9 +328,9 @@ STRATEGIES = {
     # `entry_tf` / `confirm_tf` pin a rule to rungs by name when a level
     # number would land somewhere else on a different ladder.
     #
-    # All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the
-    # executor never sends their signals to a venue, in paper or live mode.
-    # Crypto LONGs would otherwise reach Coinbase.
+    # rule3_v1 is TRADED (TRADED_STRATEGIES below); rule1_v1 is shadow with a
+    # Slack alert per open and close, to be placed by hand (MANUAL_TRADE_
+    # STRATEGIES); the rest are shadow-only.
     # -----------------------------------------------------------------------
     "rule1_v1": {                       # the research rule, on the research ladder
         "enabled": True,
@@ -339,7 +347,7 @@ STRATEGIES = {
     "rule3_v1": {                       # crypto, pre-registered 2026-10-17
         "enabled": True,
         "symbols": crypto_symbols(),
-        "ladders": ["FC"],              # FC's P2 = 3m, L3 = 5m: the research ladder's
+        "ladders": ["ED"],              # the research ladder: P2 = 3m, L3 = 5m (as on FC)
         "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
     },
     # The two new-ladder crypto rules, on the CN universe only (the seconds
@@ -359,17 +367,20 @@ STRATEGIES = {
     },
 }
 
-# Strategies whose signals the executor must NEVER route to a venue, in any
-# trade mode: they go to the shadow book (virtual fills at decision_price).
-# The chain rules are paper-only by their own spec.
-SHADOW_ONLY_STRATEGIES = frozenset(
-    # FAIL CLOSED: every chain-rule strategy (a `params.rule` entry), enabled
-    # or not, is shadow-only by construction, so adding one cannot send its
-    # signals to a venue by forgetting to list it here.
-    {name for name, cfg in STRATEGIES.items() if "rule" in (cfg.get("params") or {})}
-    | {"rule1_v1", "rule1_new_literal_v1", "rule3_v1",
-       "rule3_new_literal_v1", "rule3_new_equiv_v1"}
-)
+# The ONLY strategies whose signals may reach the venue (paper orders in paper
+# mode, real ones in live). FAIL CLOSED: the executor shadows every strategy
+# not named here — including one added to STRATEGIES later, or a name it does
+# not know at all — so nothing trades by being forgotten.
+TRADED_STRATEGIES = frozenset({"rule3_v1"})
+
+# Everything else, for the record: shadow book only (virtual fills at
+# decision_price), in any trade mode.
+SHADOW_ONLY_STRATEGIES = frozenset(STRATEGIES) - TRADED_STRATEGIES
+
+# Shadow strategies whose trades the owner places BY HAND elsewhere (equity
+# CFDs: no API to trade them). Each open and close posts to Slack at once
+# (not in the batched shadow digest), naming where to place it.
+MANUAL_TRADE_STRATEGIES = {"rule1_v1": "Trading 212"}
 
 # Shadow-book fee per leg (bps) by asset class, overriding the venue's fee
 # tier where the venue does not trade the class. Equity CFD half-spread 0.05%
