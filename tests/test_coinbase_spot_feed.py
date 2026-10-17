@@ -327,3 +327,89 @@ async def test_start_live_does_not_reemit_warmups_newest_bar():
     with pytest.raises(asyncio.CancelledError):
         await feed.start_live(["BTC-USD"], ["1m"], {"BTC-USD": {"1m": warm_newest}}, callback)
     assert [p.timestamp // 1000 for p in got] == [T0 - 120, T0 - 60]
+
+
+# ---------------------------------------------------------------------------
+# Close-time order across rungs
+# ---------------------------------------------------------------------------
+
+from feeds.coinbase_spot import CloseOrderMerge
+from producer.bar import OHLCPoint
+
+_TF_MS = {"30s": 30_000, "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000}
+
+
+def _pt(start_ms, tf):
+    return OHLCPoint(symbol="BTC-USD", timestamp=start_ms, open=1, high=1, low=1, close=1,
+                     timeframe=tf, asset_class="crypto")
+
+
+def test_merge_holds_a_bar_until_every_rung_is_read_past_its_close():
+    m = CloseOrderMerge({"BTC-USD": ["1m", "3m"]}, {("BTC-USD", "1m"): 0, ("BTC-USD", "3m"): 0})
+    m.offer("BTC-USD", "1m", [_pt(0, "1m"), _pt(60_000, "1m"), _pt(120_000, "1m")], 180_000)
+    # 3m not yet read past 0: nothing may go, a 3m bar closing at 180s could still come.
+    assert m.release() == []
+    m.offer("BTC-USD", "3m", [_pt(0, "3m")], 180_000)
+    out = m.release()
+    # Close order; on the 180s tie the shorter rung first.
+    assert [(p.timeframe, p.timestamp) for p in out] == [
+        ("1m", 0), ("1m", 60_000), ("1m", 120_000), ("3m", 0)]
+
+
+def test_merge_does_not_advance_a_rung_whose_read_failed():
+    m = CloseOrderMerge({"BTC-USD": ["1m", "5m"]}, {("BTC-USD", "1m"): 0, ("BTC-USD", "5m"): 0})
+    m.offer("BTC-USD", "1m", [_pt(0, "1m")], 60_000)
+    m.offer("BTC-USD", "5m", [], None)          # failed read: not caught up
+    assert m.release() == []
+    m.offer("BTC-USD", "5m", [], 0)             # complete read, no new window yet
+    assert m.release() == []
+    m.offer("BTC-USD", "5m", [], 300_000)
+    assert [p.timestamp for p in m.release()] == [0]
+
+
+def test_merge_symbols_are_independent():
+    m = CloseOrderMerge({"A-USD": ["1m"], "B-USD": ["1m", "5m"]},
+                        {("A-USD", "1m"): 0, ("B-USD", "1m"): 0, ("B-USD", "5m"): 0})
+    a = OHLCPoint(symbol="A-USD", timestamp=0, open=1, high=1, low=1, close=1,
+                  timeframe="1m", asset_class="crypto")
+    m.offer("A-USD", "1m", [a], 60_000)
+    m.offer("B-USD", "1m", [_pt(0, "1m")], 60_000)   # B held by its 5m rung
+    assert m.release() == [a]
+
+
+@pytest.mark.asyncio
+async def test_start_live_emits_in_close_time_order_across_rungs(monkeypatch):
+    fake = FakeCoinbase(now_s=SETTLED)
+    feed = make_feed(fake, timeframes=("1m", "3m", "5m"))
+    s = (T0 - 900) // 900 * 900 * 1000             # aligned for every rung
+    seeded = {tf: s - _TF_MS[tf] for tf in ("1m", "3m", "5m")}   # newest already-seen bar
+    got = []
+
+    async def callback(batch):
+        got.extend(batch)
+
+    import feeds.coinbase_spot as cs
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_s):
+        await real_sleep(0)
+    monkeypatch.setattr(cs.asyncio, "sleep", fast_sleep)
+    task = asyncio.create_task(feed.start_live(["BTC-USD"], ["1m", "3m", "5m"],
+                                               {"BTC-USD": seeded}, callback))
+    for _ in range(200):
+        await real_sleep(0)
+    feed._running = False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    closes = [(p.timestamp + _TF_MS[p.timeframe], _TF_MS[p.timeframe]) for p in got]
+    assert closes == sorted(closes)                    # close order, shorter first on ties
+    assert len(closes) == len(set(closes))             # nothing emitted twice
+    # The 5m window closing after T0-240 is not complete, so nothing closing
+    # after its start may be released yet; everything up to it is.
+    cutoff = (T0 - 240) * 1000
+    assert max(c for c, _ in closes) == cutoff
+    expected = {(t + _TF_MS[tf], _TF_MS[tf]) for tf in ("1m", "3m", "5m")
+                for t in range(s, cutoff, _TF_MS[tf]) if t + _TF_MS[tf] <= cutoff}
+    assert set(closes) == expected
