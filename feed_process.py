@@ -29,7 +29,10 @@ import asyncio
 import logging
 import os
 import signal as os_signal
+import time
 from typing import Dict, List
+
+from ops.alerts import alert, install_alerting, start_heartbeat
 
 log = logging.getLogger("feed_process")
 
@@ -142,6 +145,7 @@ class FeedProcess:
         self.cfg = cfg
         self.producer = None
         self._tasks: List[asyncio.Task] = []
+        self._last_publish = time.monotonic()
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
@@ -236,12 +240,13 @@ class FeedProcess:
                         "feed %s for the process lifetime. Sub-minute rungs are "
                         "served by polling trades; fix the websocket and restart "
                         "to return to streaming.", feed.name, e, rest.name,
+                        extra=alert(f"ws-fallback:{feed.name}", every=0),
                     )
                     feed = rest
                     continue
             except Exception:
                 log.exception("feed %s errored; backing off 5s then relaunching",
-                              feed.name)
+                              feed.name, extra=alert(f"feed-error:{feed.name}"))
             if self._stop.is_set():
                 break
             await asyncio.sleep(5)
@@ -281,6 +286,7 @@ class FeedProcess:
                         _bar_to_wire(p),
                         key=p.symbol.encode(),
                     )
+                    self._last_publish = time.monotonic()
                 except Exception:
                     # A publish failure for one bar must not drop the whole batch
                     # or kill the feed. Log and continue; the feed keeps streaming.
@@ -288,8 +294,16 @@ class FeedProcess:
                                   getattr(p, "symbol", "?"), getattr(p, "timeframe", "?"))
         return callback
 
+    def publishing(self, within_s: float = 300.0) -> bool:
+        """A bar was published in the last within_s (for the heartbeat; the
+        crypto rungs publish every minute, 24/7)."""
+        return time.monotonic() - self._last_publish < within_s
+
     async def run(self) -> None:
         """Wait until stopped; the feeds run in their own tasks."""
+        heartbeat = start_heartbeat("HEARTBEAT_URL_FEED", self.publishing)
+        if heartbeat is not None:
+            self._tasks.append(heartbeat)
         await self._stop.wait()
         await self.stop()
 
@@ -323,6 +337,7 @@ async def amain() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    install_alerting("feed")
     proc = FeedProcess(FeedConfig())
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGTERM, os_signal.SIGINT):

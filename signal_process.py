@@ -57,6 +57,8 @@ from producer.fanout_router_multi import MultiLadderRouter
 from producer.forecast_gate import ForecastGate, ForecastMemo
 from producer.offset_tracker import OffsetTracker
 from producer.symbol_workers import SymbolWorkerPool
+from feeds.base import timeframe_to_ms
+from ops.alerts import alert, install_alerting, start_heartbeat
 from producer.persistence import (
     make_insert_signal,
     make_load_active_chains,
@@ -309,6 +311,8 @@ class SignalProcess:
         self.audit_cache = AuditCache()
         self.metrics = Metrics()
         self._audit_task: Optional[asyncio.Task] = None
+        self._last_bar_monotonic = time.monotonic()
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._prune_task: Optional[asyncio.Task] = None
         self._health_server: Optional[HealthServer] = None
 
@@ -795,15 +799,25 @@ class SignalProcess:
         This is the number that would have made a 39-hour stall obvious on day
         one instead of after a day of watching. Export it (Prometheus/statsd) —
         alert if it exceeds a few bar intervals. Sudden growth here, or growth in
-        SymbolWorkerPool.queue_depths(), is this bug recurring."""
-        age_s = time.time() - (bar.timestamp / 1000.0)
+        SymbolWorkerPool.queue_depths(), is this bug recurring.
+
+        Age is measured from the bar's CLOSE (label + one timeframe): measured
+        from its open label, every 15m/1h bar read as "behind" on arrival."""
+        self._last_bar_monotonic = time.monotonic()
+        age_s = time.time() - (bar.timestamp + timeframe_to_ms(bar.timeframe)) / 1000.0
         if age_s > self.cfg.lag_warn_s:
             log.warning(
-                "PROCESSING LAG: bar %s/%s is %.0fs (%.1fh) old — the pipeline is "
+                "PROCESSING LAG: bar %s/%s closed %.0fs (%.1fh) ago — the pipeline is "
                 "behind. queue depths=%s",
                 bar.symbol, bar.timeframe, age_s, age_s / 3600.0,
                 self.workers.queue_depths() if self.workers else {},
+                extra=alert(f"lag:{bar.symbol}"),
             )
+
+    def bars_flowing(self, within_s: float = 300.0) -> bool:
+        """A bar was consumed in the last within_s (for the heartbeat; the
+        crypto rungs produce one every minute, 24/7)."""
+        return time.monotonic() - self._last_bar_monotonic < within_s
 
     async def _commit_offsets(self) -> None:
         """Commit the contiguous low-water mark, if it advanced. Single-partition
@@ -852,6 +866,8 @@ class SignalProcess:
             self._audit_task.cancel()
         if self._prune_task is not None:
             self._prune_task.cancel()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
         for t in getattr(self, "_strategy_tickers", []):
             t.cancel()
 
@@ -919,6 +935,7 @@ async def amain() -> None:
             logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    install_alerting("signal")
     cfg = Config()
     proc = SignalProcess(cfg)
 
@@ -961,6 +978,7 @@ async def amain() -> None:
 
     try:
         await proc.start()
+        proc._heartbeat_task = start_heartbeat("HEARTBEAT_URL_SIGNAL", proc.bars_flowing)
         await proc.run()
     finally:
         # Don't wait on threads stuck in a hung SDK call — the SDK exposes no

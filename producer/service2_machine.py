@@ -60,6 +60,7 @@ from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 
 from producer.forecast_gate import ForecastGate, ForecastMemo
+from ops.alerts import alert
 
 log = logging.getLogger("producer.service2_machine")
 
@@ -110,6 +111,26 @@ def _bar_close_ms(bar: OHLCPoint) -> int:
     if secs is None:
         raise ValueError(f"cannot parse timeframe {bar.timeframe!r}")
     return bar.timestamp + secs * 1000
+
+
+# Sumtyme failures (timeout, error, unusable result) across EVERY machine in
+# the process. One is noise; FORECAST_FAILURE_BURST within the window means
+# Sumtyme is down or degraded and bars are being skipped — alert.
+FORECAST_FAILURE_BURST = 5
+FORECAST_FAILURE_WINDOW_S = 300.0
+_forecast_failures: deque = deque()
+
+
+def _note_forecast_failure(kind: str) -> None:
+    now = time.monotonic()
+    _forecast_failures.append(now)
+    while _forecast_failures and now - _forecast_failures[0] > FORECAST_FAILURE_WINDOW_S:
+        _forecast_failures.popleft()
+    if len(_forecast_failures) >= FORECAST_FAILURE_BURST:
+        log.error("Sumtyme failing: %d forecast failures in %.0f min (latest: %s) — bars "
+                  "are being skipped", len(_forecast_failures),
+                  FORECAST_FAILURE_WINDOW_S / 60, kind,
+                  extra=alert("sumtyme-failing", every=900))
 
 
 def _now_iso() -> str:
@@ -695,6 +716,7 @@ class ServiceTwoChainMachine(ChainMachine):
                 "(repeated timeouts = Sumtyme unreachable/degraded)",
                 self._forecast_timeout_s, self.symbol, bar.timeframe, bar.timestamp,
             )
+            _note_forecast_failure("timeout")
             return None
         except asyncio.CancelledError:
             raise
@@ -707,6 +729,7 @@ class ServiceTwoChainMachine(ChainMachine):
                 "forecast ERROR for %s/%s ts=%s — skipping bar",
                 self.symbol, bar.timeframe, bar.timestamp,
             )
+            _note_forecast_failure("error")
             return None
 
         # Sumtyme returned but the result is unusable. The SDK can hand back an
@@ -719,12 +742,14 @@ class ServiceTwoChainMachine(ChainMachine):
                 "forecast returned an Exception object for %s/%s ts=%s: %r — skipping bar",
                 self.symbol, bar.timeframe, bar.timestamp, forecast,
             )
+            _note_forecast_failure("unusable result")
             return None
         if not forecast:
             log.warning(
                 "forecast returned empty/falsy result (%r) for %s/%s ts=%s — skipping bar",
                 forecast, self.symbol, bar.timeframe, bar.timestamp,
             )
+            _note_forecast_failure("empty result")
             return None
         return forecast
 

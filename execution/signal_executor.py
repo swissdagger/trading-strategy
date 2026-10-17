@@ -66,6 +66,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, FrozenSet, Optional
 
 from execution.adapter import ExecutionAdapter
+from ops.alerts import alert
 from execution.gated_adapter import GATED_PREFIX
 from execution.observability import Metrics, build_health_document
 from execution.pricing import (
@@ -188,6 +189,9 @@ class OpenTrade:
     # stream delivers those fills. Rebuilt on restart from orders.filled_qty
     # minus the order's recorded fills (load_open_trades).
     exit_unstreamed: Dict[str, Decimal] = None  # set in __post_init__
+    # Sum of qty * price over the entry fills recorded in THIS process — the
+    # average entry price for the "trade opened" alert. In-memory only.
+    entry_notional: Decimal = Decimal(0)
     # Venue rejections of the current rung's exit order (see
     # _EXIT_MAX_REJECT_RETRIES). In-memory only.
     exit_rejects: int = 0
@@ -340,6 +344,7 @@ class SignalExecutor:
         enter_max_age_ms: Optional[int] = None,
         orphan_allowlist: FrozenSet[str] = frozenset(),
         shadow_only_strategies: FrozenSet[str] = frozenset(),
+        mode_label: Optional[Callable[[], str]] = None,
     ):
         """
         shadow_book: where SHORT signals go when the adapter cannot short
@@ -358,6 +363,8 @@ class SignalExecutor:
         self.hooks = hooks
         self.shadow_book = shadow_book
         self.shadow_only_strategies = frozenset(shadow_only_strategies or ())
+        # The trade mode ('paper' / 'live'), for alerts; the launcher wires it.
+        self._mode_label = mode_label or (lambda: "?")
         # Strategies treated as shadow-only by name prefix although missing
         # from shadow_only_strategies (logged once each; see _is_shadow_only).
         self._shadow_by_prefix_logged: set = set()
@@ -613,12 +620,22 @@ class SignalExecutor:
             return abs(qty) < mins.base
         return abs(qty) <= await self._qty_epsilon(symbol, asset_class)
 
+    def _alert_opened(self, trade: OpenTrade) -> None:
+        """A real (paper or live) position just opened: the entry's first fill."""
+        avg = (trade.entry_notional / trade.filled_qty) if trade.filled_qty else None
+        log.info("%s trade OPENED: %s %s %s qty %s @ %s (strategy %s, trade %s)",
+                 self._mode_label().upper(), trade.side.value, trade.symbol,
+                 trade.asset_class, trade.filled_qty,
+                 f"{avg:.8g}" if avg is not None else "?", trade.strategy, trade.trade_id,
+                 extra=alert(f"open:{trade.trade_id}", every=0))
+
     async def _halt(self, t: OpenTrade, reason: str) -> None:
         t.state = "HALTED"
         self._mincr("trades_halted")
         await self.hooks.update_trade_state(t.trade_id, "HALTED", reason)
-        log.error("trade %s HALTED (%s %s %s): %s", t.trade_id, t.strategy,
-                  t.symbol, t.side.value, reason)
+        log.error("trade %s HALTED (%s %s %s): %s — parked for a human, the position "
+                  "is NOT being managed", t.trade_id, t.strategy, t.symbol, t.side.value,
+                  reason, extra=alert(f"halt:{t.trade_id}", every=0))
 
     # ----------------------------------------------------------------------
     # Signal ingress — the SignalListener's handler
@@ -875,6 +892,7 @@ class SignalExecutor:
         if trade.filled_qty > 0:
             trade.state = "OPEN"
             await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
+            self._alert_opened(trade)
             # Tranches can have been banked while the entry was in flight (a
             # catch-up replay, or a fast chain). Now there is a position for
             # the deficit to act on.
@@ -1706,6 +1724,7 @@ class SignalExecutor:
         if trade.state in ("PENDING", "SUBMITTED") and trade.filled_qty > 0:
             trade.state = "OPEN"
             await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
+            self._alert_opened(trade)
             await self._advance_scale(trade, key)
         if trade.state == "CLOSING":
             await self._after_exit_fills(trade, key)
@@ -1733,6 +1752,7 @@ class SignalExecutor:
             return
         if fill.intent == OrderIntent.ENTRY:
             trade.filled_qty += fill.qty
+            trade.entry_notional += fill.qty * fill.price
             self._mincr("fills_entry")
         else:
             trade.exit_filled_qty += fill.qty

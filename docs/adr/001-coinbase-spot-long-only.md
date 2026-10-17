@@ -527,3 +527,9 @@ Each phase is independently mergeable and leaves the system runnable.
   seconds rungs to trades; universe restriction (no request for others);
   live poll settle/cursor and paging back to an old cursor; `start_live`
   serves seconds rungs only for the universe.
+
+### Alerting reinstated (owner decision, supersedes PR 7's removal)
+
+- **Delivered, not queued.** PR 7 dropped the `executor_alerts` outbox because nothing ever delivered from it. Alerts now go straight to Slack from each process (`ops/alerts.py`, `SLACK_WEBHOOK_URL`): an alert is a log record tagged with an `alert` key, posted by a daemon thread, rate-limited per key, never blocking trading. No table.
+- **Events:** every trade opened (paper/live/shadow), HALT, boot refused or crash, stuck signal, kill-switch and trade-mode changes, processing lag, Sumtyme failure bursts, failed chain-rule writes, feed holds/crashes/ws fallback, and a daily summary (`ops/summary.py`).
+- **Heartbeats:** each long-running process pings a dead-man's switch (`HEARTBEAT_URL_EXECUTOR` / `_SIGNAL` / `_FEED`) only while healthy, so a crash, wedged loop or stalled pipeline alerts by going quiet. RUNBOOK §5.

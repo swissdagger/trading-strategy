@@ -36,6 +36,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from execution.pricing import is_buy, validate_touch
 from execution.types import OrderIntent, Touch, TradeSide
+from ops.alerts import alert
 
 log = logging.getLogger("executor.shadow")
 
@@ -188,8 +189,14 @@ class ShadowBook:
             # add). Track it; the DB row is the original.
             log.info("shadow ENTER %s/%s already recorded", strategy, position_key)
         self._open[(strategy, position_key)] = pos
-        log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
-                 pos.symbol, px, source)
+        if inserted:
+            log.info("SHADOW trade OPENED: %s %s %s @ %s (%s; fee %s bps/leg; strategy %s, "
+                     "position %s)", side.value, pos.symbol, pos.asset_class, px, source,
+                     fee_bps, strategy, position_key,
+                     extra=alert(f"shadow-open:{strategy}:{position_key}", every=0))
+        else:
+            log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
+                     pos.symbol, px, source)
 
     async def on_exit(self, row: dict, at_decision_price: bool = False) -> None:
         strategy = row.get("strategy", "two_ladder")

@@ -71,6 +71,8 @@ from typing import Awaitable, Callable, Dict, Optional
 
 import asyncpg
 
+from ops.alerts import alert
+
 log = logging.getLogger("executor.signal_listener")
 
 # The NOTIFY channel migration 009's trigger fires on.
@@ -174,6 +176,10 @@ class SignalListener:
         """Current created_at high-water. Callers may persist this to resume
         across restarts without replaying."""
         return self._cursor
+
+    def connected(self) -> bool:
+        """The LISTEN connection is open (for the heartbeat)."""
+        return self._conn is not None and not self._conn.is_closed()
 
     async def run(self) -> None:
         """Run until cancelled. Maintains the LISTEN connection (reconnecting
@@ -391,7 +397,8 @@ class SignalListener:
             log.error("signal %s (%s %s %s) has failed %d times and is STUCK — still "
                       "retrying every %.0fs; the persisted cursor is held at it",
                       signal_id, row.get("action"), row.get("strategy"),
-                      row.get("position_key"), n, delay, exc_info=True)
+                      row.get("position_key"), n, delay, exc_info=True,
+                      extra=alert(f"stuck:{signal_id}", every=3600))
 
     def _forget_failure(self, signal_id: str) -> None:
         self._failed.pop(signal_id, None)

@@ -22,6 +22,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from feeds.base import timeframe_to_ms
+from ops.alerts import alert
 from producer.bar import OHLCPoint
 
 logger = logging.getLogger(__name__)
@@ -98,5 +99,7 @@ class CloseOrderMerge:
                                if self._next_unread[(sym, tf)] <= oldest]
                     logger.warning(
                         "%s: %d bar(s) held %.0fs for rung(s) %s not yet read past "
-                        "their close", sym, len(held), (now_ms - oldest) / 1000, lagging)
+                        "their close — bars for this symbol are not reaching the "
+                        "signal process", sym, len(held), (now_ms - oldest) / 1000, lagging,
+                        extra=alert(f"feed-hold:{sym}"))
         return out
