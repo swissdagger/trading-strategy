@@ -230,10 +230,10 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
  
     THE DISCRIMINATOR IS THE LADDER NAME (migration 026). It used to be the
     chain's baseline timeframe (history[0].timeframe == ladder[0]), which is not
-    unique across ladders: FC and PF both baseline at 1m and both run on
-    crypto_symbols(), so each machine adopted the other's chains on restart and
-    advanced them under its own level numbering — 1h is level 5 in FC and level 6
-    in PF. Ownership is now explicit and filtered in SQL.
+    unique across ladders: FC and the former PF ladder both baselined at 1m and
+    both ran on crypto_symbols(), so each machine adopted the other's chains on
+    restart and advanced them under its own level numbering — 1h was level 5 in
+    FC and level 6 in PF. Ownership is now explicit and filtered in SQL.
  
     No legacy branch: ck_chains_ladder_required (migration 026) makes the
     column mandatory on anything live, so a NULL ladder cannot reach this

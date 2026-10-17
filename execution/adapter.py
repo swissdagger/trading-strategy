@@ -3,19 +3,22 @@ execution/adapter.py — The ExecutionAdapter interface.
 
 Symmetric to feeds/base.py's AssetFeed: feeds bring market data IN, execution
 adapters send orders OUT. The executor (the trade-managing service) knows
-nothing about IBKR's gateway session or Binance's HMAC signing — that lives
-behind the concrete class, exactly as Polygon's `C:`/`O:` prefixes live behind
-the concrete feeds. Adding a venue means writing one file that inherits
+nothing about Coinbase's JWT signing or key scoping — that lives behind the
+concrete class, exactly as a feed's native symbol forms live behind the
+concrete feeds. Adding a venue means writing one file that inherits
 ExecutionAdapter; the executor treats all venues uniformly through this
 interface and routes by asset_class.
 
-Two concrete adapters are planned:
-  * IBKRAdapter  — equity + fx, via TWS API through a headless IB Gateway
-                   (supervised by IBC). Owns the gateway session lifecycle and
-                   the daily re-auth. connect() must confirm the TRADING-enabled
-                   brokerage session, not merely the read-only portal tier.
-  * BinanceAdapter — crypto, via Binance USDⓈ-M Futures. Reads and fills at the
-                   same venue, so no cross-venue price reference is needed.
+ADR-001: one venue, Coinbase Advanced Trade spot, long-only. The concrete
+adapters:
+  * CoinbaseAdapter     — crypto spot (execution/coinbase_adapter.py). Reads and
+                          fills at the same venue, so no cross-venue price
+                          reference is needed. Used for LIVE.
+  * PaperCoinbaseAdapter — simulated fills against the real Coinbase market,
+                          read through the real adapter wrapped in
+                          ReadOnlyAdapter (execution/paper_adapter.py). Used for
+                          OFF and PAPER.
+Equities have no venue adapter: their strategies are shadow-only.
 
 THE BOOT-ORDERING INVARIANT (read before implementing the executor):
 
@@ -33,8 +36,8 @@ sequence enforces it — but every order method's docstring restates the
 precondition so an implementer can't miss it.
 
 Each adapter owns its own connection, auth, and rate-limit budget. Adapters do
-NOT share rate budget — IBKR and Binance have independent quotas — mirroring the
-feeds' "no shared RateLimiter across sources" rule.
+NOT share rate budget — each venue has its own quota — mirroring the feeds'
+"no shared RateLimiter across sources" rule.
 """
 from __future__ import annotations
 
@@ -92,16 +95,11 @@ class ExecutionAdapter(ABC):
         """Establish and CONFIRM a trading-enabled session, then return. Must
         not return until orders can actually be placed.
 
-        IBKR: IBC keeps the gateway logged in, but connect() is responsible for
-        VERIFYING the brokerage (trading) session is live — the /iserver-tier
-        session, not just the read-only portal tier. A gateway that is up but
-        not trading-authenticated is the classic trap: some calls succeed, order
-        calls silently fail. Also enforce the single-brokerage-session reality
-        by using the dedicated bot username (a manual TWS login on the same
-        username would evict this session).
-
-        Binance: confirm signed/authenticated REST+WS connectivity and that the
-        futures account is reachable.
+        Coinbase: verify the key's permissions (bound to the configured
+        portfolio, can view, can trade in live mode, can NOT transfer) and that
+        every account it sees belongs to that portfolio; refuse otherwise.
+        Paper: connect the read-only market adapter and load (or seed) the
+        paper ledger.
 
         Runs until a live trading session is confirmed; raises if it cannot
         establish one, so the executor stays HALTED rather than trading blind.
@@ -162,10 +160,8 @@ class ExecutionAdapter(ABC):
         rather than guess a price; returning a stale or one-sided touch would be
         worse than None.
 
-        IBKR: a snapshot market-data request (reqTickers) on the qualified
-        contract; equity/fx bid/ask. FX quotes are the pair's touch.
-        Binance: the futures bookTicker (best bid/ask) for the symbol — the same
-        venue orders fill at, so no cross-venue reference skew.
+        Coinbase: GET /best_bid_ask for the product — the same venue orders fill
+        at, so no cross-venue reference skew. Paper reads the same real touch.
 
         bid/ask are Decimal (str-converted at the venue boundary) so downstream
         pricing stays in Decimal.
@@ -179,10 +175,10 @@ class ExecutionAdapter(ABC):
         policy — e.g. "5% of equity per position" reads total here, converts to a
         quantity via the symbol's price, and rounds to the venue's step size.
 
-        IBKR: NetLiquidation (and AvailableFunds) from the account summary — the
-        same summary connect() already reads to confirm the trading session.
-        Binance USD-M: total and available balance from the futures account
-        (the USDT-margined wallet).
+        Coinbase spot: available = the quote currency's available balance (what
+        a new BUY can spend); total = quote (available + hold) + sum(base
+        balance x mid). Paper computes the same from its ledger, with available
+        net of cash reserved by resting BUYs.
 
         Raises if equity cannot be read (an unreadable account is a sizing-blocking
         condition — better to fail the entry loudly than size off a stale/zero
@@ -199,11 +195,8 @@ class ExecutionAdapter(ABC):
         marketable-limit pricing already respects via the adapter's price
         formatting); this is the QUANTITY granularity only.
 
-        IBKR: the qualified contract's minimum size / size increment from contract
-        details (whole shares for most equity; fx has its own lot). Cached with the
-        contract, since it doesn't change intraday.
-        Binance USD-M: the LOT_SIZE filter's stepSize from exchangeInfo for the
-        symbol. Cached per symbol.
+        Coinbase: the product's base_increment. Cached per symbol, since it
+        doesn't change intraday.
 
         None means "unknown" — the sizing policy then returns the un-floored
         quantity and relies on the adapter to express it in the symbol's
@@ -236,8 +229,8 @@ class ExecutionAdapter(ABC):
     async def submit_order(self, order: OrderRequest) -> OrderResult:
         """Place ONE marketable-limit order. Preconditions above.
 
-        Attaches order.client_order_id as the venue's client reference (IBKR
-        orderRef; Binance newClientOrderId) so a crash between submit and ack is
+        Attaches order.client_order_id as the venue's client reference (Coinbase
+        client_order_id) so a crash between submit and ack is
         resolvable by querying the venue for that exact id rather than blindly
         re-sending. IDEMPOTENT BY CONTRACT: submitting the same client_order_id
         twice must not create two orders — the adapter relies on the venue's own
@@ -281,7 +274,7 @@ class ExecutionAdapter(ABC):
     @abstractmethod
     def to_venue_symbol(self, symbol: str) -> str:
         """Canonical symbol -> the venue's native form. Mirrors AssetFeed's
-        to_native_symbol exactly. IBKR needs a contract spec (symbol + exchange
-        + currency + secType); Binance is near pass-through. The canonical form
+        to_native_symbol exactly. Coinbase is pass-through (canonical
+        "BASE-QUOTE" is already its product id). The canonical form
         is what flows through Kafka and the DB; the native form never leaves the
         adapter."""

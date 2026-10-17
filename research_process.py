@@ -38,6 +38,7 @@ from typing import Optional
 import asyncpg
 
 import config
+from config import require_env
 from execution.signal_listener import SignalListener
 from research.bars import BarCollector
 from research.earnings import import_csv
@@ -51,17 +52,10 @@ from research.quotes import QuoteCapture
 log = logging.getLogger("research_process")
 
 
-def _require(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise RuntimeError(f"missing required env var {name}")
-    return v
-
-
 class ResearchConfig:
     def __init__(self) -> None:
-        self.db_url = _require("TRADING_DB_URL")
-        self.polygon_key = _require("POLYGON_API_KEY")
+        self.db_url = require_env("TRADING_DB_URL")
+        self.polygon_key = require_env("POLYGON_API_KEY")
         self.bars_interval_s = float(os.environ.get("RESEARCH_BARS_INTERVAL_S", "900"))
         self.symbols = config.research_symbols()
 

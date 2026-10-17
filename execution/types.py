@@ -117,21 +117,22 @@ class Fill:
     fee: Decimal = Decimal(0)
     fee_currency: Optional[str] = None
     # The venue's order id this fill belongs to. Every venue stamps a fill with
-    # its parent order (Binance userTrades.orderId, IB execution.orderId), so a
-    # fill arriving asynchronously on the stream can be attributed to the trade
-    # whose order produced it — the executor maps venue_order_id -> trade at
-    # submit time. Optional because a fill discovered during reconcile (before we
-    # know our orders) may lack it; such fills are persisted and left for the
-    # position reconcile to explain.
+    # its parent order (Coinbase fills carry order_id), so a fill arriving
+    # asynchronously on the stream can be attributed to the trade whose order
+    # produced it — the executor maps venue_order_id -> trade at submit time.
+    # Optional because a fill discovered during reconcile (before we know our
+    # orders) may lack it; such fills are persisted and left for the position
+    # reconcile to explain.
     venue_order_id: Optional[str] = None
     # Our canonical cv1 client_order_id for the order this fill belongs to, when
-    # the adapter can recover it (Binance userTrades carries clientOrderId, which
-    # reverses through the adapter's compression map; IB stamps orderRef on the
-    # execution). This is the PRIMARY attribution key: it is DETERMINISTIC and
-    # known BEFORE submit, so a fill streamed in the brief submit->ack window —
-    # before we've learned this order's venue_order_id — is still attributable.
-    # Optional because reconcile may surface a foreign/older fill without it; such
-    # fills fall back to venue_order_id, then to the position reconcile.
+    # the adapter can recover it (Coinbase fills omit it, so the adapter looks
+    # each unknown order_id up once, cached, to recover its client_order_id;
+    # paper fills carry it directly). This is the PRIMARY attribution key: it
+    # is DETERMINISTIC and known BEFORE submit, so a fill streamed in the brief
+    # submit->ack window — before we've learned this order's venue_order_id —
+    # is still attributable. Optional because reconcile may surface a
+    # foreign/older fill without it; such fills fall back to venue_order_id,
+    # then to the position reconcile.
     client_order_id: Optional[str] = None
 
 
@@ -209,9 +210,9 @@ class ReconcileResult:
 class Touch:
     """Current venue best bid/ask for a symbol, used to price a marketable limit.
 
-    The unit of pricing truth, fetched live from the venue adapter (IB snapshot
-    for equity/fx, Binance bookTicker for crypto) at order time — NOT stored in
-    the DB (the 001 schema deliberately has no quotes table). bid/ask are Decimal
+    The unit of pricing truth, fetched live from the venue adapter (Coinbase
+    best_bid_ask; paper reads the same) at order time — NOT stored in the DB
+    (the 001 schema deliberately has no quotes table). bid/ask are Decimal
     so all downstream pricing arithmetic (price_marketable_limit) stays in Decimal;
     the float->Decimal boundary is crossed once, in the adapter, via str().
 
@@ -226,11 +227,11 @@ class Touch:
 class AccountEquity:
     """A venue account's current equity, for position sizing.
 
-    total is the account's total equity in `currency` (IB: NetLiquidation from
-    the account summary; Binance USD-M: total wallet/margin balance in USDT).
-    available is the portion free for new positions (IB: AvailableFunds; Binance:
-    availableBalance) — sizing that respects buying power uses this, while a
-    simple "% of equity" rule uses total. available is Optional because not every
+    total is the account's total equity in `currency` (Coinbase spot: quote
+    balance + sum(base balance x mid)). available is the portion free for new
+    positions (Coinbase: the quote currency's available balance) — sizing that
+    respects buying power uses this, while a simple "% of equity" rule uses
+    total. available is Optional because not every
     venue read cheaply distinguishes it; when absent, sizing falls back to total.
 
     Decimal throughout, str-converted at the venue boundary, same as Touch.
@@ -283,12 +284,13 @@ def qty_match_epsilon(asset_class: str) -> Decimal:
 # live executor's reconcile). An adapter that returned an unsigned magnitude for a
 # short would make every short look like a mismatch and spuriously HALT it.
 #
-# The sign IS the side — neither Binance positionRisk nor IB reqPositions returns
-# a separate side field — so we cannot cross-check sign against an independent
-# side per position. What we CAN enforce at the adapter boundary: qty is a real,
-# finite Decimal, and a flat (zero) position never leaks into the list (both are
-# detectable corruption, e.g. IB's NaN, which Decimal(str(nan)) turns into a
-# Decimal('NaN') that silently defeats every downstream comparison).
+# The sign IS the side — a venue position carries no separate side field (on
+# Coinbase spot a position is a base balance, always positive: long-only) — so
+# we cannot cross-check sign against an independent side per position. What we
+# CAN enforce at the adapter boundary: qty is a real, finite Decimal, and a flat
+# (zero) position never leaks into the list (both are detectable corruption,
+# e.g. a NaN, which Decimal(str(nan)) turns into a Decimal('NaN') that silently
+# defeats every downstream comparison).
 #
 # Every adapter's get_positions runs its result through validate_venue_positions,
 # so the contract is enforced identically and any future adapter is forced past

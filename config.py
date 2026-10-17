@@ -20,6 +20,14 @@ from __future__ import annotations
 import os
 
 
+def require_env(name: str) -> str:
+    """A required environment variable's value; RuntimeError if unset or empty."""
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"missing required env var {name}")
+    return value
+
+
 # The traded universe: base assets, all quoted in QUOTE_CURRENCY. The product
 # id is f"{base}-{QUOTE_CURRENCY}" (BTC-USD). BNB and TRX were dropped in
 # ADR-001 Phase 1. Changing the quote (e.g. to GBP or USDC) changes every

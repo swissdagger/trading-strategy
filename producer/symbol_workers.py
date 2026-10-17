@@ -305,7 +305,9 @@ class SymbolWorkerPool:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                pass
+                # The stage loops catch per-bar errors, so a task that ended
+                # with one died outside them: say so rather than lose it.
+                log.exception("symbol worker task %s ended with an error", t.get_name())
         log.info("symbol worker pool stopped (%d pipelines)", len(self._pipes))
 
     def worker_count(self) -> int:

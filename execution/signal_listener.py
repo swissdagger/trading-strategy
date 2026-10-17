@@ -234,14 +234,16 @@ class SignalListener:
             self._terminated.set()
         if conn is None:
             return
+        # Best effort: the connection is being dropped (often because it
+        # already died), so a failure here is expected and changes nothing.
         try:
             await conn.remove_listener(CHANNEL, self._on_notify)
         except Exception:
-            pass
+            log.debug("remove_listener on a closing connection failed", exc_info=True)
         try:
             await conn.close()
         except Exception:
-            pass
+            log.debug("closing the LISTEN connection failed", exc_info=True)
 
     def _on_notify(self, conn, pid, channel, payload) -> None:
         """asyncpg listener callback — runs in the connection's read loop.

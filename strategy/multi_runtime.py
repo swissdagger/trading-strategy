@@ -111,17 +111,17 @@ class MultiStrategyRuntime:
     async def on_raw_event(self, raw: dict) -> None:
         """Single ingress per causal-events message: a RAW event dict from the
         router (carrying `ladder`). Acquires the symbol lock, then processes
-        (entry fan-out, exit sweep) via _process_raw_locked.
+        (entry fan-out, exit sweep) via process_raw_locked.
 
         The caller must NOT already hold the symbol lock — this is the entry
         point for callers OUTSIDE the shared-lock region (e.g. a Kafka consumer
         loop, or the tests). The in-lock entry point the router's publish sink
-        uses is _process_raw_locked directly (see _publish in signal_process),
+        uses is process_raw_locked directly (see _publish in signal_process),
         which is why processing lives there and this method is a thin
         lock-acquire wrapper around it."""
         symbol = raw["symbol"]
         async with self._lock(symbol):
-            await self._process_raw_locked(raw)
+            await self.process_raw_locked(raw)
 
     # Backward-compatible alias: some callers/tests drive the runtime with a raw
     # dict via on_raw_event_direct. It has the same contract as on_raw_event
@@ -131,7 +131,7 @@ class MultiStrategyRuntime:
         Same contract: raw dict in, lock acquired here, processed."""
         await self.on_raw_event(raw)
 
-    async def _process_raw_locked(self, raw: dict) -> None:
+    async def process_raw_locked(self, raw: dict) -> None:
         """Process one raw tagged event, assuming the caller ALREADY HOLDS this
         symbol's lock (the shared-lock entry point the router's publish sink
         calls — re-acquiring a non-reentrant asyncio.Lock would deadlock).

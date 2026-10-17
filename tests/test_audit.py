@@ -162,3 +162,59 @@ def test_empty_cache_is_explicit():
     snap = AuditCache().snapshot()
     assert snap["chains"] is None
     assert snap["computed_at_age_seconds"] is None
+
+
+# --- the DB integrity view (real Postgres) ----------------------------------
+
+import asyncio
+import os
+import uuid
+
+DSN = os.environ.get("QISS_TEST_DSN")
+
+
+async def _refresh(pool, ladders):
+    from producer.audit import make_chain_audit_refresher
+    cache = AuditCache()
+    task = asyncio.create_task(
+        make_chain_audit_refresher(pool, cache, interval_seconds=60, ladders=ladders)())
+    try:
+        for _ in range(200):
+            snap = cache.snapshot()
+            if snap["chains"] is not None or snap["last_refresh_error"]:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+    assert snap["last_refresh_error"] is None, snap["last_refresh_error"]
+    return snap["chains"]
+
+
+@pytest.mark.skipif(not DSN, reason="QISS_TEST_DSN not set; needs real Postgres")
+@pytest.mark.asyncio
+async def test_chain_audit_checks_every_configured_ladder_and_flags_unconfigured_ones():
+    import asyncpg
+    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=2, statement_cache_size=0)
+    ladders = {"FC": ["1m", "3m", "5m", "15m", "1h"], "CN": ["30s", "45s", "1m"]}
+    sym = f"AUDIT-{uuid.uuid4().hex[:6]}"
+    rows = [  # (ladder, active_timeframes)
+        ("FC", ["1m", "3m"]),          # fine
+        ("CN", ["30s", "1m"]),         # skips 45s: a shape violation on CN
+        ("PF", ["1m"]),                # deleted ladder: no machine will ever end it
+    ]
+    try:
+        before = await _refresh(pool, ladders)
+        for i, (ladder, tfs) in enumerate(rows):
+            await pool.execute(
+                "INSERT INTO chains (chain_id, symbol, asset_class, direction, origin_time, "
+                "propagation_levels, active_timeframes, ladder) "
+                "VALUES ($1, $2, 'crypto', 1, now() - make_interval(mins => $3), $4, $5, $6)",
+                f"chain1.{sym}.{i}", sym, i, len(tfs), tfs, ladder)
+        after = await _refresh(pool, ladders)
+    finally:
+        await pool.execute("DELETE FROM chains WHERE symbol = $1", sym)
+        await pool.close()
+    assert after["active_chains"] - before["active_chains"] == 3
+    assert after["shape_violations"] - before["shape_violations"] == 1
+    assert after["active_unconfigured_ladder"] - before["active_unconfigured_ladder"] == 1
+    assert after["active_by_ladder"]["PF"] - before["active_by_ladder"].get("PF", 0) == 1

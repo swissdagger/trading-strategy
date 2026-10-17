@@ -1,10 +1,10 @@
 """
 strategy/chain_history.py — a chain-history view for the confirmed_15m
-confirmation strategy.
+confirmation strategy (also used by strategy/chain_recorder.py).
 
-The two-ladder ChainView tracks only CURRENTLY-ACTIVE chains and keeps just
-(direction, peak_level) — it forgets a chain the moment it terminates and never
-records timestamps. The confirmed_15m confirmation strategy needs more:
+Tracking only CURRENTLY-ACTIVE chains as (direction, peak_level) — forgetting
+a chain the moment it terminates, with no timestamps — is not enough. The
+confirmed_15m confirmation strategy needs more:
 
   * TERMINATED chains, because its initiation phase reasons about a chain that
     FAILED (an opposing 1m chain that terminated before reaching 3m);
@@ -14,10 +14,8 @@ records timestamps. The confirmed_15m confirmation strategy needs more:
   * chain ORDERING in time, to identify "two initiators then a failed opposing
     chain then a confirming chain".
 
-So this strategy owns its own history structure rather than reusing the
-two-ladder ChainView. It is DELIBERATELY SEPARATE: this is a distinct strategy
-on its own ladder [1m,3m,5m,15m,1h], not part of the A/B two-ladder design, and
-coupling them would entangle two unrelated strategies.
+So this strategy owns its own history structure, on its own ladder (FC:
+[1m,3m,5m,15m,1h]), rather than sharing chain state with other strategies.
 
 ## Retention: count cap only, no time-based eviction
 
@@ -36,22 +34,21 @@ the place to optimize (see confirmed_15m_strategy._match_pattern).
 
 ## FUTURE — chain-monitoring encapsulation (deferred, YAGNI)
 
-This is the SECOND chain-monitoring structure in QISS (the two-ladder ChainView
-is the first). They overlap — both fold events, retain state, answer queries —
-but differ in WHAT they retain (this one keeps terminated chains + per-level
-timestamps; ChainView keeps only active chains + peak level). With only two
-strategies that is an acceptable, small duplication, and the right shared
-abstraction is better DISCOVERED from a third example than guessed from two.
+This is not the only chain-monitoring state in QISS (the chain rules keep their
+own trade state; strategy/chain_rules.py). They overlap — both fold events,
+retain state, answer queries — but differ in WHAT they retain. That is an
+acceptable, small duplication, and the right shared abstraction is better
+DISCOVERED from more examples than guessed from two.
 
-When a third strategy arrives, revisit: if it can reuse this view, extract
-nothing; if it needs a third variant, the three together will reveal the real
+When another strategy arrives, revisit: if it can reuse this view, extract
+nothing; if it needs a new variant, the set together will reveal the real
 shared base. The likely long-term shape is a `ChainMonitor` protocol
 (apply(event) + queries) with the runtime owning a SET of monitors and folding
 each event into all of them once — inverting today's "each strategy folds its
-own" (see confirmed_15m_adapter's double-fold) into "runtime folds once per
-monitor, strategies subscribe". Deferred deliberately: doing it now would be
-premature generalization from N=2. Do NOT build it until a concrete third
-strategy forces the question.
+own" (confirmed_15m_adapter and chain_recorder each fold their own view)
+into "runtime folds once per monitor, strategies subscribe". Deferred
+deliberately: doing it now would be premature generalization. Do NOT build it
+until a concrete new strategy forces the question.
 """
 from __future__ import annotations
 
@@ -99,9 +96,9 @@ class ChainHistoryView:
     """Per-symbol rolling history of chains on ONE ladder, retaining terminated
     chains and per-level timestamps for the confirmation strategy.
 
-    Fed the same raw chain events as the two-ladder view, but decoupled from it:
-    it keys purely on this strategy's ladder and ignores the A/B `set` tag.
-    Serialized per symbol by the runtime's per-symbol lock, same as ChainView.
+    Fed the raw chain events of this strategy's ladder: it keys purely on that
+    ladder's timeframes and ignores the event's `set` (ladder-name) tag.
+    Serialized per symbol by the runtime's per-symbol lock.
     """
 
     def __init__(

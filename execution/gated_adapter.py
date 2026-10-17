@@ -1,23 +1,23 @@
 """
 execution/gated_adapter.py — the master on/off wrapper for any ExecutionAdapter.
 
-Wraps a concrete adapter (IBKRAdapter, BinanceAdapter) and gates ORDER-PLACING
-calls on the master trade-enable state (execution/trade_enable.py). When trading
-is disabled, submit/cancel/amend become SAFE NO-OPS — they return a synthetic
-terminal result and touch no venue — while read/observe calls (reconcile,
-get_positions) and the session lifecycle (connect, start_fill_stream) pass
-straight through.
+Wraps a concrete adapter (CoinbaseAdapter, PaperCoinbaseAdapter) and gates
+ORDER-PLACING calls on the master trade-enable state (execution/trade_enable.py).
+When trading is disabled, submit/cancel/amend become SAFE NO-OPS — they return
+a synthetic terminal result and touch no venue — while read/observe calls
+(reconcile, get_positions) and the session lifecycle (connect,
+start_fill_stream) pass straight through.
 
-## Why a wrapper, not `if enabled` inside IBKRAdapter
+## Why a wrapper, not `if enabled` inside CoinbaseAdapter
 
 The concrete adapter is the dangerous code — it talks to a real brokerage with
 real money. Scattering enable-checks through it means the safety switch is
 entangled with the venue logic, and a missed check is a live order that should
 not have gone out. Isolating the gate in one wrapper means:
 
-  - the IB adapter stays a pure venue translator, with no concept of "enabled";
+  - the Coinbase adapter stays a pure venue translator, with no concept of "enabled";
   - there is exactly ONE place an order can be suppressed, auditable at a glance;
-  - the SAME gate protects any future adapter (Binance) for free;
+  - the SAME gate protects the paper adapter and any future one for free;
   - the gate composes with kill_switch: the executor checks kill_switch, this
     checks trade_enabled, and BOTH must allow an order. This wrapper owns only
     the trade_enabled half — it does NOT know about kill_switch, keeping the two
@@ -55,6 +55,7 @@ from decimal import Decimal
 from typing import List, Optional
 
 from execution.adapter import ExecutionAdapter, FillCallback
+from execution.read_only_adapter import ReadOnlyAdapter
 from execution.trade_enable import TradeEnableState
 from execution.types import (
     AccountEquity,
@@ -91,6 +92,18 @@ class GatedAdapter(ExecutionAdapter):
         self.venue = inner.venue
         self.supported_classes = inner.supported_classes
         self.supports_short = inner.supports_short
+
+    @property
+    def inner(self) -> ExecutionAdapter:
+        return self._inner
+
+    def block_all_writes(self) -> None:
+        """From now on every write comes back REJECTED (READ_ONLY), whatever
+        the enable state; reads still pass through. For a trade-mode change
+        that switches venue, until the process restarts against the new one.
+        Idempotent."""
+        if not isinstance(self._inner, ReadOnlyAdapter):
+            self._inner = ReadOnlyAdapter(self._inner)
 
     # ---- session lifecycle: pass through ----
     # connect/start_fill_stream are NOT gated: we still want a live session and

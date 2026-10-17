@@ -208,12 +208,13 @@ def chain_id_for(symbol: str, asset_class: str, ladder_name: str,
     like chain_steps' (chain_id, step_index) and trade_signals' signal_id. Same
     "prefix + truncated sha256" shape as signal_writer._signal_id, for consistency.
 
-    LADDER NAME IS PART OF THE KEY AND MUST STAY THERE. Ladders overlap: FC and
-    PF share the 1m baseline and both run on crypto symbols, so one 1m signal
-    legitimately initiates TWO chains — same symbol, direction, and origin_time,
-    different ladders. Keying on the baseline timeframe instead of the ladder name
-    would collapse them into one row and let two machines with different level
-    numbering fight over it.
+    LADDER NAME IS PART OF THE KEY AND MUST STAY THERE. Ladders overlap: two
+    ladders that share a baseline on the same symbols (as FC and the former PF
+    ladder did at 1m on crypto) see one baseline signal legitimately initiate
+    TWO chains — same symbol, direction, and origin_time, different ladders.
+    Keying on the baseline timeframe instead of the ladder name would collapse
+    them into one row and let two machines with different level numbering
+    fight over it.
     """
     raw = f"chain1|{symbol}|{asset_class}|{ladder_name}|{direction}|{origin_timestamp}"
     return "chain1." + hashlib.sha256(raw.encode()).hexdigest()[:32]
@@ -318,9 +319,9 @@ class ServiceTwoChainMachine(ChainMachine):
         # see ForecastMemo. If None, every call goes to the API (standalone/test
         # posture); the live process constructs exactly one and injects it.
         self._forecast_memo = forecast_memo
-        # Rungs whose empty/short buffer is EXPECTED and acceptable (e.g. PF's
-        # 12h top rung, above the scale-out schedule, warmable only for venue
-        # listings older than ~6.9 years). Downgrades the hydrate fill report
+        # Rungs whose empty/short buffer is EXPECTED and acceptable (e.g. DL's
+        # 4h/6h rungs: 5000 bars of equity session time is years of history,
+        # more than a young listing has). Downgrades the hydrate fill report
         # for these rungs from WARNING to INFO; affects LOGGING ONLY — an
         # unwarmed rung is inert either way (it never forecasts until its
         # buffer reaches WINDOW_SIZE, and chains below it are unaffected).
@@ -444,7 +445,7 @@ class ServiceTwoChainMachine(ChainMachine):
             is CAPPED at the level below the short rung until it fills; any
             strategy logic keyed to deeper levels never fires for this symbol.
           * short rung in optional_timeframes -> INFO. Expected-short by
-            configuration (e.g. PF's 12h, above the scale-out schedule).
+            configuration (e.g. DL's 4h/6h; config.LADDER_OPTIONAL_TIMEFRAMES).
 
         The days-to-fill estimate assumes live bars arrive continuously — true
         for crypto, an underestimate for session-bound classes.

@@ -62,8 +62,9 @@ operator needs to know:
 - **Symbols are Coinbase product ids** (`BTC-USD`) = `config.CRYPTO_BASES` ×
   `config.QUOTE_CURRENCY`. Changing the quote currency changes every symbol and
   needs a fresh database.
-- **Derived rungs.** 3m (and 4h/12h for the disabled PF ladder) are aggregated
-  from 1m (1h/6h). They are not Coinbase granularities.
+- **Derived rungs.** 2m and 3m are aggregated from 1m (4h/12h, should a ladder
+  need them, from 1h/6h); the CN ladder's 30s/45s rungs are built from raw
+  trades. None of these are Coinbase granularities.
 - **Gaps.** Coinbase returns no candle for an interval with no trades. The feed
   passes the gaps through and never fabricates flat bars. Thin books gap a lot
   at 1m (AAVE-USD: ~17% of minutes, mostly 21:00–01:00 UTC). Sumtyme runs in step
