@@ -14,6 +14,9 @@ data we will get, so instead of dropping them the executor routes them here:
     (partial-exit) row is ignored.
   * Shadow-only strategies (the chain rules) fill both legs at the signal's
     decision_price instead, per their spec; the touch only if it is missing.
+  * Manual-trade strategies (config.MANUAL_TRADE_STRATEGIES: equity CFDs the
+    owner places by hand) post each open and close to Slack at once, naming
+    where to place it, instead of joining the batched shadow digest.
 
 Nothing here is ever sized or sent to a venue, and nothing here touches the
 real book: shadow positions are not part of reconcile, sizing, the
@@ -91,6 +94,21 @@ def net_pnl_bps(side: TradeSide, entry_px: Decimal, exit_px: Decimal,
     return (gross - 2 * fee_bps).quantize(Decimal("0.0001"))
 
 
+def _signal_time(row: dict) -> str:
+    """When the signal was written, for a manual-trade alert: the owner acts
+    on it by hand and must see how old it is."""
+    at = row.get("created_at")
+    if isinstance(at, str):
+        try:
+            at = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            return at
+    if isinstance(at, datetime):
+        at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        return at.astimezone(timezone.utc).strftime("%H:%M:%S UTC")
+    return "time unknown"
+
+
 def _ms_to_dt(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
@@ -99,7 +117,7 @@ class ShadowBook:
     def __init__(self, hooks: ShadowHooks, *, taker_fee_bps: Decimal,
                  fee_bps_fn: Optional[Callable[[], Awaitable[Optional[Decimal]]]] = None,
                  fee_bps_by_class: Optional[dict] = None,
-                 opened_digest=None):
+                 opened_digest=None, manual_strategies: Optional[dict] = None):
         """taker_fee_bps: the fallback fee per leg. fee_bps_fn: optional async
         source of the account's real taker fee (the venue's fee tier); when it
         returns a value, that is what a new virtual entry is charged."""
@@ -113,6 +131,8 @@ class ShadowBook:
         # Where "shadow trade opened" alerts collect for a batched Slack post
         # (ops.alerts.AlertDigest); None alerts once per open.
         self.opened_digest = opened_digest
+        # strategy -> where its trades are placed by hand (e.g. "Trading 212").
+        self.manual_strategies = dict(manual_strategies or {})
         self._open: Dict[Tuple[str, str], ShadowPosition] = {}
 
     async def _fee_bps(self, asset_class: Optional[str] = None) -> Decimal:
@@ -193,7 +213,12 @@ class ShadowBook:
             # add). Track it; the DB row is the original.
             log.info("shadow ENTER %s/%s already recorded", strategy, position_key)
         self._open[(strategy, position_key)] = pos
-        if inserted:
+        if inserted and strategy in self.manual_strategies:
+            log.warning("MANUAL TRADE — OPEN %s %s @ %s on %s (%s; signal %s; position %s)",
+                        side.value, pos.symbol, px, self.manual_strategies[strategy],
+                        strategy, _signal_time(row), position_key,
+                        extra=alert(f"manual-open:{strategy}:{position_key}", every=0))
+        elif inserted:
             line = (f"{side.value} {pos.symbol} {pos.asset_class} @ {px} ({source}; fee "
                     f"{fee_bps} bps/leg; strategy {strategy}, position {position_key})")
             if self.opened_digest is not None:
@@ -237,3 +262,10 @@ class ShadowBook:
         self._open.pop((strategy, position_key), None)
         log.info("shadow EXIT %s %s %s @ %s (%s) pnl=%sbps net", strategy,
                  pos.side.value, pos.symbol, px, source, pnl)
+        if strategy in self.manual_strategies:
+            log.warning("MANUAL TRADE — CLOSE %s %s @ %s on %s (%s, reason %s; signal %s; "
+                        "opened @ %s, %s bps net on the shadow book)",
+                        pos.side.value, pos.symbol, px, self.manual_strategies[strategy],
+                        strategy, row.get("exit_reason") or "MANUAL", _signal_time(row),
+                        pos.entry_px, pnl,
+                        extra=alert(f"manual-close:{strategy}:{position_key}", every=0))

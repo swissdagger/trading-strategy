@@ -286,6 +286,7 @@ class SignalExecutor:
         enter_max_age_ms: Optional[int] = None,
         orphan_allowlist: FrozenSet[str] = frozenset(),
         shadow_only_strategies: FrozenSet[str] = frozenset(),
+        traded_strategies: Optional[FrozenSet[str]] = None,
         mode_label: Optional[Callable[[], str]] = None,
     ):
         """
@@ -293,6 +294,9 @@ class SignalExecutor:
             (adapter.supports_short is False). None => such signals are skipped.
         shadow_only_strategies: strategies whose ENTERs always go to the shadow
             book, in every trade mode (paper rules that must never reach a venue).
+        traded_strategies: the ONLY strategies allowed to reach the venue;
+            every other strategy is shadowed (fail closed). None => no
+            allowlist (tests; the launcher always passes one).
         max_open_positions: cap on non-terminal trades across all symbols,
             checked before every ENTER. None => no cap.
         enter_max_age_ms: an ENTER whose row was written (created_at) longer
@@ -305,11 +309,13 @@ class SignalExecutor:
         self.hooks = hooks
         self.shadow_book = shadow_book
         self.shadow_only_strategies = frozenset(shadow_only_strategies or ())
+        self.traded_strategies = (None if traded_strategies is None
+                                  else frozenset(traded_strategies))
         # The trade mode ('paper' / 'live'), for alerts; the launcher wires it.
         self._mode_label = mode_label or (lambda: "?")
-        # Strategies treated as shadow-only by name prefix although missing
-        # from shadow_only_strategies (logged once each; see _is_shadow_only).
-        self._shadow_by_prefix_logged: set = set()
+        # Strategies shadowed only because they are missing from the traded
+        # allowlist and unknown to shadow_only_strategies (logged once each).
+        self._shadow_unlisted_logged: set = set()
         self._max_open_positions = max_open_positions
         self._enter_max_age_ms = enter_max_age_ms
         self._orphan_allowlist = frozenset(orphan_allowlist)
@@ -711,17 +717,17 @@ class SignalExecutor:
             await self._open_position(row, key, side)
 
     def _is_shadow_only(self, strategy: str) -> bool:
-        """Shadow-only: listed in shadow_only_strategies, OR named rule* (the
-        chain rules are paper-only by their own spec). Fails closed: a rule
-        missing from the configured set is still kept off the venue, with one
-        ERROR per strategy so the config gap is fixed."""
+        """Shadow-only: listed in shadow_only_strategies, OR missing from the
+        traded allowlist. Fails closed: a strategy the config does not name at
+        all is kept off the venue, with one ERROR per strategy so the gap is
+        seen."""
         if strategy in self.shadow_only_strategies:
             return True
-        if strategy.startswith("rule"):
-            if strategy not in self._shadow_by_prefix_logged:
-                self._shadow_by_prefix_logged.add(strategy)
-                log.error("strategy %r is not in SHADOW_ONLY_STRATEGIES but is a rule* "
-                          "strategy — treating it as shadow-only; fix the config",
+        if self.traded_strategies is not None and strategy not in self.traded_strategies:
+            if strategy not in self._shadow_unlisted_logged:
+                self._shadow_unlisted_logged.add(strategy)
+                log.error("strategy %r is in neither TRADED_STRATEGIES nor "
+                          "SHADOW_ONLY_STRATEGIES — treating it as shadow-only",
                           strategy)
             return True
         return False

@@ -144,7 +144,7 @@ def test_rule3_new_equiv_on_dl_would_land_on_the_wrong_rungs_and_is_refused_with
                          params={"entry_tf": "3m", "confirm_tf": "5m"})
 
 
-def test_shipped_config_enables_the_three_runnable_rules_shadow_only():
+def test_shipped_config_enables_the_rules_and_trades_only_rule3_v1():
     enabled = {k for k, v in CFG.STRATEGIES.items() if v["enabled"]}
     assert {"rule1_v1", "rule1_new_literal_v1", "rule3_v1"} <= enabled
     assert {"rule3_new_literal_v1", "rule3_new_equiv_v1"} <= enabled
@@ -152,9 +152,18 @@ def test_shipped_config_enables_the_three_runnable_rules_shadow_only():
     assert set(CFG.EXTRA_LADDERS["CN"]) <= set(CFG.ASSET_CONFIGS["crypto"]["timeframes"])
     assert CFG.EXTRA_LADDERS["ED"] == ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"]
     assert CFG.STRATEGIES["rule1_v1"]["ladders"] == ["ED"]
-    assert CFG.STRATEGIES["rule3_v1"]["ladders"] == ["FC"]
+    # Latency budget: rule1_v1 (ED, cheap) on four equities; the dense DL
+    # ladder only on the equity subminute_symbols (NVDA), seconds rungs too.
+    assert CFG.STRATEGIES["rule1_v1"]["symbols"] == ["NVDA", "XOM", "META", "INTC"]
+    for k in ("rule1_new_literal_v1", "chain_recorder"):
+        assert CFG.STRATEGIES[k]["symbols"] == ["NVDA"] and CFG.STRATEGIES[k]["ladders"] == ["DL"]
+    assert not CFG.serves("equity", "XOM", "30s") and CFG.serves("equity", "NVDA", "30s")
+    assert CFG.STRATEGIES["rule3_v1"]["ladders"] == ["ED"]
+    assert set(CFG.EXTRA_LADDERS["ED"]) <= set(CFG.ASSET_CONFIGS["crypto"]["timeframes"])
     assert "5m" in CFG.ASSET_CONFIGS["equity"]["timeframes"]
-    for k in ("rule1_v1", "rule1_new_literal_v1", "rule3_v1", "rule3_new_literal_v1", "rule3_new_equiv_v1"):
+    # rule3_v1 is the one traded rule; the rest stay shadow-only.
+    assert CFG.TRADED_STRATEGIES == frozenset({"rule3_v1"})
+    for k in ("rule1_v1", "rule1_new_literal_v1", "rule3_new_literal_v1", "rule3_new_equiv_v1"):
         assert k in CFG.SHADOW_ONLY_STRATEGIES
 
 

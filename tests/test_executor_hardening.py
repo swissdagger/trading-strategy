@@ -493,8 +493,8 @@ class SizingAdapter:
 async def test_sizing_uses_available_not_total():
     eq = AccountEquity(total=Decimal("100000"), available=Decimal("20000"), currency="USD")
     size = make_size_position(lambda: SizingAdapter(eq))
-    # 5% of 20,000 available / mid 100 = 10.
-    assert await size("BTC-USD", "crypto", TradeSide.LONG, None) == Decimal("10")
+    # 10% of 20,000 available / mid 100 = 20.
+    assert await size("BTC-USD", "crypto", TradeSide.LONG, None) == Decimal("20")
 
 
 @pytest.mark.asyncio
@@ -613,7 +613,7 @@ async def test_shadow_only_strategy_long_on_supported_class_is_shadowed():
 
 @pytest.mark.asyncio
 async def test_non_shadow_only_strategy_still_reaches_venue():
-    ex, adapter, store = await shadow_executor(shadow_only_strategies=frozenset({"rule3_v1"}))
+    ex, adapter, store = await shadow_executor(shadow_only_strategies=frozenset({"rule1_v1"}))
     await ex.handle_signal(enter_row(direction="LONG"))
     assert adapter.submitted != [] and ("two_ladder", "chainX:L") not in store.rows
 
