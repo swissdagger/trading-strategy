@@ -21,6 +21,11 @@ from collections import deque
 
 log = logging.getLogger("producer.persistence")
 
+def _as_timestamptz_or_none(value):
+    """_as_timestamptz for an optional field: None stays None."""
+    return None if value is None else _as_timestamptz(value)
+
+
 def _as_timestamptz(value: Union[str, datetime]) -> datetime:
     """Coerce a decision timestamp to a datetime for a timestamptz bind.
 
@@ -110,12 +115,15 @@ def make_persist_chain_init(pool):
                 await conn.execute(
                     """
                     INSERT INTO chain_steps
-                        (chain_id, step_index, level, timeframe, step_time, price)
-                    VALUES ($1, 0, $2, $3, $4, $5)
+                        (chain_id, step_index, level, timeframe, step_time, price,
+                         bar_close, detected_at)
+                    VALUES ($1, 0, $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (chain_id, step_index) DO NOTHING
                     """,
                     chain["chain_id"], first["level"], first["timeframe"],
                     origin_time, first.get("price"),
+                    _as_timestamptz_or_none(first.get("bar_close")),
+                    _as_timestamptz_or_none(first.get("detected_at")),
                 )
     return persist_chain_init
 
@@ -151,12 +159,15 @@ def make_persist_chain_propagate(pool):
                 await conn.execute(
                     """
                     INSERT INTO chain_steps
-                        (chain_id, step_index, level, timeframe, step_time, price)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                        (chain_id, step_index, level, timeframe, step_time, price,
+                         bar_close, detected_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (chain_id, step_index) DO NOTHING
                     """,
                     chain_id, new_step["level"] - 1, new_step["level"],
                     new_step["timeframe"], step_time, new_step.get("price"),
+                    _as_timestamptz_or_none(new_step.get("bar_close")),
+                    _as_timestamptz_or_none(new_step.get("detected_at")),
                 )
     return persist_chain_propagate
 
@@ -253,7 +264,7 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
             step_rows = await conn.fetch(
                 """
                 SELECT cs.chain_id, cs.step_index, cs.level, cs.timeframe,
-                       cs.step_time, cs.price
+                       cs.step_time, cs.price, cs.bar_close, cs.detected_at
                 FROM chain_steps cs
                 JOIN chains c ON c.chain_id = cs.chain_id
                 WHERE c.active = true AND c.symbol = $1 AND c.asset_class = $2
@@ -271,6 +282,10 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
                 # step_time is timestamptz; the machine compares/parses ISO
                 # strings, so emit isoformat exactly as the live path stored it.
                 "timestamp": s["step_time"].isoformat(),
+                # NULL on steps written before migration 027; the machine then
+                # derives the close from the label (open + one timeframe).
+                "bar_close": s["bar_close"].isoformat() if s["bar_close"] else None,
+                "detected_at": s["detected_at"].isoformat() if s["detected_at"] else None,
                 "price": s["price"],
             })
         out = []
@@ -295,6 +310,7 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
                 "next_expected_level": len(history),
                 "active_timeframes": list(r["active_timeframes"]),
                 "history": history, "last_timestamp": last["timestamp"],
+                "last_bar_close": last["bar_close"],
             })
         return out
     return load_active_chains
@@ -396,8 +412,8 @@ def make_insert_signal(pool):
                     INSERT INTO trade_signals
                         (signal_id, position_key, chain_id, direction, action,
                          symbol, asset_class, strategy, trigger_level, decision_price,
-                         exit_reason, fraction, decided_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                         exit_reason, fraction, decided_at, decided_bar_close)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                     ON CONFLICT (signal_id) DO NOTHING
                     """,
                     row["signal_id"], row["position_key"], row["chain_id"],
@@ -414,6 +430,7 @@ def make_insert_signal(pool):
                     # cumulative-fraction arithmetic relies on exactness.
                     Decimal(str(row.get("fraction", 1.0))),
                     decided_at,
+                    _as_timestamptz_or_none(row.get("decided_bar_close")),
                 )
         except Exception:
             # An exception here is exactly the failure mode that once killed the

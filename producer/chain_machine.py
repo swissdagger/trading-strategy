@@ -71,8 +71,9 @@ class ChainEvent:
     direction: int
     propagation_level: int
     timeframe: str             # the timeframe this event occurred at
-    timestamp: str             # ISO; the closing bar's time
+    timestamp: str             # ISO; the deciding bar's LABEL (its open time)
     price: Optional[float] = None
+    bar_close: Optional[str] = None   # ISO; when that bar closed (the information's time)
 
 
 class ChainMachine(ABC):

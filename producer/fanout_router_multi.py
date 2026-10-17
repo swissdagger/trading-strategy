@@ -311,6 +311,8 @@ class MultiLadderRouter:
             "propagation_level": ce.propagation_level,
             "metadata": {"propagation_level": ce.propagation_level},
             "timestamp": ce.timestamp,
+            # When the deciding bar CLOSED (timestamp is its open label).
+            "bar_close": getattr(ce, "bar_close", None),
             # The price the strategy SAW when this event fired. ChainEvent has
             # carried it all along ("so the signal's decision_price is available
             # downstream" — chain_machine.py), but it was dropped HERE, so
@@ -321,7 +323,7 @@ class MultiLadderRouter:
             # the field name both strategies' entry/exit components already read.
             "decision_price": ce.price,
             # When this event was DETECTED (wall clock), as opposed to
-            # `timestamp` (the closing bar, one timeframe earlier). The
+            # `timestamp` (the deciding bar's open) and `bar_close`. The
             # strategy package's replay harness needs it to time entries the
             # way live does (its spec §2.4); additive, ignored by everything
             # else.

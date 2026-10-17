@@ -101,6 +101,7 @@ class SignalWriter:
         decided_at: str,            # ISO timestamp from the triggering signal
         decision_price: Optional[float] = None,
         trigger_level: Optional[int] = None,
+        decided_bar_close: Optional[str] = None,   # ISO; the deciding bar's close
     ) -> str:
         """Emit an ENTER signal: announces a new position and defines its key.
         Returns the position_key the consumer will track this position by (and
@@ -124,6 +125,7 @@ class SignalWriter:
             # is uniform across actions for the insert path.
             "fraction": 1.0,
             "decided_at": decided_at,
+            "decided_bar_close": decided_bar_close,
         }
         newly = await self.hooks.insert_signal(row)
         if newly:
@@ -146,6 +148,7 @@ class SignalWriter:
         trigger_level: Optional[int] = None,
         fraction: float = 1.0,
         tranche: Optional[int] = None,
+        decided_bar_close: Optional[str] = None,
     ) -> str:
         """Emit an EXIT signal: references an existing position by key and asks
         to close FRACTION of it (default 1.0 — the whole position, exactly the
@@ -196,6 +199,7 @@ class SignalWriter:
             "exit_reason": reason.value,
             "fraction": fraction,
             "decided_at": decided_at,
+            "decided_bar_close": decided_bar_close,
         }
         newly = await self.hooks.insert_signal(row)
         if newly:

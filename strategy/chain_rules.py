@@ -36,7 +36,8 @@ The adapter, and only this:
      on the Trade and in the log). decision_price: the event's price for an
      event-driven intent; for a clock-driven one, the newest close the signal
      process has seen in the bar stream (strategy/vol_source.LiveCloses).
-     decided_at: the event timestamp, or now.
+     decided_at: the event timestamp (the deciding bar's open label), or now;
+     decided_bar_close: that bar's close for an event-driven intent, else None.
 
   5. ACKS. These strategies are shadow-only (config.SHADOW_ONLY_STRATEGIES
      and the executor's class gate): the shadow book fills at decision_price
@@ -209,7 +210,7 @@ class ChainRuleEntry:
         if raw is None:
             raw = {k: getattr(ev, k, None) for k in (
                 "event_type", "symbol", "asset_class", "direction", "chain_id",
-                "propagation_level", "timestamp", "decision_price")}
+                "propagation_level", "timestamp", "decision_price", "bar_close")}
             raw["metadata"] = {"propagation_level": raw.get("propagation_level")}
         if raw.get("asset_class") != self._asset_class:
             return None
@@ -224,7 +225,8 @@ class ChainRuleEntry:
             self._flush_rule_log()
             await self._execute(intents, now, event_symbol=raw["symbol"],
                                 decided_at=str(raw.get("timestamp") or now.isoformat()),
-                                event_price=raw.get("decision_price"), trigger_level=lvl)
+                                event_price=raw.get("decision_price"), trigger_level=lvl,
+                                decided_bar_close=raw.get("bar_close") if raw.get("timestamp") else None)
         return None
 
     async def tick(self, now: Optional[datetime] = None) -> None:
@@ -242,7 +244,8 @@ class ChainRuleEntry:
         return self._latest_close(intent.trade.symbol)
 
     async def _execute(self, intents: List[Intent], now: datetime, *, event_symbol,
-                       decided_at: str, event_price, trigger_level) -> None:
+                       decided_at: str, event_price, trigger_level,
+                       decided_bar_close: Optional[str] = None) -> None:
         for intent in intents:
             t = intent.trade
             side = TradeSide.LONG if t.direction > 0 else TradeSide.SHORT
@@ -252,7 +255,8 @@ class ChainRuleEntry:
                     await self._writer.emit_entry(
                         chain_id=t.chain_id, side=side, symbol=t.symbol,
                         asset_class=self._asset_class, decided_at=decided_at,
-                        decision_price=price, trigger_level=self.rule.cfg.entry_level)
+                        decision_price=price, trigger_level=self.rule.cfg.entry_level,
+                        decided_bar_close=decided_bar_close)
                     self.rule.confirm_open(t.chain_id, now)
                     self.stats["opens"] += 1
                     log.info("%s ENTER %s %s chain=%s vol_ratio=%s price=%s", self._name, t.symbol,
@@ -263,7 +267,8 @@ class ChainRuleEntry:
                         chain_id=t.chain_id, side=side, symbol=t.symbol,
                         asset_class=self._asset_class, reason=reason, decided_at=decided_at,
                         decision_price=price,
-                        trigger_level=int(trigger_level) if trigger_level is not None else None)
+                        trigger_level=int(trigger_level) if trigger_level is not None else None,
+                        decided_bar_close=decided_bar_close)
                     self.rule.confirm_close(t.chain_id, now)
                     self.stats["closes"] += 1
                     log.info("%s EXIT %s %s chain=%s reason=%s (%s) price=%s", self._name,

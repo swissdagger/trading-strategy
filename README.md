@@ -77,7 +77,7 @@ fees — the only short-side data available.
 | Producer | bars | tagged chain events | `service2_machine.py`, `fanout_router_multi.py`, `ladder_registry.py` |
 | Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `confirmed_15m_*.py`, `signal_writer.py` |
 | Execution | trade signals | venue orders | `signal_listener.py`, `signal_executor.py`, `sizing.py`, `shadow_book.py`, `gated_adapter.py`, `coinbase_adapter.py`, `paper_adapter.py` |
-| Schema | — | the trading DB | `migrations/001…026` |
+| Schema | — | the trading DB | `migrations/001…027` |
 
 Dependencies point downward only. The executor never imports the strategy; both
 sides share only the DB contract and the event shape.
@@ -149,7 +149,8 @@ consumer.
 | `direction`, `symbol`, `asset_class` | symbol is the Coinbase product id (`BTC-USD`) |
 | `trigger_level`, `decision_price` | the level and price the strategy saw |
 | `exit_reason` | `STOP` \| `TARGET` (\| `SCALE` \| `TERMINAL`) on EXIT, NULL on ENTER |
-| `decided_at` | the time the deciding signal forecasts: its bar's window END (market time) |
+| `decided_at` | the deciding bar's label: its OPEN time (market time); for a clock-driven exit, the wall clock |
+| `decided_bar_close` | the deciding bar's CLOSE, when its information existed (migration 027); NULL for clock-driven signals |
 | `created_at` | when the row was written (wall time) |
 
 **Idempotency.** `signal_id` hashes `(strategy, position_key, action, discriminator)`,
@@ -308,9 +309,18 @@ unroutable by design.
   (`CloseOrderMerge` in `feeds/coinbase_spot.py`): a bar waits until every rung
   of its symbol has been read past its close. The chain machines apply bars in
   arrival order, so without this the poll timing decided whether a chain
-  propagated or terminated. The chain sweep compares signals by the moment they
-  forecast (the bar's window end), so a 1h bar at 11:00 extends a chain whose
-  top rung is a 30m bar at 11:30 — both forecast 12:00.
+  propagated or terminated.
+- **Bar times.** Bars are labelled by their OPEN time, and that label is what
+  `chain_steps.step_time`, `chains.origin_time` and `trade_signals.decided_at`
+  record. A signal's information exists at its bar's CLOSE (= label + one
+  timeframe = `signals.timestamp`, Sumtyme's placeholder), and that is what the
+  chain sweep compares across rungs: a higher rung extends a chain only with
+  information at least as new as the chain's last step. So the 1h bar
+  11:00–12:00 extends a chain whose top rung is the 30m bar 11:30–12:00 (both
+  close at 12:00). Each chain step also stores `bar_close` and `detected_at`
+  (when the machine made the step; wall clock), and `trade_signals` stores
+  `decided_bar_close` (migration 027), so nothing has to be inferred. For the
+  5m bar labelled 12:05: label 12:05, close 12:10, detected ~12:11.
 - **Restart hydration.** Every bar a machine appends is written to
   `warmup_bars` (the bar store) once applied, so a restarted signal process
   hydrates its buffers to where the last run got; Kafka replays the rest and

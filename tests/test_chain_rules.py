@@ -68,12 +68,14 @@ class Clock:
         return self.now
 
 
-def ev(event_type, symbol, direction, chain_id, level, ts, price, asset_class="equity", ladder="ED"):
+def ev(event_type, symbol, direction, chain_id, level, ts, price, asset_class="equity", ladder="ED",
+       bar_close=None):
     from strategy.multi_runtime import _RawEventView
     return _RawEventView({"event_type": event_type, "symbol": symbol, "asset_class": asset_class,
                           "direction": direction, "chain_id": chain_id, "ladder": ladder,
                           "propagation_level": level, "metadata": {"propagation_level": level},
-                          "timestamp": ts.isoformat(), "decision_price": price})
+                          "timestamp": ts.isoformat(), "decision_price": price,
+                          "bar_close": bar_close.isoformat() if bar_close else None})
 
 
 def registry():
@@ -365,3 +367,18 @@ async def test_start_warms_vol_for_every_symbol_in_the_background():
     await strat.entry.start()
     await strat.entry._warm_task
     assert sorted(sym for sym, _ in vol.prefetched) == ["NVDA", "SPCX", "XOM"]
+
+
+@pytest.mark.asyncio
+async def test_signals_carry_the_deciding_bar_close_only_when_an_event_decided_them():
+    strat, writer, _, clock = build()
+    label = clock.now - timedelta(minutes=3)                 # the 3m bar's open
+    await strat.entry.on_event(ev("chain_propagated", "NVDA", 1, "c1", 2, label, 500.0,
+                                  bar_close=clock.now))
+    clock.now += timedelta(minutes=61)                       # no L3: stall exit on the clock
+    await strat.entry.tick()
+    (k1, enter), (k2, exit_) = writer.rows
+    assert (k1, k2) == ("ENTER", "EXIT")
+    assert enter["decided_at"] == label.isoformat()
+    assert enter["decided_bar_close"] == (clock.now - timedelta(minutes=61)).isoformat()
+    assert exit_["decided_bar_close"] is None                # decided_at is the wall clock
