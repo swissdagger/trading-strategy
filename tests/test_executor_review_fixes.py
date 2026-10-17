@@ -16,6 +16,7 @@ Regressions for the execution-side review fixes:
 Driven with the fakes from test_signal_executor / test_executor_hardening.
 """
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -129,10 +130,37 @@ async def test_failed_signal_is_retried_and_cursor_never_persists_past_it():
     assert handled == ["s2"]
     assert max(saved) <= t1                       # not past the failed s1
     fail.clear()
-    lst._last_retry -= signal_listener._RETRY_INTERVAL_S + 1   # the timer is due
+    lst._next_retry["s1"] = 0                     # its backoff has elapsed
     await lst._maybe_retry_failed()
     assert handled == ["s2", "s1"]
     assert saved[-1] == t2                        # released once s1 succeeds
+
+
+@pytest.mark.asyncio
+async def test_a_failing_signal_backs_off_and_is_reported_stuck_never_dropped():
+    async def handler(row):
+        raise ConnectionError("db down")
+    lst = _listener(handler, None)
+    row = {"signal_id": "s1", "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc)}
+    await lst._dispatch_row(row)
+    delays = []
+    for _ in range(signal_listener._STUCK_AFTER + 2):
+        delays.append(lst._next_retry["s1"] - time.monotonic())
+        lst._next_retry["s1"] = 0
+        await lst._maybe_retry_failed()
+    # 5 s, 10 s, 20 s ... capped at 5 min.
+    assert 4 < delays[0] <= 5 and 9 < delays[1] <= 10 and 19 < delays[2] <= 20
+    assert max(delays) <= signal_listener._RETRY_MAX_S
+    assert lst.stuck_signals() == 1 and "s1" in lst._failed     # still retried
+    # Not due yet: no retry.
+    calls = []
+    async def counting(row):
+        calls.append(row["signal_id"])
+        raise ConnectionError("db down")
+    lst._handler = counting
+    lst._next_retry["s1"] = time.monotonic() + 60
+    await lst._maybe_retry_failed()
+    assert calls == []
 
 
 @pytest.mark.asyncio

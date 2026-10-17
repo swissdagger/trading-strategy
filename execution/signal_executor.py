@@ -185,7 +185,8 @@ class OpenTrade:
     # (order-level filled_qty) that the fill stream has not delivered yet, per
     # cancelled exit client_order_id. Subtracted from the remainder so the next
     # rung is never sized from stale stream counts (an oversell). Drained as the
-    # stream delivers those fills. In-memory only.
+    # stream delivers those fills. Rebuilt on restart from orders.filled_qty
+    # minus the order's recorded fills (load_open_trades).
     exit_unstreamed: Dict[str, Decimal] = None  # set in __post_init__
     # Venue rejections of the current rung's exit order (see
     # _EXIT_MAX_REJECT_RETRIES). In-memory only.

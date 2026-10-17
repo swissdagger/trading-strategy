@@ -329,6 +329,27 @@ def make_load_open_trades(pool: asyncpg.Pool):
                  WHERE t.state NOT IN ('CLOSED', 'REJECTED')
                 """
             )
+            # Exit quantity the venue REPORTED filled per order (orders.filled_qty,
+            # from submit/cancel results) beyond the fills the stream has
+            # delivered for that order. The executor nets it out of the next
+            # exit rung; it was in memory only, so a restart forgot it and the
+            # next rung could oversell.
+            unstreamed_rows = await conn.fetch(
+                """
+                SELECT o.trade_id, o.client_order_id,
+                       o.filled_qty - COALESCE(SUM(f.qty), 0) AS unstreamed
+                  FROM orders o
+                  JOIN trades t ON t.trade_id = o.trade_id
+                  LEFT JOIN fills f ON f.order_id = o.order_id
+                 WHERE o.intent = 'EXIT' AND t.state NOT IN ('CLOSED', 'REJECTED')
+                 GROUP BY o.order_id
+                HAVING o.filled_qty > COALESCE(SUM(f.qty), 0)
+                """
+            )
+        unstreamed: dict = {}
+        for u in unstreamed_rows:
+            unstreamed.setdefault(str(u["trade_id"]), {})[u["client_order_id"]] = \
+                Decimal(u["unstreamed"])
         out: list[OpenTrade] = []
         for r in rows:
             side = TradeSide(r["side"])
@@ -357,6 +378,7 @@ def make_load_open_trades(pool: asyncpg.Pool):
                 scale_banked={int(k): Decimal(v)
                               for k, v in json.loads(r["scale_banked_json"] or "{}").items()},
                 exit_reason=r["exit_reason"],
+                exit_unstreamed=unstreamed.get(str(r["trade_id"]), {}),
             ))
         return out
     return load_open_trades

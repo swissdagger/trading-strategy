@@ -295,3 +295,46 @@ async def test_persist_trade_never_overwrites_another_trade_on_the_same_key(pape
     finally:
         await pool.execute("DELETE FROM trades WHERE chain_id = $1", chain_id)
         await pool.execute("DELETE FROM chains WHERE chain_id = $1", chain_id)
+
+
+@pytest.mark.asyncio
+async def test_restart_rebuilds_exit_quantity_the_venue_reported_but_the_stream_did_not(paper_pool):
+    # A cancelled exit rung: the venue reported 0.3 filled at the cancel, the
+    # fill stream had delivered 0.1 of it. After a restart the next rung must
+    # still be sized net of the 0.2 in flight.
+    from execution.persistence import make_load_open_trades, make_persist_trade
+    from execution.signal_executor import OpenTrade
+    from execution.types import OrderIntent
+    from execution import client_order_id as coid
+
+    pool = paper_pool
+    chain_id = str(uuid.uuid4())
+    await pool.execute(
+        """INSERT INTO chains (chain_id, symbol, asset_class, direction, origin_time,
+                               active_timeframes, ladder)
+           VALUES ($1, 'BTC-USD', 'crypto', 1, now(), '{1m}', 'FC')""", chain_id)
+    tid = str(uuid.uuid4())
+    t = OpenTrade(trade_id=tid, strategy="confirmed_15m", position_key=f"{chain_id}:L",
+                  symbol="BTC-USD", asset_class="crypto", side=TradeSide.LONG,
+                  target_qty=Decimal("1"), filled_qty=Decimal("1"), state="CLOSING",
+                  entry_client_order_id=coid.build(tid, OrderIntent.ENTRY, 0),
+                  exit_filled_qty=Decimal("0.1"), exit_reason="STOP")
+    x0 = coid.build(tid, OrderIntent.EXIT, 0)
+    try:
+        assert await make_persist_trade(pool)(t) is True
+        oid = await pool.fetchval(
+            """INSERT INTO orders (trade_id, intent, side, status, client_order_id,
+                                   limit_price, target_qty, filled_qty, exit_reason)
+               VALUES ($1, 'EXIT', 'LONG', 'CANCELLED', $2, 100.0, 1, 0.3, 'STOP')
+               RETURNING order_id""", uuid.UUID(tid), x0)
+        await pool.execute(
+            """INSERT INTO fills (order_id, trade_id, intent, qty, price, venue_exec_id, filled_at)
+               VALUES ($1, $2, 'EXIT', 0.1, 100.0, $3, now())""",
+            oid, uuid.UUID(tid), f"exec-{tid}")
+        (loaded,) = [x for x in await make_load_open_trades(pool)() if x.trade_id == tid]
+        assert loaded.exit_unstreamed == {x0: Decimal("0.2")}
+    finally:
+        await pool.execute("DELETE FROM fills WHERE trade_id = $1", uuid.UUID(tid))
+        await pool.execute("DELETE FROM orders WHERE trade_id = $1", uuid.UUID(tid))
+        await pool.execute("DELETE FROM trades WHERE chain_id = $1", chain_id)
+        await pool.execute("DELETE FROM chains WHERE chain_id = $1", chain_id)

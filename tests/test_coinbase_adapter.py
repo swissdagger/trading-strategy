@@ -652,3 +652,18 @@ async def test_executor_long_round_trip_and_short_to_shadow():
 
 async def _noop():
     return None
+
+
+@pytest.mark.asyncio
+async def test_resubmitting_an_id_reports_the_existing_orders_real_state():
+    # Coinbase returns the EXISTING order for a repeated client_order_id; if it
+    # has since failed (or filled), a resubmit must say so, not "working".
+    fake, adapter = setup()
+    o = order()
+    first = await adapter.submit_order(o)
+    assert first.status == OrderStatus.WORKING
+    fake.orders[first.venue_order_id]["status"] = "FAILED"
+    again = await adapter.submit_order(o)
+    assert again.status == OrderStatus.REJECTED
+    assert again.venue_order_id == first.venue_order_id
+    assert len(fake.orders) == 1                       # nothing new was created

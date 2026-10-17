@@ -336,9 +336,18 @@ class CoinbaseAdapter(ExecutionAdapter):
                 if x and x != "UNKNOWN_FAILURE_REASON")
             return self._reject(cid, reason or "rejected (no reason given)")
         oid = (resp.get("success_response") or {}).get("order_id")
+        resubmitted = cid in self._coid_to_order
         if oid:
             self._coid_to_order[cid] = oid
             self._order_to_coid[oid] = cid
+        if resubmitted and oid:
+            # A repeated client_order_id creates nothing: Coinbase returns the
+            # EXISTING order (documented), which may have filled, been
+            # cancelled or failed since. Report its real state, not WORKING.
+            try:
+                return self._result_from_order(cid, await self._get_order(oid))
+            except Exception:
+                log.exception("status read for resubmitted %s failed; reporting WORKING", cid)
         return OrderResult(client_order_id=cid, status=OrderStatus.WORKING,
                            venue_order_id=oid)
 
