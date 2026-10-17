@@ -54,9 +54,8 @@ def _build_rest_feed(asset_class: str, symbols: list, timeframes: list):
     (it becomes the ws feed's backfill engine), so the two paths can't build
     the REST feed differently.
 
-    Crypto-only since ADR-001 Phase 1 (equity/fx Polygon feeds deleted); the
-    crypto feed is Coinbase spot candles since Phase 2. A future equities feed
-    adds its branch here.
+    Crypto: Coinbase spot candles (and trades for the seconds rungs). Equity:
+    Polygon aggregates (and trades for the seconds rungs).
 
     Lazy imports keep the module loadable without every feed's deps present
     and avoid importing a feed for a class that has no symbols configured.
@@ -78,8 +77,7 @@ def _build_rest_feed(asset_class: str, symbols: list, timeframes: list):
 def _build_ws_feed(asset_class: str, backfill_feed):
     """Instantiate the websocket AssetFeed for one class, composing the given
     REST feed as its reconnect-backfill engine. Returns None if the class has
-    no ws feed (config.transport_for already rejects ws for such classes, so
-    this is defence in depth, not the primary guard).
+    no ws feed (_build_feeds then raises: a startup misconfiguration).
     """
     if asset_class == "equity":
         from feeds.polygon_ws import PolygonStocksWSFeed

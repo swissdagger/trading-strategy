@@ -1,7 +1,7 @@
 """research/persistence.py — the research_* tables (migration 025)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Iterable, List, Optional
 
 import asyncpg

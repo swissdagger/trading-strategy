@@ -15,9 +15,10 @@ One server runs everything under `docker compose`:
 |---|---|---|
 | `kafka` | always | single broker; `trading-bars` and `chain-events` topics |
 | `warmup` | once | seeds `warmup_bars` + `feed_cursors`, then exits 0 |
-| `feed` | unless-stopped | Coinbase public candles → `trading-bars` |
-| `signal` | unless-stopped | bars → Sumtyme chains → `confirmed_15m` → `trade_signals` |
-| `executor` | unless-stopped | `trade_signals` → paper or live orders |
+| `feed` | unless-stopped | Coinbase candles (crypto) and Polygon (equities) → `trading-bars` |
+| `signal` | unless-stopped | bars → Sumtyme chains → strategies (`confirmed_15m`, the shadow-only chain rules) → `trade_signals` |
+| `executor` | unless-stopped | `trade_signals` → paper or live orders; shadow book for the rest |
+| `research` | unless-stopped | `trade_signals` + Polygon → `research_*` tables (off the live path) |
 
 `feed`, `signal` and `executor` start only after `warmup` has completed.
 

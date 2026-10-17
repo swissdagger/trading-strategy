@@ -68,7 +68,7 @@ import asyncio
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, List, Optional
+from typing import Callable, List, Optional
 
 from execution.types import ExitReason, TradeSide
 from ops.alerts import alert

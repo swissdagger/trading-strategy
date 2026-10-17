@@ -7,10 +7,9 @@ of truth for:
   * which strategies run and on which ladders (STRATEGIES, EXTRA_LADDERS), and
   * the execution venue's connection settings (VENUE_ENDPOINTS).
 
-ADR-001 (docs/adr/001-coinbase-spot-long-only.md): crypto-only, long-only, one
-venue (Coinbase Advanced Trade spot). The equity/fx classes are removed here; the
-asset_class plumbing (universe.py, feeds/base.is_market_open, by-class caps) is
-deliberately kept for future equities.
+ADR-001 (docs/adr/001-coinbase-spot-long-only.md): one venue (Coinbase Advanced
+Trade spot), long-only. Crypto is traded; equities (Polygon) feed the
+shadow-only chain rules and research.
 
 producer/universe.py reads ASSET_CONFIGS to resolve symbol -> asset_class. A
 symbol must appear under exactly ONE class (universe.build_symbol_class_map
@@ -162,10 +161,6 @@ def crypto_symbols() -> list[str]:
 # validation agree on the allowed set.
 VALID_TRANSPORTS = ("rest", "ws")
 
-# Asset classes that actually HAVE a websocket feed today. A class not
-# listed here must not be configured with transport="ws" — the feed
-# builder would have nothing to instantiate.
-WS_CAPABLE_CLASSES = ("crypto",)
 
 
 def transport_for(asset_class: str) -> str:
@@ -281,9 +276,8 @@ PAPER_STARTING_CASH = 10_000
 STRATEGIES = {
     "confirmed_15m": {
         "enabled": True,              # ladder is streamed + warmed (crypto config)
-        # Crypto-only: resolved just below the dict to the current crypto
-        # universe so new crypto symbols auto-join.
-        "symbols": [],                # set to crypto_symbols() below
+        # The current crypto universe, so new crypto symbols auto-join.
+        "symbols": crypto_symbols(),
         "ladders": ["FC"],            # the [1m,3m,5m,15m,1h] ladder below
         # No time-based retention (confirmed_15m's pattern span is unbounded); the
         # ChainHistoryView is bounded only by a per-symbol count cap. Override it
@@ -291,70 +285,70 @@ STRATEGIES = {
         # default; omitted => the view's default cap.
         "params": {},
     },
-}
 
-STRATEGIES["confirmed_15m"]["symbols"] = crypto_symbols()
+    # chain_recorder — a record-only OWNER for the dense equity ladder. The
+    # router only computes chains for (symbol, ladder) pairs some enabled
+    # strategy owns, so a ladder being evaluated as data still needs an owner;
+    # this one emits no trade_signals (chains and signals rows are the
+    # product). Replace it with the real DL strategy when that lands: same
+    # 'symbols'/'ladders', different key.
+    "chain_recorder": {
+        "enabled": True,          # kept on beside rule1: depth counters on /health, no signals
+        "symbols": equity_symbols(),
+        "ladders": ["DL"],
+        "params": {},
+    },
 
-# chain_recorder — a record-only OWNER for the dense equity ladder. The router
-# only computes chains for (symbol, ladder) pairs some enabled strategy owns,
-# so a ladder being evaluated as data still needs an owner; this one emits no
-# trade_signals (chains and signals rows are the product). Replace it with the
-# real DL strategy when that lands: same 'symbols'/'ladders', different key.
-STRATEGIES["chain_recorder"] = {
-    "enabled": True,              # kept on beside rule1: depth counters on /health, no signals
-    "symbols": equity_symbols(),
-    "ladders": ["DL"],
-    "params": {},
-}
-
-# ---------------------------------------------------------------------------
-# The owner's frozen chain-following rules (strategy/rules.py, run verbatim
-# through strategy/chain_rules.py). Each is its OWN pre-registered 200-trade
-# review; the package is explicit that trades are never pooled across ladders
-# or rules, which is why a rule on two ladders is two strategies.
-#
-# LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is 3m;
-# on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is 45s. The
-# adapter logs the resolved (level, rung) pairs at start. `entry_tf` /
-# `confirm_tf` pin a rule to rungs by name when a level number would land
-# somewhere else on a different ladder.
-#
-# All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the executor
-# never sends their signals to a venue, in paper or live mode. Crypto LONGs
-# would otherwise reach Coinbase.
-# ---------------------------------------------------------------------------
-STRATEGIES["rule1_v1"] = {                       # the research rule, on the research ladder
-    "enabled": True,
-    "symbols": equity_symbols(),
-    "ladders": ["ED"],
-    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 3m, L3 = 5m
-}
-STRATEGIES["rule1_new_literal_v1"] = {           # the same rule's level numbers on the dense ladder
-    "enabled": True,
-    "symbols": equity_symbols(),
-    "ladders": ["DL"],
-    "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
-}
-STRATEGIES["rule3_v1"] = {                       # crypto, pre-registered 2026-10-17
-    "enabled": True,
-    "symbols": crypto_symbols(),
-    "ladders": ["FC"],                           # FC's P2 = 3m, L3 = 5m: the research ladder's
-    "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
-}
-# The two new-ladder crypto rules, on the CN universe only (the seconds rungs
-# are built from trades for ASSET_CONFIGS["crypto"]["subminute_symbols"]).
-STRATEGIES["rule3_new_literal_v1"] = {
-    "enabled": True,
-    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
-    "ladders": ["CN"],
-    "params": {"rule": "RULE3_NEW_LITERAL", "tick_seconds": 15},  # P2 = 45s, L3 = 1m
-}
-STRATEGIES["rule3_new_equiv_v1"] = {
-    "enabled": True,
-    "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
-    "ladders": ["CN"],
-    "params": {"rule": "RULE3_NEW_EQUIV", "entry_tf": "3m", "confirm_tf": "5m",
-               "tick_seconds": 15},                               # pinned by rung, not level
+    # -----------------------------------------------------------------------
+    # The owner's frozen chain-following rules (strategy/rules.py, run
+    # verbatim through strategy/chain_rules.py). Each is its OWN
+    # pre-registered 200-trade review; the package is explicit that trades
+    # are never pooled across ladders or rules, which is why a rule on two
+    # ladders is two strategies.
+    #
+    # LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is
+    # 3m; on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is
+    # 45s. The adapter logs the resolved (level, rung) pairs at start.
+    # `entry_tf` / `confirm_tf` pin a rule to rungs by name when a level
+    # number would land somewhere else on a different ladder.
+    #
+    # All of these are SHADOW-ONLY (SHADOW_ONLY_STRATEGIES below): the
+    # executor never sends their signals to a venue, in paper or live mode.
+    # Crypto LONGs would otherwise reach Coinbase.
+    # -----------------------------------------------------------------------
+    "rule1_v1": {                       # the research rule, on the research ladder
+        "enabled": True,
+        "symbols": equity_symbols(),
+        "ladders": ["ED"],
+        "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 3m, L3 = 5m
+    },
+    "rule1_new_literal_v1": {           # the same rule's level numbers on the dense ladder
+        "enabled": True,
+        "symbols": equity_symbols(),
+        "ladders": ["DL"],
+        "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
+    },
+    "rule3_v1": {                       # crypto, pre-registered 2026-10-17
+        "enabled": True,
+        "symbols": crypto_symbols(),
+        "ladders": ["FC"],              # FC's P2 = 3m, L3 = 5m: the research ladder's
+        "params": {"rule": "RULE3_CRYPTO", "tick_seconds": 15},
+    },
+    # The two new-ladder crypto rules, on the CN universe only (the seconds
+    # rungs are built from trades for ASSET_CONFIGS["crypto"]["subminute_symbols"]).
+    "rule3_new_literal_v1": {
+        "enabled": True,
+        "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+        "ladders": ["CN"],
+        "params": {"rule": "RULE3_NEW_LITERAL", "tick_seconds": 15},  # P2 = 45s, L3 = 1m
+    },
+    "rule3_new_equiv_v1": {
+        "enabled": True,
+        "symbols": list(ASSET_CONFIGS["crypto"]["subminute_symbols"]),
+        "ladders": ["CN"],
+        "params": {"rule": "RULE3_NEW_EQUIV", "entry_tf": "3m", "confirm_tf": "5m",
+                   "tick_seconds": 15},                               # pinned by rung, not level
+    },
 }
 
 # Strategies whose signals the executor must NEVER route to a venue, in any

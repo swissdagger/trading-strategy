@@ -29,7 +29,6 @@ from strategy.registry import (
     Strategy,
     StrategyRegistry,
     namespaced_position_key,
-    split_namespaced_key,
 )
 
 log = logging.getLogger("strategy.multi_runtime")
