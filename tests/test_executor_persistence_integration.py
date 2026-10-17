@@ -252,3 +252,46 @@ async def test_paper_round_trip_through_real_persistence_and_review_queries(pape
     assert row["symbol"] == "BTC-USD" and row["trades"] == 1
     assert row["gross_pnl"] > 0 and row["fees"] > 0
     assert row["net_pnl"] == row["gross_pnl"] - row["fees"]
+
+
+# --------------------------------------------------------------------
+# trades upsert: a different trade on an occupied (chain_id, side) is refused
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_persist_trade_never_overwrites_another_trade_on_the_same_key(paper_pool):
+    from execution.persistence import make_persist_trade
+    from execution.signal_executor import OpenTrade
+    from execution.types import OrderIntent
+    from execution import client_order_id as coid
+
+    pool = paper_pool
+    chain_id = str(uuid.uuid4())
+    await pool.execute(
+        """INSERT INTO chains (chain_id, symbol, asset_class, direction, origin_time,
+                               active_timeframes, ladder)
+           VALUES ($1, 'BTC-USD', 'crypto', 1, now(), '{1m}', 'FC')""", chain_id)
+
+    def trade(state, filled):
+        tid = str(uuid.uuid4())
+        return OpenTrade(trade_id=tid, strategy="confirmed_15m",
+                         position_key=f"{chain_id}:L", symbol="BTC-USD",
+                         asset_class="crypto", side=TradeSide.LONG,
+                         target_qty=Decimal("1"), filled_qty=Decimal(filled), state=state,
+                         entry_client_order_id=coid.build(tid, OrderIntent.ENTRY, 0))
+
+    persist = make_persist_trade(pool)
+    try:
+        first = trade("OPEN", "1")
+        assert await persist(first) is True
+        first.exit_filled_qty = Decimal("0.4")
+        assert await persist(first) is True                 # same trade: updated
+        # A second trade (re-processed ENTER) must not reset the row to PENDING.
+        assert await persist(trade("PENDING", "0")) is False
+        r = await pool.fetchrow("SELECT trade_id::text, state, entry_filled_qty, "
+                                "exit_filled_qty FROM trades WHERE chain_id = $1", chain_id)
+        assert r["trade_id"] == first.trade_id and r["state"] == "OPEN"
+        assert r["entry_filled_qty"] == Decimal("1") and r["exit_filled_qty"] == Decimal("0.4")
+    finally:
+        await pool.execute("DELETE FROM trades WHERE chain_id = $1", chain_id)
+        await pool.execute("DELETE FROM chains WHERE chain_id = $1", chain_id)

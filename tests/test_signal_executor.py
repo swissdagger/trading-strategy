@@ -439,8 +439,13 @@ async def test_escalation_no_action_before_deadline():
 @pytest.mark.asyncio
 async def test_escalation_halts_at_top_of_ladder():
     adapter = FakeAdapter()
-    # A one-rung ladder: after rung 0's window and one escalation to rung 1,
-    # the next expiry is past the top -> HALT.
+    cancels = []
+    async def cancel_order(cid):
+        cancels.append(cid)
+        return OrderResult(client_order_id=cid, status=OrderStatus.CANCELLED)
+    adapter.cancel_order = cancel_order
+    # A one-rung ladder: rung 0 (base cap), then rung 1 = ladder[0]. The top
+    # rung gets its OWN window before the HALT, and the HALT cancels its order.
     hooks, state = make_hooks(ladder=(
         EscalationRung(widen_to_spread_mult=Decimal("3"), window_seconds=30),
     ))
@@ -451,18 +456,20 @@ async def test_escalation_halts_at_top_of_ladder():
     await ex.handle_signal(exit_row())
     key = ("two_ladder", "chainX:L")
     trade = ex._open[key]
-    # rung 0 window is ladder[0]=30s. Expire it; escalate. With a 1-rung ladder,
-    # has_rung_beyond(0) is True (0 < 1) -> re-issue at rung 1, whose window is
-    # window_seconds_for_rung(1)=None (past ladder) -> deadline None.
+    # rung 0's window is ladder[0]=30s. Expire it; escalate to rung 1.
     state["now"][0] = 1_000_000 + 31_000
     adapter.queue_results(_working("exit1"))
     await ex.run_escalation_once()
     assert trade.exit_rung == 1
-    assert trade.exit_deadline_ms is None   # at top, no further window
-    # Next pass: deadline None + still CLOSING -> HALT.
+    assert trade.exit_deadline_ms == 1_000_000 + 31_000 + 30_000   # top rung's window
+    await ex.run_escalation_once()
+    assert trade.state == "CLOSING"             # window still running: no HALT yet
+    # Top rung's window expires -> cancel its order, then HALT.
+    state["now"][0] = 1_000_000 + 62_000
     await ex.run_escalation_once()
     assert state["states"][trade.trade_id][0] == "HALTED"
-    assert key not in ex._open
+    assert cancels[-1] == coid.build(trade.trade_id, OrderIntent.EXIT, 1)
+    assert ex._open[key] is trade               # HALTED stays under management
 
 
 @pytest.mark.asyncio

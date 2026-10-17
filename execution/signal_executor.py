@@ -108,6 +108,12 @@ class OrphanPositionError(RuntimeError):
 # on a long window. Kept well under a typical rung fill window.
 _EXIT_RETRY_MS = 2_000
 
+# A venue rejection of an exit (e.g. INSUFFICIENT_FUND while the fill stream
+# lags a cancelled rung's fills) is retried at the SAME rung this many times
+# before the rung is treated as placed-and-unfilled and the ladder moves on.
+# Gated rejections (trading off) are never counted: the exit holds.
+_EXIT_MAX_REJECT_RETRIES = 3
+
 # --- Client-order-id rung stride for partial exits (migration 017) ---------
 # One trade can now run SEVERAL exit lifecycles (one per scale-out tranche
 # batch, plus a possible final close), each with its own escalation ladder.
@@ -175,10 +181,21 @@ class OpenTrade:
     # deficit from durable state) is the recovery route for a mid-cycle crash.
     exit_order_qty: Decimal = Decimal(0)
     exit_cycle_base: Decimal = Decimal(0)
+    # Exit quantity the venue reported filled when an exit order was cancelled
+    # (order-level filled_qty) that the fill stream has not delivered yet, per
+    # cancelled exit client_order_id. Subtracted from the remainder so the next
+    # rung is never sized from stale stream counts (an oversell). Drained as the
+    # stream delivers those fills. In-memory only.
+    exit_unstreamed: Dict[str, Decimal] = None  # set in __post_init__
+    # Venue rejections of the current rung's exit order (see
+    # _EXIT_MAX_REJECT_RETRIES). In-memory only.
+    exit_rejects: int = 0
 
     def __post_init__(self):
         if self.scale_banked is None:
             self.scale_banked = {}
+        if self.exit_unstreamed is None:
+            self.exit_unstreamed = {}
 
     @property
     def exit_cycle_done(self) -> bool:
@@ -221,28 +238,30 @@ class ExitCap:
     ladder: tuple  # tuple[EscalationRung, ...]
 
     def cap_for_rung(self, rung: int) -> CapConfig:
-        """The CapConfig to price rung `rung`. Rung 0 is the base; higher rungs
-        widen cap_spread_mult per the ladder. A rung beyond the ladder returns
-        the base (the driver HALTs before pricing past the top)."""
+        """The CapConfig to price rung `rung`. Rung 0 is the base; rung r >= 1
+        is ladder[r-1]: BOTH the cross and the cap move to its
+        widen_to_spread_mult (never below the base's), so each rung really is
+        more aggressive. Widening only the cap changed nothing: a SELL limit is
+        max(cross edge, cap edge), and the cross binds whenever cross < cap. A
+        rung beyond the ladder returns the base (the driver HALTs before
+        pricing past the top)."""
         if rung <= 0 or rung > len(self.ladder):
             return self.base
         widened = self.ladder[rung - 1].widen_to_spread_mult
         return CapConfig(
-            cross_spread_mult=self.base.cross_spread_mult,
-            cap_spread_mult=widened,
+            cross_spread_mult=max(self.base.cross_spread_mult, widened),
+            cap_spread_mult=max(self.base.cap_spread_mult, widened),
             cap_abs_bps=self.base.cap_abs_bps,
         )
 
     def window_seconds_for_rung(self, rung: int) -> Optional[int]:
-        """The window for the rung just ISSUED (rung index into the ladder). The
-        window that governs a working exit at rung R is ladder[R]'s window (R is
-        1-based into the ladder for issued escalations; rung 0's window is
-        ladder[0] too — the first exit gets the first rung's window). None when
-        there is no further rung (=> at/over the top, HALT)."""
-        idx = rung
-        if idx < len(self.ladder):
-            return self.ladder[idx].window_seconds
-        return None
+        """The fill window for a working exit at `rung`, from the SAME ladder
+        entry that prices it: rung r >= 1 is ladder[r-1]; rung 0 (the base cap)
+        takes ladder[0]'s window. So the top rung gets its own window before the
+        driver HALTs. None past the top of the ladder (or for an empty ladder)."""
+        if not self.ladder or rung > len(self.ladder):
+            return None
+        return self.ladder[max(rung, 1) - 1].window_seconds
 
     def has_rung_beyond(self, rung: int) -> bool:
         """Is there a rung to escalate TO after `rung`? False => top of ladder,
@@ -257,7 +276,10 @@ class ExitCap:
 @dataclass
 class ExecutorHooks:
     # --- Persistence (writes to the 001 trade-lifecycle schema) ---
-    persist_trade: Callable[[OpenTrade], Awaitable[None]]
+    # Returns False when the row could not be written because ANOTHER trade
+    # already holds its (chain_id, side) key; the executor then refuses the
+    # entry. None (fakes) is taken as written.
+    persist_trade: Callable[[OpenTrade], Awaitable[Optional[bool]]]
     update_trade_state: Callable[[str, str, Optional[str]], Awaitable[None]]  # (trade_id, state, halt_reason)
     persist_order: Callable[[dict], Awaitable[None]]
     persist_fill: Callable[[dict], Awaitable[bool]]   # returns False if dup (venue_exec_id)
@@ -335,6 +357,9 @@ class SignalExecutor:
         self.hooks = hooks
         self.shadow_book = shadow_book
         self.shadow_only_strategies = frozenset(shadow_only_strategies or ())
+        # Strategies treated as shadow-only by name prefix although missing
+        # from shadow_only_strategies (logged once each; see _is_shadow_only).
+        self._shadow_by_prefix_logged: set = set()
         self._max_open_positions = max_open_positions
         self._enter_max_age_ms = enter_max_age_ms
         self._orphan_allowlist = frozenset(orphan_allowlist)
@@ -481,8 +506,21 @@ class SignalExecutor:
 
         by_symbol: Dict[str, list[OpenTrade]] = defaultdict(list)
         for t in db_trades:
-            self._open[(t.strategy, t.position_key)] = t
+            key = (t.strategy, t.position_key)
+            self._open[key] = t
             by_symbol[t.symbol].append(t)
+            # Re-register the trade's live order ids: the attribution map is
+            # in-memory, so without this a stream fill on an entry or exit
+            # placed before the restart resolves to no live trade and never
+            # advances it (the trade would sit SUBMITTED, or a close would wait
+            # forever for entry fills the stream already delivered).
+            self._register_order(t.entry_client_order_id, key)
+            if t.state == "CLOSING":
+                try:
+                    self._register_order(
+                        coid.build(t.trade_id, OrderIntent.EXIT, t.exit_rung), key)
+                except ValueError:
+                    pass   # not a uuid trade id: nothing we could have placed
 
         for sym, trades in by_symbol.items():
             live = [t for t in trades if t.state in _LIVE_STATES]
@@ -637,14 +675,15 @@ class SignalExecutor:
         # venue has no touch — so the strategy still gets virtual round trips.
         # Before kill switch and cap: the shadow book takes no risk.
         supported = getattr(self.adapter, "supported_classes", None)
-        shadow_only = strategy in self.shadow_only_strategies
+        shadow_only = self._is_shadow_only(strategy)
         if shadow_only or (supported and row.get("asset_class") not in supported):
             # Also the gate for SHADOW-ONLY strategies (config): paper rules
             # whose signals must never reach a venue in ANY trade mode. Same
-            # destination, same position in the gate order.
+            # destination, same position in the gate order. Those fill at the
+            # signal's decision_price (their spec); the rest at the touch.
             if self.shadow_book is not None:
                 self._mincr("entries_shadowed_strategy" if shadow_only else "entries_shadowed_class")
-                await self.shadow_book.on_enter(row)
+                await self.shadow_book.on_enter(row, at_decision_price=shadow_only)
             else:
                 self._mincr("entries_class_unsupported")
                 log.warning("ENTER %s/%s: %s and no shadow book — skipped", strategy, position_key,
@@ -682,6 +721,22 @@ class SignalExecutor:
                                 self._max_open_positions, strategy, position_key)
                     return
             await self._open_position(row, key, side)
+
+    def _is_shadow_only(self, strategy: str) -> bool:
+        """Shadow-only: listed in shadow_only_strategies, OR named rule* (the
+        chain rules are paper-only by their own spec). Fails closed: a rule
+        missing from the configured set is still kept off the venue, with one
+        ERROR per strategy so the config gap is fixed."""
+        if strategy in self.shadow_only_strategies:
+            return True
+        if strategy.startswith("rule"):
+            if strategy not in self._shadow_by_prefix_logged:
+                self._shadow_by_prefix_logged.add(strategy)
+                log.error("strategy %r is not in SHADOW_ONLY_STRATEGIES but is a rule* "
+                          "strategy — treating it as shadow-only; fix the config",
+                          strategy)
+            return True
+        return False
 
     def _enter_is_stale(self, row: dict) -> bool:
         """True if the ENTER signal was WRITTEN (trade_signals.created_at) more
@@ -779,7 +834,14 @@ class SignalExecutor:
         # Persist PENDING before submitting: if we crash between submit and ack,
         # the durable PENDING row + deterministic id let reconcile query the
         # venue for exactly this order rather than blindly re-sending.
-        await self.hooks.persist_trade(trade)
+        if await self.hooks.persist_trade(trade) is False:
+            # Another trade already holds this (chain_id, side) — a re-processed
+            # ENTER whose trade already closed, or a second strategy on the same
+            # chain. The DB key is the capital backstop: refuse, never overwrite.
+            self._mincr("entries_refused_key_conflict")
+            log.error("ENTER %s/%s refused: a trade on chain/side %s already exists",
+                      strategy, position_key, position_key)
+            return
         self._open[key] = trade
 
         order = OrderRequest(
@@ -831,14 +893,22 @@ class SignalExecutor:
         if trade is None and self.shadow_book is not None and self.shadow_book.holds(*key):
             # A virtual (shadow) position: close it there. Never touches the venue.
             self._mincr("exits_shadowed")
-            await self.shadow_book.on_exit(row)
+            await self.shadow_book.on_exit(row, at_decision_price=self._is_shadow_only(strategy))
             return
         if trade is None:
             # EXIT for a position we don't hold. Per migration 004's note, this
             # is a detectable reconciliation gap, not a silent drop.
             log.warning("EXIT for unknown position %s/%s — reconciliation gap", strategy, position_key)
             return
-        if trade.state in ("CLOSED", "REJECTED", "HALTED"):
+        if trade.state == "HALTED":
+            # Parked for a human, who closes it by hand: never trade it
+            # automatically. Loud, because the strategy wants it flat.
+            self._mincr("exits_on_halted")
+            log.warning("EXIT (%s) for HALTED trade %s %s/%s — not acted on; the "
+                        "operator must close it", row.get("exit_reason"),
+                        trade.trade_id, strategy, position_key)
+            return
+        if trade.state in ("CLOSED", "REJECTED"):
             log.debug("EXIT for %s already terminal (%s) — skip", trade.trade_id, trade.state)
             return
         # NOTE: CLOSING is deliberately NOT a blanket skip any more. Whether a
@@ -960,28 +1030,64 @@ class SignalExecutor:
         rung = max(trade.scale_banked) * _TRANCHE_STRIDE
         await self._issue_exit(trade, key, rung=rung)
 
-    async def _cancel_working_exit(self, trade: OpenTrade) -> None:
+    async def _cancel_working_exit(self, trade: OpenTrade) -> bool:
         """Cancel the trade's current working exit order (by its deterministic
         id) and absorb any fills the cancel reports (a partial fill racing the
-        cancel). Used when escalating past a rung and when a final close
-        supersedes a working tranche — the adapter contract (adapter.py) names
-        cancel-then-reissue as the escalation mechanism precisely so two live
-        exit orders can never work the same position at once."""
+        cancel). Used when escalating past a rung, before a HALT, and when a
+        final close supersedes a working tranche — the adapter contract
+        (adapter.py) names cancel-then-reissue as the escalation mechanism
+        precisely so two live exit orders can never work the same position at
+        once.
+
+        Returns True once the order can no longer fill (or none was placed);
+        False when that is unknown — the cancel raised, the venue has not
+        confirmed it, or trading is off (a gated cancel never reached the
+        venue) — and the caller must not issue a replacement or HALT yet.
+
+        The cancel's ORDER-LEVEL filled_qty beyond what the fill stream has
+        delivered is held in exit_unstreamed, so the next rung is sized net of
+        it (Coinbase reports fills only on the stream, ~2 s later)."""
         if not trade.exit_order_submitted:
-            return   # the rung was committed but no order was ever placed
+            return True   # the rung was committed but no order was ever placed
         cid = coid.build(trade.trade_id, OrderIntent.EXIT, trade.exit_rung)
         try:
             result = await self.adapter.cancel_order(cid)
         except Exception:
-            # A cancel that errors leaves an unknown order state — the fill
-            # stream and reconcile remain the safety net; log and continue
-            # (the replacement order's own qty is computed net of fills).
-            log.exception("cancel_order(%s) raised for %s — continuing", cid, trade.trade_id)
-            return
+            log.exception("cancel_order(%s) raised for %s — will retry", cid, trade.trade_id)
+            return False
+        if (result.reject_reason or "").startswith(GATED_PREFIX):
+            log.info("trading disabled — exit %s of %s not cancelled; holding",
+                     cid, trade.trade_id)
+            return False
         self._learn_venue_order_id(result)
         await self.hooks.advance_order_fill(cid, result.filled_qty, result.status.value)
         for f in result.fills:
             await self._record_fill(trade, f, cid)
+        unstreamed = result.filled_qty - (trade.exit_filled_qty - trade.exit_cycle_base)
+        if unstreamed > 0:
+            trade.exit_unstreamed[cid] = unstreamed
+        if result.status in (OrderStatus.WORKING, OrderStatus.PARTIALLY_FILLED):
+            log.warning("exit %s of %s not cancelled yet (%s) — will retry",
+                        cid, trade.trade_id, result.status.value)
+            return False
+        return True
+
+    def _exit_remaining(self, trade: OpenTrade) -> Decimal:
+        """Quantity still to sell: held, net of exit fills recorded AND of exit
+        fills the venue reported at a cancel that the stream has not delivered."""
+        return (trade.filled_qty - trade.exit_filled_qty
+                - sum(trade.exit_unstreamed.values(), Decimal(0)))
+
+    async def _hold_exit(self, trade: OpenTrade, rung: int) -> None:
+        """Keep the trade CLOSING at `rung` with NO order working and a short
+        retry deadline: the escalation driver re-issues this same rung rather
+        than escalating past (or HALTing on) an order that was never placed."""
+        trade.state = "CLOSING"
+        trade.exit_rung = rung
+        trade.exit_order_submitted = False
+        trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
+        await self.hooks.update_trade_state(trade.trade_id, "CLOSING", None)
+        await self.hooks.persist_exit_state(trade.trade_id, rung, trade.exit_deadline_ms)
 
     async def _issue_exit(self, trade: OpenTrade, key, rung: int) -> None:
         """Price + submit an exit for the trade's REMAINING quantity at escalation
@@ -999,8 +1105,13 @@ class SignalExecutor:
         symbol = trade.symbol
         asset_class = trade.asset_class
 
-        remaining = trade.filled_qty - trade.exit_filled_qty
+        remaining = self._exit_remaining(trade)
         if remaining <= 0:
+            if trade.exit_unstreamed:
+                # The venue says the rest is already sold; its fills are still on
+                # the stream, which finalizes the trade when they land.
+                await self._hold_exit(trade, rung)
+                return
             # Nothing left to close (position already flat). Finalize.
             await self._finalize_closed(trade, key)
             return
@@ -1025,24 +1136,33 @@ class SignalExecutor:
         # Commit the CLOSING intent + this rung FIRST, so it is durable regardless
         # of what happens during pricing/submit below.
         exit_cap = await self.hooks.get_exit_cap(asset_class)
+        if rung != trade.exit_rung:
+            trade.exit_rejects = 0
         trade.state = "CLOSING"
         trade.exit_rung = rung
+        # Provisionally "not placed, retry soon": if anything below raises before
+        # the order is submitted, the driver retries this rung instead of reading
+        # a CLOSING trade with no deadline as top-of-ladder and HALTing it.
+        trade.exit_order_submitted = False
+        trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
         # The ExitCap ladder indexes on the ESCALATION component of the strided
         # rung (block * 100 + escalation) — block 0 reproduces pre-017 behaviour
         # exactly.
         window_s = exit_cap.window_seconds_for_rung(_esc(rung))
 
-        touch = await self.hooks.get_touch(symbol, asset_class)
+        try:
+            touch = await self.hooks.get_touch(symbol, asset_class)
+        except Exception:
+            # A failed read (venue 5xx after retries) is the same as no book.
+            log.exception("touch read failed for EXIT %s", trade.trade_id)
+            touch = None
         bad = validate_touch(touch.bid, touch.ask) if touch is not None else "no touch"
         if bad is not None:
             # Can't price the exit right now. Keep the trade CLOSING at THIS rung
             # with a short retry deadline; the driver will call _issue_exit again
             # at the same rung. exit_order_submitted=False marks "no order placed",
             # so the driver retries rather than escalating past an unplaced rung.
-            trade.exit_order_submitted = False
-            trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
-            await self.hooks.update_trade_state(trade.trade_id, "CLOSING", None)
-            await self.hooks.persist_exit_state(trade.trade_id, rung, trade.exit_deadline_ms)
+            await self._hold_exit(trade, rung)
             log.warning("cannot price EXIT %s rung=%d (%s) — will retry",
                         trade.trade_id, rung, bad)
             self._mincr("exits_retry_bad_touch")
@@ -1097,6 +1217,39 @@ class SignalExecutor:
         # Attribute each synchronous fill to THIS exit order's trade (sync fill
         # attribution: the fills in an OrderResult belong to the order we just
         # submitted, whose trade we know). _record_fill advances exit_filled_qty.
+        if result.status == OrderStatus.REJECTED:
+            # No order is working. Trading off (gated): hold and retry, never
+            # escalate or HALT. A venue rejection (e.g. INSUFFICIENT_FUND while
+            # the stream lags a cancelled rung's fills): retry the same rung a
+            # few times; past that, let the rung's window run and escalate.
+            gated = (result.reject_reason or "").startswith(GATED_PREFIX)
+            if not gated:
+                trade.exit_rejects += 1
+            if gated or trade.exit_rejects <= _EXIT_MAX_REJECT_RETRIES:
+                await self._hold_exit(trade, trade.exit_rung)
+                (log.info if gated else log.warning)(
+                    "EXIT %s rung=%d rejected (%s) — retrying the same rung",
+                    trade.trade_id, trade.exit_rung, result.reject_reason)
+                self._mincr("exits_retry_rejected")
+                return
+            # Retries spent. No order is working (it was rejected), so there
+            # is nothing to cancel: move up the ladder now, or HALT at the top.
+            # (Waiting out the window would send the driver to cancel an order
+            # the venue never accepted, which it cannot confirm.)
+            exit_cap = await self.hooks.get_exit_cap(trade.asset_class)
+            if exit_cap.has_rung_beyond(_esc(trade.exit_rung)):
+                log.error("EXIT %s rung=%d rejected %d times (%s) — escalating",
+                          trade.trade_id, trade.exit_rung, trade.exit_rejects,
+                          result.reject_reason)
+                self._mincr("escalations_issued")
+                await self._issue_exit(trade, key, rung=trade.exit_rung + 1)
+            else:
+                trade.exit_deadline_ms = None
+                await self._halt(trade, f"escalation: exit rejected {trade.exit_rejects} "
+                                        f"times at the top of the ladder "
+                                        f"({result.reject_reason})")
+                await self.hooks.persist_exit_state(trade.trade_id, trade.exit_rung, None)
+            return
         for f in result.fills:
             await self._record_fill(trade, f, result.client_order_id)
         await self._after_exit_fills(trade, key)
@@ -1178,14 +1331,12 @@ class SignalExecutor:
                 fresh = self._open.get(key)
                 if fresh is None or fresh.state != "CLOSING":
                     continue
-                if fresh.exit_deadline_ms is None:
-                    # No deadline while CLOSING means we're at/over the ladder top
-                    # with an unfilled exit — HALT (the ladder's terminal action).
-                    await self._halt(fresh, "escalation: exit unfilled at top of ladder")
-                    self._open.pop(key, None)
-                    continue
-                if self.hooks.now_ms() < fresh.exit_deadline_ms:
+                if (fresh.exit_deadline_ms is not None
+                        and self.hooks.now_ms() < fresh.exit_deadline_ms):
                     continue   # deadline moved out from under us (rung re-issued)
+                # An expired window, or no deadline at all (at/over the ladder
+                # top): _escalate re-issues, escalates, or — at the top —
+                # cancels the working order and HALTs.
                 await self._escalate(fresh, key)
 
     async def run_close_requests_once(self) -> None:
@@ -1210,6 +1361,16 @@ class SignalExecutor:
                             if r == ExitReason.KILL_SWITCH.value]:
                     self._close_requests.pop(key, None)
                     self._entry_cancelled_filled.pop(key, None)
+                    # The reason was persisted on the trade so a restart resumes
+                    # the close; withdrawn, it must not, or a restart re-flattens
+                    # a position the operator released.
+                    trade = self._open.get(key)
+                    if (trade is not None and trade.exit_reason == ExitReason.KILL_SWITCH.value
+                            and trade.state in ("PENDING", "SUBMITTED", "OPEN")):
+                        async with self._lock(trade.symbol):
+                            if trade.exit_reason == ExitReason.KILL_SWITCH.value:
+                                trade.exit_reason = None
+                                await self.hooks.persist_trade(trade)
         for key, reason in list(self._close_requests.items()):
             trade = self._open.get(key)
             if trade is None or not self._closable(trade):
@@ -1374,41 +1535,60 @@ class SignalExecutor:
 
     async def _escalate(self, trade: OpenTrade, key) -> None:
         """Advance one rung, OR retry the current rung if its order never got
-        placed (caller holds the symbol lock). If there's a rung beyond the
-        current one, re-issue there; else HALT."""
-        remaining = trade.filled_qty - trade.exit_filled_qty
-        if remaining <= 0:
+        placed (caller holds the symbol lock). The working order is cancelled
+        (and confirmed dead) first; then re-issue at the next rung, or HALT at
+        the top of the ladder. While the cancel can't be confirmed — venue
+        error, cancel still pending, or trading off — hold and retry: never two
+        exit orders at once, and never a HALT with an order still working."""
+        if (trade.filled_qty - trade.exit_filled_qty <= 0
+                and not trade.exit_unstreamed):
             await self._finalize_closed(trade, key)
             return
         if not trade.exit_order_submitted:
             # The current rung was committed but never actually placed (couldn't
-            # price the book). Retry the SAME rung — do NOT burn a ladder step for
-            # a book we never got an order onto.
+            # price the book, or the venue rejected it). Retry the SAME rung — do
+            # NOT burn a ladder step for a book we never got an order onto.
             self._mincr("exits_retry_same_rung")
             log.info("retrying exit for %s at same rung %d (order not yet placed)",
                      trade.trade_id, trade.exit_rung)
             await self._issue_exit(trade, key, rung=trade.exit_rung)
             return
         exit_cap = await self.hooks.get_exit_cap(trade.asset_class)
+        # Cancel the outgoing rung's order BEFORE issuing its replacement — the
+        # adapter contract names cancel-then-reissue as the escalation
+        # mechanism. Without it, both rungs work the book at once and can BOTH
+        # fill (an over-close that flips the position). Fills the cancel
+        # reports (and the order's venue-reported filled qty not yet on the
+        # stream) are netted out of the replacement.
+        if not await self._cancel_working_exit(trade):
+            trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
+            await self.hooks.persist_exit_state(trade.trade_id, trade.exit_rung,
+                                                trade.exit_deadline_ms)
+            return
+        remaining = self._exit_remaining(trade)
+        if remaining <= 0:
+            if trade.exit_unstreamed:
+                # Sold in full per the venue; wait for the stream to deliver.
+                trade.exit_deadline_ms = self.hooks.now_ms() + _EXIT_RETRY_MS
+                return
+            await self._finalize_closed(trade, key)
+            return
         if not exit_cap.has_rung_beyond(_esc(trade.exit_rung)):
             # Top of the ladder and still not filled -> HALT. Better a
             # human looks than an unbounded market order in a fast market. This
             # applies to a SCALE tranche too: a 5% slice that can't fill through
             # the full ladder means the book is broken enough that the whole
-            # position deserves eyes, not more automation.
+            # position deserves eyes, not more automation. The trade stays in
+            # _open: it holds capital (counts toward the cap) and late fills
+            # still land on it.
+            trade.exit_deadline_ms = None
             await self._halt(trade, "escalation: exit unfilled through full ladder")
-            self._open.pop(key, None)
+            await self.hooks.persist_exit_state(trade.trade_id, trade.exit_rung, None)
             return
         next_rung = trade.exit_rung + 1
         self._mincr("escalations_issued")
         log.info("escalating exit for %s: rung %d -> %d (remaining=%s)",
                  trade.trade_id, trade.exit_rung, next_rung, remaining)
-        # Cancel the outgoing rung's order BEFORE issuing its replacement — the
-        # adapter contract names cancel-then-reissue as the escalation
-        # mechanism. Without it, both rungs work the book at once and can BOTH
-        # fill (an over-close that flips the position). Any fills the cancel
-        # reports are absorbed first, so the replacement's qty is computed net.
-        await self._cancel_working_exit(trade)
         await self._issue_exit(trade, key, rung=next_rung)
 
     # ----------------------------------------------------------------------
@@ -1494,6 +1674,10 @@ class SignalExecutor:
                         fill.venue_exec_id, fill.venue_order_id, cid)
             return
 
+        if key is None:
+            # An order of a live trade whose id was never registered in this
+            # process (a rung placed before a restart): find it by trade_id.
+            key = next((k for k, t in self._open.items() if t.trade_id == trade_id), None)
         trade = self._open.get(key) if key is not None else None
         if trade is None:
             # Attributable, but the trade isn't live in memory (already
@@ -1518,7 +1702,7 @@ class SignalExecutor:
         the sync paths do: an entry that's now (partly) filled becomes OPEN (and
         any pre-banked scale tranches start working); exit fills route through
         the shared completion check (flat -> CLOSED; tranche satisfied -> OPEN)."""
-        if trade.state == "SUBMITTED" and trade.filled_qty > 0:
+        if trade.state in ("PENDING", "SUBMITTED") and trade.filled_qty > 0:
             trade.state = "OPEN"
             await self.hooks.update_trade_state(trade.trade_id, "OPEN", None)
             await self._advance_scale(trade, key)
@@ -1552,6 +1736,15 @@ class SignalExecutor:
         else:
             trade.exit_filled_qty += fill.qty
             self._mincr("fills_exit")
+            # A fill of a cancelled exit the venue already reported: it is now
+            # recorded, so stop netting it out of the remainder.
+            cid = client_order_id or fill.client_order_id
+            if cid in trade.exit_unstreamed:
+                left = trade.exit_unstreamed[cid] - fill.qty
+                if left > 0:
+                    trade.exit_unstreamed[cid] = left
+                else:
+                    del trade.exit_unstreamed[cid]
         # Durably record the advanced quantities so restart recovery is faithful.
         await self.hooks.persist_trade(trade)
 

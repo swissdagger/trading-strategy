@@ -111,6 +111,17 @@ def build_raw_adapter(mode: TradeMode, pool):
     return adapter
 
 
+def shadow_only_strategies(cfg) -> frozenset:
+    """config.SHADOW_ONLY_STRATEGIES, required. Fails closed: a config without
+    it must not boot an executor that would send paper-only rules to a venue
+    (the executor also treats rule* strategies as shadow-only by name)."""
+    names = getattr(cfg, "SHADOW_ONLY_STRATEGIES", None)
+    if names is None:
+        raise RuntimeError("config.SHADOW_ONLY_STRATEGIES is missing; refusing to start "
+                           "rather than route shadow-only strategies to the venue")
+    return frozenset(names)
+
+
 def make_on_mode_change(current: dict, stop: asyncio.Event, restart_required: dict):
     """The trade-mode callback. off<->paper: nothing (same paper adapter; the
     GatedAdapter starts or stops allowing simulated orders). paper<->live: the
@@ -208,7 +219,7 @@ async def main() -> None:
     executor = SignalExecutor(
         adapter, hooks,
         shadow_book=shadow,
-        shadow_only_strategies=getattr(config, "SHADOW_ONLY_STRATEGIES", frozenset()),
+        shadow_only_strategies=shadow_only_strategies(config),
         max_open_positions=config.MAX_OPEN_POSITIONS,
         enter_max_age_ms=config.ENTER_MAX_AGE_SECONDS * 1000,
         orphan_allowlist=config.ORPHAN_BALANCE_ALLOWLIST,

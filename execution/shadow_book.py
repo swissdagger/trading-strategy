@@ -12,6 +12,8 @@ data we will get, so instead of dropping them the executor routes them here:
   * The taker fee is charged on both legs; pnl_bps is net of it.
   * Whole positions only: SCALE tranches are ignored and the position closes on
     the final EXIT.
+  * Shadow-only strategies (the chain rules) fill both legs at the signal's
+    decision_price instead, per their spec; the touch only if it is missing.
 
 Nothing here is ever sized or sent to a venue, and nothing here touches the
 real book: shadow positions are not part of reconcile, sizing, the
@@ -132,10 +134,16 @@ class ShadowBook:
     def open_count(self) -> int:
         return len(self._open)
 
-    async def _price(self, row: dict, side: TradeSide, intent: OrderIntent
-                     ) -> Tuple[Optional[Decimal], str]:
+    async def _price(self, row: dict, side: TradeSide, intent: OrderIntent,
+                     at_decision_price: bool = False) -> Tuple[Optional[Decimal], str]:
         """(price, source). Prefer the live touch; fall back to the signal's
-        decision_price (logged — it is the strategy's price, not a fill price)."""
+        decision_price (logged — it is the strategy's price, not a fill price).
+        at_decision_price (shadow-only strategies, whose spec fills at the
+        signal's price): decision_price first, the touch only without one — so
+        a signal replayed after downtime is not priced at the replay-time book."""
+        dp = row.get("decision_price")
+        if at_decision_price and dp is not None and Decimal(str(dp)) > 0:
+            return Decimal(str(dp)), "decision_price"
         try:
             touch = await self.hooks.get_touch(row["symbol"], row["asset_class"])
         except Exception:
@@ -143,23 +151,22 @@ class ShadowBook:
             touch = None
         if touch is not None and validate_touch(touch.bid, touch.ask) is None:
             return fill_price(side, intent, touch), "touch"
-        dp = row.get("decision_price")
         if dp is not None and Decimal(str(dp)) > 0:
             return Decimal(str(dp)), "decision_price"
         return None, "none"
 
-    async def on_enter(self, row: dict) -> None:
+    async def on_enter(self, row: dict, at_decision_price: bool = False) -> None:
         strategy = row.get("strategy", "two_ladder")
         position_key = row["position_key"]
         if self.holds(strategy, position_key):
             return   # replayed ENTER
         side = TradeSide.LONG if row["direction"] == "LONG" else TradeSide.SHORT
-        px, source = await self._price(row, side, OrderIntent.ENTRY)
+        px, source = await self._price(row, side, OrderIntent.ENTRY, at_decision_price)
         if px is None:
             log.warning("shadow ENTER %s/%s: no touch and no decision_price — skipped",
                         strategy, position_key)
             return
-        if source != "touch":
+        if source != "touch" and not at_decision_price:
             log.warning("shadow ENTER %s/%s priced off %s (no usable touch)",
                         strategy, position_key, source)
         fee_bps = await self._fee_bps(row.get("asset_class"))
@@ -184,7 +191,7 @@ class ShadowBook:
         log.info("shadow ENTER %s %s %s @ %s (%s)", strategy, side.value,
                  pos.symbol, px, source)
 
-    async def on_exit(self, row: dict) -> None:
+    async def on_exit(self, row: dict, at_decision_price: bool = False) -> None:
         strategy = row.get("strategy", "two_ladder")
         position_key = row["position_key"]
         pos = self._open.get((strategy, position_key))
@@ -197,7 +204,7 @@ class ShadowBook:
             # emits SCALE, and it is disabled.
             log.debug("shadow EXIT %s/%s: SCALE tranche ignored", strategy, position_key)
             return
-        px, source = await self._price(row, pos.side, OrderIntent.EXIT)
+        px, source = await self._price(row, pos.side, OrderIntent.EXIT, at_decision_price)
         if px is None:
             # Leave it open: a later EXIT for the position (or an operator) can
             # still close it. Never invent an exit price.

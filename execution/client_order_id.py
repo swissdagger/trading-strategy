@@ -13,9 +13,8 @@ it is deterministic and parseable:
     SAME id, so the venue's own client-id dedupe rejects the second one (belt),
     and our DB unique constraint on orders.client_order_id rejects it too
     (braces).
-  * Boot reconcile attributes venue orders/fills to the right trade by PARSING
-    the id back into (trade_id, intent, rung), making execution/boot.py's
-    _live_exit_order and _explaining_exit_fills EXACT rather than best-effort.
+  * Boot reconcile attributes venue fills to the right trade by PARSING the id
+    back into (trade_id, intent, rung), exactly rather than best-effort.
 
 FORMAT (single line, venue-safe charset only):
 

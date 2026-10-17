@@ -45,14 +45,27 @@ replay everything). created_at can tie (two rows same instant); we handle that
 by making the sweep '>=' the cursor and relying on the recently-seen set +
 handler idempotency to suppress the re-dispatched boundary rows, rather than
 '>' which could SKIP a row that shares the cursor's exact timestamp.
+
+created_at is the INSERT's transaction start, not its commit, so with
+concurrent writers a row with an earlier created_at can commit after a later
+one was dispatched. The sweep therefore starts _SWEEP_LAG_S before the cursor;
+the same dedupe makes the overlap safe.
+
+## Failed signals are retried
+
+A signal whose handler raised is kept in a retry set and re-dispatched every
+_RETRY_INTERVAL_S while the listener runs. The persisted cursor never moves
+past the oldest such signal (later successes still advance the in-memory
+high-water), so after a restart the sweep re-reads it.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
-from datetime import datetime, timezone
-from typing import Awaitable, Callable, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Awaitable, Callable, Dict, Optional
 
 import asyncpg
 
@@ -66,6 +79,14 @@ CHANNEL = "trade_signal"
 # a near-simultaneous catch-up sweep. Handler idempotency is the real backstop.
 _RECENT_CAPACITY = 4096
 
+# How far behind the cursor the catch-up sweep starts, to pick up rows whose
+# created_at (transaction start) precedes a row already dispatched but which
+# committed after it. Re-read rows are deduped.
+_SWEEP_LAG_S = 30.0
+
+# How often signals whose handler raised are retried.
+_RETRY_INTERVAL_S = 5.0
+
 # Reconnect backoff bounds for the dedicated LISTEN connection.
 _RECONNECT_BASE_S = 1.0
 _RECONNECT_MAX_S = 30.0
@@ -74,8 +95,8 @@ _RECONNECT_MAX_S = 30.0
 # A handler takes the full signal row (dict) and acts on it. Must be idempotent
 # on row['signal_id'] (see module docstring). Returns when the signal has been
 # handled; raising is logged and does NOT crash the listener (one bad signal
-# must not stop the stream), but the cursor does NOT advance past a signal whose
-# handler raised, so it will be retried on the next sweep.
+# must not stop the stream); the signal is retried every _RETRY_INTERVAL_S and
+# the persisted cursor does not move past it until it succeeds.
 SignalHandler = Callable[[dict], Awaitable[None]]
 
 
@@ -108,11 +129,12 @@ class SignalListener:
                the whole table.
         statement_cache_size: passed to the dedicated connect; 0 for pgbouncer/
                Supabase compatibility, matching the pool convention elsewhere.
-        on_cursor_advance: awaited with the new cursor each time it advances
-               (after a successful dispatch), so the caller can persist it and
-               resume there after a restart. A failure is logged and does not
-               affect delivery: the worst case is replaying a few signals the
-               handler already deduplicates.
+        on_cursor_advance: awaited with the cursor to persist each time it
+               advances (after a successful dispatch), so the caller can resume
+               there after a restart. Never later than the oldest signal whose
+               handler failed. A failure is logged and retried on the next
+               advance: the worst case is replaying a few signals the handler
+               already deduplicates.
         """
         self._dsn = dsn
         self._pool = pool
@@ -120,6 +142,12 @@ class SignalListener:
         self._cursor: datetime = initial_cursor or datetime.now(timezone.utc)
         self._stmt_cache = statement_cache_size
         self._on_cursor_advance = on_cursor_advance
+        # The last cursor value persisted (or the starting one): only a later
+        # value is saved.
+        self._persisted: datetime = self._cursor
+        # Signals whose handler raised, by signal_id -> row, retried on a timer.
+        self._failed: Dict[str, dict] = {}
+        self._last_retry = time.monotonic()
 
         self._conn: Optional[asyncpg.Connection] = None
         self._running = False
@@ -226,6 +254,7 @@ class SignalListener:
         fires termination.
         """
         while self._running:
+            await self._maybe_retry_failed()
             get_task = asyncio.ensure_future(self._notify_queue.get())
             term_task = asyncio.ensure_future(self._terminated.wait())
             try:
@@ -253,11 +282,11 @@ class SignalListener:
                 raise ConnectionError("LISTEN connection lost")
 
     async def _catch_up(self) -> None:
-        """Dispatch every signal with created_at >= cursor that we haven't
-        already dispatched. Runs on each (re)connect. Ordered by created_at so
-        the cursor advances monotonically and signals are handled in write
-        order (which, per migration 004, consumers may rely on alongside
-        decided_at for strategy semantics)."""
+        """Dispatch every signal with created_at >= cursor - _SWEEP_LAG_S that
+        we haven't already dispatched. Runs on each (re)connect. Ordered by
+        created_at so the cursor advances monotonically and signals are handled
+        in write order (which, per migration 004, consumers may rely on
+        alongside decided_at for strategy semantics)."""
         rows = await self._pool.fetch(
             """
             SELECT signal_id, position_key, chain_id, direction, action,
@@ -267,7 +296,7 @@ class SignalListener:
             WHERE created_at >= $1
             ORDER BY created_at ASC, signal_id ASC
             """,
-            self._cursor,
+            self._cursor - timedelta(seconds=_SWEEP_LAG_S),
         )
         if rows:
             log.info("signal catch-up sweep: %d row(s) from cursor %s",
@@ -299,29 +328,59 @@ class SignalListener:
     async def _dispatch_row(self, row: dict) -> None:
         """Run the handler for one signal, then advance dedup state and cursor.
 
-        The cursor advances to this row's created_at only AFTER the handler
-        returns successfully — so a handler that raises leaves the cursor behind
-        the failed signal, and the next catch-up sweep retries it. At-least-once
-        delivery; the handler's idempotency makes retries safe.
+        A handler that raises leaves the signal in the retry set (re-dispatched
+        every _RETRY_INTERVAL_S) and holds the PERSISTED cursor at or before
+        it, even while later signals succeed and move the in-memory high-water
+        on. At-least-once delivery; the handler's idempotency makes retries
+        safe.
         """
         signal_id = row["signal_id"]
         if signal_id in self._recent:
+            self._failed.pop(signal_id, None)
             return
         try:
             await self._handler(row)
         except Exception:
-            log.exception("handler failed for signal %s; will retry on next sweep", signal_id)
-            return  # do NOT advance cursor or mark seen — retry later
+            log.exception("handler failed for signal %s; will retry", signal_id)
+            self._failed[signal_id] = row
+            return
+        self._failed.pop(signal_id, None)
         self._mark_seen(signal_id)
         created_at = row["created_at"]
         if created_at is not None and created_at > self._cursor:
             self._cursor = created_at
-            if self._on_cursor_advance is not None:
-                try:
-                    await self._on_cursor_advance(created_at)
-                except Exception:
-                    log.exception("persisting listener cursor %s failed; will "
-                                  "retry on the next advance", created_at.isoformat())
+        await self._persist_cursor()
+
+    async def _persist_cursor(self) -> None:
+        """Save the cursor, clamped to the oldest failed signal so a restart
+        re-reads it. Only ever saves a later value than the last one saved."""
+        target = self._cursor
+        held = [r["created_at"] for r in self._failed.values()
+                if r.get("created_at") is not None]
+        if held:
+            target = min(target, min(held))
+        if self._on_cursor_advance is None or target <= self._persisted:
+            return
+        try:
+            await self._on_cursor_advance(target)
+        except Exception:
+            log.exception("persisting listener cursor %s failed; will "
+                          "retry on the next advance", target.isoformat())
+            return
+        self._persisted = target
+
+    async def _maybe_retry_failed(self) -> None:
+        """Re-dispatch failed signals, oldest first, at most every
+        _RETRY_INTERVAL_S."""
+        if not self._failed or time.monotonic() - self._last_retry < _RETRY_INTERVAL_S:
+            return
+        self._last_retry = time.monotonic()
+        rows = sorted(self._failed.values(),
+                      key=lambda r: (r.get("created_at") is None, r.get("created_at") or 0,
+                                     r["signal_id"]))
+        log.info("retrying %d failed signal(s)", len(rows))
+        for row in rows:
+            await self._dispatch_row(row)
 
     def _mark_seen(self, signal_id: str) -> None:
         self._recent[signal_id] = None
