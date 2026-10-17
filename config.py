@@ -82,8 +82,9 @@ ASSET_CONFIGS = {
     # 04:00–20:00 ET session the ladder needs ~5,700 forecasts/symbol/day,
     # ~0.1/s/symbol while the market is open. At the measured 0.36 calls/s
     # peak that is ~3 symbols on their own, and crypto already uses most of
-    # it (FC ~0.27/s + CN ~0.06/s, 24/7), so two symbols run over the peak
-    # during the session; most of an equity's demand is DL's seconds rungs.
+    # it (FC ~0.27/s + CN ~0.06/s, 24/7). Most of that per-symbol demand is
+    # DL's seconds rungs: ED alone is ~1,600 forecasts/symbol/day (~0.03/s),
+    # so DL runs on one symbol (subminute_symbols) and ED on four.
     # The forecast/apply split (PR 8) is what makes
     # even ONE symbol fit: serial per-symbol processing capped a symbol at
     # one forecast per ~8 s, and 30s+45s+1m+90s+2m+3m need one every ~6 s.
@@ -99,8 +100,10 @@ ASSET_CONFIGS = {
     # buckets. Transport 'ws' with automatic fallback to 'rest' if the socket
     # cannot be established on a cold start (feed_process._run_feed).
     "equity": {
-        # Cut from three (SPCX dropped) for latency; see CAPACITY above.
-        "symbols": ["NVDA", "XOM"],
+        # rule1_v1's universe (ED, ~0.03 forecasts/s each in session). The
+        # dense DL ladder costs ~3x that per symbol, so its strategies run on
+        # subminute_symbols only (below).
+        "symbols": ["NVDA", "XOM", "META", "INTC"],
         # Union of the DL ladder and the ED ladder (rule1_v1's research
         # ladder adds 5m); the memo dedupes the rungs they share.
         "timeframes": ["30s", "45s", "1m", "90s", "2m", "3m", "5m",
@@ -108,6 +111,11 @@ ASSET_CONFIGS = {
         "points": 5000,
         "baseline_timeframe": "30s",
         "transport": "ws",
+        # The DL universe: warmup builds the seconds rungs (30s/45s/90s) from
+        # raw trades for these only. The live feed still streams 1s data for
+        # every symbol; seconds bars for the others are published and dropped
+        # by the router (no DL owner), costing no forecasts.
+        "subminute_symbols": ["NVDA"],
     },
 }
 
@@ -310,7 +318,7 @@ STRATEGIES = {
     # 'symbols'/'ladders', different key.
     "chain_recorder": {
         "enabled": True,          # kept on beside rule1: depth counters on /health, no signals
-        "symbols": equity_symbols(),
+        "symbols": list(ASSET_CONFIGS["equity"]["subminute_symbols"]),   # the DL universe
         "ladders": ["DL"],
         "params": {},
     },
@@ -340,7 +348,7 @@ STRATEGIES = {
     },
     "rule1_new_literal_v1": {           # the same rule's level numbers on the dense ladder
         "enabled": True,
-        "symbols": equity_symbols(),
+        "symbols": list(ASSET_CONFIGS["equity"]["subminute_symbols"]),   # the DL universe
         "ladders": ["DL"],
         "params": {"rule": "RULE1_EQUITY", "tick_seconds": 15},     # P2 = 45s, L3 = 1m
     },

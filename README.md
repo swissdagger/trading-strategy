@@ -105,8 +105,8 @@ review and trades are never pooled across rules or ladders):
 
 | Strategy | Asset | Ladder | Entry → confirm | Stall | Filters | Status |
 |---|---|---|---|---|---|---|
-| `rule1_v1` | equity | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 60 min | vol_ratio ≤ 1.46; US regular session | enabled, **placed by hand** |
-| `rule1_new_literal_v1` | equity | DL (30s base) | L2 = 45s → L3 = 1m | 60 min | same | enabled |
+| `rule1_v1` | equity | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 60 min | vol_ratio ≤ 1.46; US regular session | enabled, **placed by hand**; NVDA, XOM, META, INTC |
+| `rule1_new_literal_v1` | equity | DL (30s base) | L2 = 45s → L3 = 1m | 60 min | same | enabled, NVDA only |
 | `rule3_v1` | crypto | ED `1m,3m,5m,15m,30m,1h,2h,4h` | P2 = 3m → L3 = 5m | 30 min | vol_ratio > 0.71, not squeeze-release; 24/7 | enabled, **traded** |
 | `rule3_new_literal_v1` | crypto | CN `30s,45s,1m,2m,3m,5m,15m,30m,1h` | L2 = 45s → L3 = 1m | 30 min | same | enabled, BTC-USD only |
 | `rule3_new_equiv_v1` | crypto | CN | 3m → 5m (pinned by rung) | 30 min | same | enabled, BTC-USD only |
@@ -126,7 +126,8 @@ by the research process. Volatility filters read 1m closes from the feeds
 (Polygon for equities, Coinbase for crypto; `strategy/vol_source.py`).
 
 **`chain_recorder`** (enabled) — owns the dense equity ladder **DL**
-(`30s,45s,1m,90s,2m,3m,15m,30m,1h,2h,4h,6h`) on the Polygon equities so its
+(`30s,45s,1m,90s,2m,3m,15m,30m,1h,2h,4h,6h`) on NVDA (the equity
+`subminute_symbols`; DL is ~3× ED's forecast cost per symbol) so its
 chains and signals are computed and persisted; emits no trade signals. It is
 the placeholder owner until the DL strategy lands (a config swap). The
 executor routes any signal for an asset class its venue does not trade to the
