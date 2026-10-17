@@ -3,8 +3,11 @@ producer/service2_machine.py — service_2's chain state machine, extracted behi
 the ChainMachine seam, instantiated once per (symbol, set).
 
 This is the EXTRACTION of CausaView's service_2_sumtyme_bridge.process_forecast.
-The INIT -> PROPAGATE -> TERMINATE logic is preserved verbatim in behavior; what
-changes is structural, and exactly two things change in a way that MATTERS:
+The INIT -> PROPAGATE -> TERMINATE logic (the start condition, the one-rung
+propagation loop, both termination paths) is the same as the original; the
+deliberate differences are listed in README "State-machine sync" (ordering,
+comparing on bar close, deterministic ids, input guard, storage). Structurally,
+two things change in a way that MATTERS:
 
   1. ONE INSTANCE PER (symbol, set), not per asset class. Each instance owns its
      own signal cache, last-base-signal, active_chains, per-timeframe buffers, and
@@ -29,7 +32,8 @@ against service_2):
   * the asyncio.to_thread Sumtyme call (never block the loop),
   * the INIT condition (baseline signal changed direction),
   * the PROPAGATE/TERMINATE sweep, including the "next-expected level opposes" AND
-    "current level flips" termination paths,
+    "current level flips" termination paths (its comparison is on bar close —
+    see README "State-machine sync"),
   * persisting signals + chains to the DB (research/audit tables want them),
   * hydrate-on-restart from the chains table.
 

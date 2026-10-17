@@ -328,9 +328,24 @@ unroutable by design.
   the topic from the earliest offset. The feed resumes from the newest stored
   bar (or warmup's cursor, if newer). The store grows by every live bar
   (~15k rows/day for the crypto universe).
-- **State-machine sync.** The chain machine is copied from CausaView, not shared
-  as a library, and differs by two changes: the monotonic bar guard, and the
-  prepare/forecast/apply split of `on_bar` (ADR-001 debt D9). The
-  INIT/PROPAGATE/TERMINATE sweep (`_run_state_machine`) is verbatim; apply
-  changes to it in both places.
-  in both places.
+- **State-machine sync.** The chain machine is copied from CausaView's
+  `service_2_sumtyme_bridge.process_forecast`, not shared as a library (ADR-001
+  debt D9). The INIT condition, the one-rung-at-a-time PROPAGATE loop and both
+  TERMINATE paths are the same logic. It deliberately differs in:
+  - **ordering**: the prepare/forecast/apply split applies each symbol's
+    results strictly in arrival order, cache write and sweep both under the
+    symbol lock (CausaView writes the cache, outside the lock, in forecast
+    completion order);
+  - **the sweep's comparison**: bar CLOSE, not the bar's open label (see Bar
+    times);
+  - **identity**: deterministic `chain_id` per (symbol, ladder, direction,
+    origin), and a replayed initiation is skipped (CausaView: `uuid4`);
+  - **input**: the monotonic bar guard, no synthetic gap-fill bars, and an
+    OHLC-only Sumtyme payload;
+  - **scope and storage**: one machine per (symbol, ladder); `chain_steps`
+    rows carrying `bar_close` / `detected_at`; persistence failures are
+    logged and the sweep continues; the INIT guard is restored from the
+    newest of `signals` and the active chains.
+
+  A change to the shared logic must be made in both places; a change to one of
+  the differences above must be checked against why it differs.
