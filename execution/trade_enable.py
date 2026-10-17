@@ -3,11 +3,12 @@ execution/trade_enable.py — the master trade-mode state (off / paper / live).
 
 Single source of truth for QISS's execution mode. Read by the GatedAdapter (to
 gate orders) and by the adapter-selection layer (to pick the paper vs live
-venue endpoint). Three states:
+adapter, execution/adapter_factory.py). Three states:
 
   OFF   — place no orders at all.
-  PAPER — place orders against the PAPER venue (IB port 4002 / Binance testnet):
-          real order flow, real pricing/fills/reconcile, FAKE money.
+  PAPER — place orders with the in-process PaperCoinbaseAdapter: real Coinbase
+          market data, real order flow/pricing/reconcile, SIMULATED fills,
+          FAKE money.
   LIVE  — place orders against the LIVE venue: real money.
 
 Two inputs, in precedence order (unchanged from the original boolean design):
@@ -26,16 +27,15 @@ callers of is_enabled() keep working; mode-aware callers use mode().
 ## Paper<->live changes the VENUE, so it needs a reconnect
 
 Unlike OFF (which the GatedAdapter honours instantly by no-oping orders),
-switching between PAPER and LIVE changes which gateway the adapter is connected
-to — established at connect() time. A pure in-memory flag flip is NOT enough: the
-adapter must reconnect to the other endpoint. So this class fires an
-`on_mode_change(old, new)` async callback whenever the mode changes; the
-application wires that to reconnect/reselect the adapter for the new mode's
-venue. The callback runs off the refresh loop, so a mode flip propagates to a
-reconnect without a redeploy — but it is the application's job to actually
-perform the reconnect there. Until the reconnect completes, the GatedAdapter
-keeps gating on is_enabled() so no order goes to the wrong venue in the gap
-(the application should gate/queue during the swap; see the wiring guide).
+switching between PAPER and LIVE changes which adapter (simulated or real
+Coinbase) the executor trades through — established at connect() time. A pure
+in-memory flag flip is NOT enough: the executor must switch adapters. So this
+class fires an `on_mode_change(old, new)` async callback whenever the mode
+changes, off the refresh loop, so a mode flip propagates without a redeploy —
+but it is the application's job to act on it. run_executor.py blocks every
+write on the old adapter at once (GatedAdapter.block_all_writes) and restarts
+the executor, which boots and reconciles against the new venue, so no order
+goes to the wrong venue in the gap.
 
 ## Fail-safe default
 
@@ -232,14 +232,16 @@ class TradeEnableState:
         conn, self._conn = self._conn, None
         if conn is None:
             return
+        # Best effort: the connection is being dropped (often because it
+        # already died), so a failure here is expected and changes nothing.
         try:
             await conn.remove_listener(CHANNEL, self._on_notify)
         except Exception:
-            pass
+            log.debug("remove_listener on a closing connection failed", exc_info=True)
         try:
             await conn.close()
         except Exception:
-            pass
+            log.debug("closing the LISTEN connection failed", exc_info=True)
 
     def _on_notify(self, conn, pid, channel, payload) -> None:
         """Wake the refresh loop to re-read. We re-read the row rather than

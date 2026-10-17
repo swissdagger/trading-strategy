@@ -369,14 +369,14 @@ async def test_venue_change_blocks_writes_and_stops_for_a_restart():
     cb = run_executor.make_on_mode_change(current, stop, flag)
 
     await cb(TradeMode.OFF, TradeMode.PAPER)             # same venue: nothing
-    assert not stop.is_set() and gated._inner is a
+    assert not stop.is_set() and gated.inner is a
 
     await cb(TradeMode.PAPER, TradeMode.LIVE)            # venue change
     assert stop.is_set() and flag["flag"]
     r = await gated.submit_order(order())
     assert r.status == OrderStatus.REJECTED and r.reject_reason == READ_ONLY_REASON
     await cb(TradeMode.LIVE, TradeMode.PAPER)            # idempotent: not double-wrapped
-    assert not isinstance(gated._inner.inner, ReadOnlyAdapter)
+    assert not isinstance(gated.inner.inner, ReadOnlyAdapter)
 
 
 # --------------------------------------------------------------------

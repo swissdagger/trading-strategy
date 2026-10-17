@@ -49,7 +49,6 @@ from execution.adapter_factory import (
     endpoint_kind_for_mode,
 )
 from execution.gated_adapter import GatedAdapter
-from execution.read_only_adapter import ReadOnlyAdapter
 from execution.trade_enable import TradeEnableState, TradeMode
 from execution.signal_listener import SignalListener
 from execution.signal_executor import OrphanPositionError, SignalExecutor
@@ -142,8 +141,8 @@ def make_on_mode_change(current: dict, stop: asyncio.Event, restart_required: di
             log.info("mode %s -> %s: same endpoint, no adapter change", old.value, new.value)
             return
         gated = current.get("gated")
-        if gated is not None and not isinstance(gated._inner, ReadOnlyAdapter):
-            gated._inner = ReadOnlyAdapter(gated._inner)
+        if gated is not None:
+            gated.block_all_writes()
         restart_required["flag"] = True
         log.error("mode %s -> %s changes the venue: orders blocked; stopping so the "
                   "executor restarts and reconciles against the new venue",
