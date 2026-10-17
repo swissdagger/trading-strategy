@@ -67,9 +67,11 @@ from producer.persistence import (
     # their sync factories are intentionally no longer imported here.
     make_persist_chain_init,
     make_load_buffers,
+    make_persist_live_bar,
     make_load_last_base_signal,
     make_load_strategy_open_entries,
     make_load_opposing_chain_since,
+    make_load_chain_confirmed,
 )
 from producer.service2_machine import ServiceTwoChainMachine
 from strategy.chain_view import ChainView, TaggedChainEvent
@@ -251,7 +253,12 @@ class SignalProcess:
             # holes in the chain machine's input. We commit only the contiguous
             # low-water mark of FINISHED bars (see run() / OffsetTracker).
             enable_auto_commit=False,
-            auto_offset_reset="latest",
+            # EARLIEST: a group with no committed offset (first start) reads
+            # the whole topic. The bars after warmup's newest may already have
+            # been published before this consumer joined; "latest" skipped
+            # them, leaving a hole after the hydrated buffer. Everything older
+            # than the buffer is dropped by the machines' monotonic guard.
+            auto_offset_reset="earliest",
         )
         self.producer = AIOKafkaProducer(
             bootstrap_servers=self.cfg.kafka_bootstrap,
@@ -406,8 +413,17 @@ class SignalProcess:
             _closes_source(asset_class)
             return self._vol_providers[asset_class]
 
+        # The price a rule records for a clock-driven intent: the newest close
+        # in the bar stream (fed from the consume loop), falling back to the
+        # vol source's cache before the first bar for a symbol arrives.
+        from strategy.vol_source import LiveCloses
+        self._live_closes: dict = {}
+
         def _latest_close_for(asset_class: str):
-            return _closes_source(asset_class).latest_close
+            if asset_class not in self._live_closes:
+                self._live_closes[asset_class] = LiveCloses(
+                    fallback=_closes_source(asset_class).latest_close)
+            return self._live_closes[asset_class].latest_close
 
         chain_rule_factory = lambda *, name, symbols, ladders, params: make_chain_rule(
             name=name, symbols=symbols, ladders=ladders, params=params,
@@ -415,6 +431,7 @@ class SignalProcess:
             vol_provider_for=_vol_for, latest_close_for=_latest_close_for,
             load_open=make_load_strategy_open_entries(self.pool, name),
             load_opposing_since=make_load_opposing_chain_since(self.pool),
+            load_confirmed=make_load_chain_confirmed(self.pool),
         )
         for key in ("rule1_v1", "rule1_new_literal_v1", "rule3_v1",
                     "rule3_new_literal_v1", "rule3_new_equiv_v1"):
@@ -437,6 +454,7 @@ class SignalProcess:
             make_machine=self._make_factory(client),
             publish=self._publish,
             owns=lambda symbol, ladder: (symbol, ladder) in owned,
+            persist_bar=make_persist_live_bar(self.pool),
         )
         # --- Multi-strategy runtime, sharing the router's lock map ---
         self.runtime = MultiStrategyRuntime(
@@ -537,7 +555,7 @@ class SignalProcess:
                 # oblivious to whether its writes are sync or deferred.
                 persist_chain_propagate=self.audit_writer.persist_chain_propagate,
                 persist_chain_terminate=self.audit_writer.persist_chain_terminate,
-                # Filters on the ladder NAME (migration 019). The old baseline-
+                # Filters on the ladder NAME (migration 026). The old baseline-
                 # timeframe discriminator conflated FC and PF, whose baselines are
                 # both 1m on the same crypto symbols: each machine adopted the
                 # other's chains on restart and advanced them under its own level
@@ -732,6 +750,9 @@ class SignalProcess:
                     continue
 
                 self._observe_lag(bar)
+                closes = self._live_closes.get(bar.asset_class)
+                if closes is not None:
+                    closes.observe(bar)
                 # Hand off. This AWAITS only if the symbol's queue is full
                 # (backpressure); otherwise it returns immediately and the loop
                 # goes straight back to Kafka. That is the whole speedup.

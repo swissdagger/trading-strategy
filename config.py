@@ -371,7 +371,7 @@ STRATEGIES["chain_recorder"] = {
 # review; the package is explicit that trades are never pooled across ladders
 # or rules, which is why a rule on two ladders is two strategies.
 #
-# LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is 5m;
+# LEVELS ARE LADDER-RELATIVE. "P2" on the research equity ladder (ED) is 3m;
 # on the crypto ladder (FC) it is 3m; on the dense ladder (DL) it is 45s. The
 # adapter logs the resolved (level, rung) pairs at start. `entry_tf` /
 # `confirm_tf` pin a rule to rungs by name when a level number would land
@@ -418,10 +418,14 @@ STRATEGIES["rule3_new_equiv_v1"] = {
 # Strategies whose signals the executor must NEVER route to a venue, in any
 # trade mode: they go to the shadow book (virtual fills at decision_price).
 # The chain rules are paper-only by their own spec.
-SHADOW_ONLY_STRATEGIES = frozenset({
-    "rule1_v1", "rule1_new_literal_v1", "rule3_v1",
-    "rule3_new_literal_v1", "rule3_new_equiv_v1",
-})
+SHADOW_ONLY_STRATEGIES = frozenset(
+    # FAIL CLOSED: every chain-rule strategy (a `params.rule` entry), enabled
+    # or not, is shadow-only by construction, so adding one cannot send its
+    # signals to a venue by forgetting to list it here.
+    {name for name, cfg in STRATEGIES.items() if "rule" in (cfg.get("params") or {})}
+    | {"rule1_v1", "rule1_new_literal_v1", "rule3_v1",
+       "rule3_new_literal_v1", "rule3_new_equiv_v1"}
+)
 
 # Shadow-book fee per leg (bps) by asset class, overriding the venue's fee
 # tier where the venue does not trade the class. Equity CFD half-spread 0.05%

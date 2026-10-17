@@ -19,7 +19,8 @@ from producer.service2_machine import ServiceTwoChainMachine, chain_id_for
 
 FC_LADDER = ["1m", "3m", "5m", "15m", "1h"]
 PF_LADDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h"]
-ORIGIN = "2026-07-29T12:00:00+00:00"
+ORIGIN = "2026-07-29T12:00:00+00:00"          # the 1m bar's open label
+ORIGIN_CLOSE = "2026-07-29T12:01:00+00:00"    # its close
 
 
 def _machine(ladder=FC_LADDER, ladder_name="FC", *,
@@ -128,7 +129,8 @@ async def test_no_reinit_on_first_baseline_signal_after_restart():
     await m.hydrate()
 
     m._latest_signals[0] = {"signal": 1, "timeframe": "1m",
-                            "timestamp": ORIGIN, "price": 100.0}
+                            "timestamp": ORIGIN, "bar_close": ORIGIN_CLOSE,
+                            "price": 100.0}
     events = await m._run_state_machine(0)
 
     assert [e.event_type for e in events] == []
@@ -142,7 +144,8 @@ async def test_replayed_initiation_does_not_fork_the_chain():
     # under the same id.
     m = _machine()
     m._latest_signals[0] = {"signal": 1, "timeframe": "1m",
-                            "timestamp": ORIGIN, "price": 100.0}
+                            "timestamp": ORIGIN, "bar_close": ORIGIN_CLOSE,
+                            "price": 100.0}
 
     first = await m._run_state_machine(0)
     assert [e.event_type for e in first] == ["chain_initiated"]
@@ -165,7 +168,8 @@ async def test_no_reinit_beside_a_retained_legacy_chain():
     m._last_base_signal = None          # worst case: guard restore found nothing
 
     m._latest_signals[0] = {"signal": 1, "timeframe": "1m",
-                            "timestamp": ORIGIN, "price": 100.0}
+                            "timestamp": ORIGIN, "bar_close": ORIGIN_CLOSE,
+                            "price": 100.0}
     events = await m._run_state_machine(0)
 
     assert [e.event_type for e in events] == []
@@ -181,7 +185,8 @@ async def test_direction_flip_still_initiates():
 
     flip_ts = "2026-07-29T12:01:00+00:00"
     m._latest_signals[0] = {"signal": -1, "timeframe": "1m",
-                            "timestamp": flip_ts, "price": 99.0}
+                            "timestamp": flip_ts, "bar_close": "2026-07-29T12:02:00+00:00",
+                            "price": 99.0}
     events = await m._run_state_machine(0)
 
     assert [e.event_type for e in events] == ["chain_initiated"]

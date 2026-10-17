@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(not DSN, reason="QISS_TEST_DSN not set; needs re
 @pytest_asyncio.fixture
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
-    await p.execute("TRUNCATE trade_signals")
+    await p.execute("TRUNCATE trade_signals CASCADE")
     yield p
     await p.close()
 

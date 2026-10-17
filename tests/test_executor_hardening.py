@@ -1,7 +1,7 @@
 """
 Tests for the ADR-001 Phase 3 executor hardening:
 
-  * netted per-symbol reconcile (executor and boot.py)
+  * netted per-symbol reconcile
   * orphan venue balances refuse boot (dust and allowlist excepted)
   * side gate: SHORT never reaches a venue that can't short; it goes to the
     shadow book (virtual fills at the touch, fees on both legs)
@@ -19,7 +19,6 @@ import pytest
 
 from test_signal_executor import FakeAdapter, enter_row, exit_row, make_hooks
 
-from execution import boot
 from execution.gated_adapter import GatedAdapter
 from execution.pricing import quantize_limit_price
 from execution.shadow_book import ShadowBook, ShadowHooks, ShadowPosition, net_pnl_bps
@@ -182,34 +181,6 @@ async def test_tolerance_is_one_venue_quantity_increment(venue_qty, halts):
     hooks, state = make_hooks(open_trades=[db_trade("t1", qty="10")])
     await booted(adapter, hooks)
     assert ("t1" in state["states"]) is halts
-
-
-@pytest.mark.asyncio
-async def test_boot_reconcile_nets_per_symbol():
-    # boot.run_boot_reconcile: two OPEN trades summing to the venue position
-    # are both re-adopted, not halted against each other.
-    adapter = SpotAdapter()
-    adapter.reconcile_result = positions(AAPL=15)
-    trades = [
-        boot.DbTrade(trade_id=t, chain_id=t, symbol="AAPL", asset_class="equity",
-                     side=TradeSide.LONG, state="OPEN", entry_client_order_id=f"e-{t}",
-                     entry_target_qty=Decimal(q), entry_filled_qty=Decimal(q),
-                     exit_filled_qty=Decimal(0))
-        for t, q in (("t1", "10"), ("t2", "5"))
-    ]
-    resumed, states, alerts = [], [], []
-    async def load(): return trades
-    async def write_fill(f, tid): pass
-    async def set_state(tid, s, r): states.append((tid, s, r))
-    async def resubmit(t): pass
-    async def resume(t): resumed.append(t.trade_id)
-    async def reissue(t): pass
-    async def alert(kind, detail): alerts.append(kind)
-    ok = await boot.run_boot_reconcile(
-        adapter, boot.BootHooks(load, write_fill, set_state, resubmit, resume, reissue), alert)
-    assert ok is True
-    assert sorted(resumed) == ["t1", "t2"]
-    assert states == [] and alerts == []
 
 
 # --------------------------------------------------------------------

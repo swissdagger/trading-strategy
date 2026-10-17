@@ -70,7 +70,7 @@ async def _insert(pool, row) -> bool:
 async def pool():
     p = await asyncpg.create_pool(DSN, min_size=1, max_size=4, statement_cache_size=0)
     # Clean slate for each test.
-    await p.execute("TRUNCATE trade_signals")
+    await p.execute("TRUNCATE trade_signals CASCADE")
     yield p
     await p.close()
 
@@ -255,6 +255,45 @@ async def test_cursor_advances(pool):
         await asyncio.sleep(0.2)
         # Cursor must have advanced to at least the row's created_at.
         assert listener.cursor > before
+    finally:
+        await listener.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# --------------------------------------------------------------------
+# A failed handler is retried while running (not only on a reconnect sweep)
+# --------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_failed_signal_is_retried_while_listening(pool, monkeypatch):
+    from execution import signal_listener
+    monkeypatch.setattr(signal_listener, "_RETRY_INTERVAL_S", 0.0)
+    calls, ok = [], []
+    got_both = asyncio.Event()
+    first, second = _row(), _row()
+
+    async def handler(row):
+        calls.append(row["signal_id"])
+        if row["signal_id"] == first["signal_id"] and calls.count(first["signal_id"]) == 1:
+            raise ConnectionError("transient")
+        ok.append(row["signal_id"])
+        if len(ok) == 2:
+            got_both.set()
+
+    listener = SignalListener(DSN, pool, handler, initial_cursor=datetime.now(timezone.utc))
+    task = asyncio.create_task(listener.run())
+    try:
+        await asyncio.sleep(0.3)
+        await _insert(pool, first)        # fails on the fast path
+        await asyncio.sleep(0.3)
+        await _insert(pool, second)       # the next loop pass retries the first
+        await asyncio.wait_for(got_both.wait(), timeout=8.0)
+        assert sorted(ok) == sorted([first["signal_id"], second["signal_id"]])
+        assert calls.count(first["signal_id"]) == 2
     finally:
         await listener.stop()
         task.cancel()

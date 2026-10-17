@@ -21,6 +21,11 @@ from collections import deque
 
 log = logging.getLogger("producer.persistence")
 
+def _as_timestamptz_or_none(value):
+    """_as_timestamptz for an optional field: None stays None."""
+    return None if value is None else _as_timestamptz(value)
+
+
 def _as_timestamptz(value: Union[str, datetime]) -> datetime:
     """Coerce a decision timestamp to a datetime for a timestamptz bind.
 
@@ -81,7 +86,7 @@ def make_persist_chain_init(pool):
     its initiation step (hydrate reconstructs current_level from the step
     count, so a missing step-0 would under-report the level by one).
  
-    Per migration 019 the row also carries `ladder`, the registered ladder name.
+    Per migration 026 the row also carries `ladder`, the registered ladder name.
     ON CONFLICT (chain_id) DO NOTHING has been here since 002 but was dead code:
     chain_id was a fresh uuid4 per call, so the conflict could never fire and a
     replayed initiation wrote a duplicate row. chain_id is now derived from the
@@ -110,12 +115,15 @@ def make_persist_chain_init(pool):
                 await conn.execute(
                     """
                     INSERT INTO chain_steps
-                        (chain_id, step_index, level, timeframe, step_time, price)
-                    VALUES ($1, 0, $2, $3, $4, $5)
+                        (chain_id, step_index, level, timeframe, step_time, price,
+                         bar_close, detected_at)
+                    VALUES ($1, 0, $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (chain_id, step_index) DO NOTHING
                     """,
                     chain["chain_id"], first["level"], first["timeframe"],
                     origin_time, first.get("price"),
+                    _as_timestamptz_or_none(first.get("bar_close")),
+                    _as_timestamptz_or_none(first.get("detected_at")),
                 )
     return persist_chain_init
 
@@ -151,12 +159,15 @@ def make_persist_chain_propagate(pool):
                 await conn.execute(
                     """
                     INSERT INTO chain_steps
-                        (chain_id, step_index, level, timeframe, step_time, price)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                        (chain_id, step_index, level, timeframe, step_time, price,
+                         bar_close, detected_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (chain_id, step_index) DO NOTHING
                     """,
                     chain_id, new_step["level"] - 1, new_step["level"],
                     new_step["timeframe"], step_time, new_step.get("price"),
+                    _as_timestamptz_or_none(new_step.get("bar_close")),
+                    _as_timestamptz_or_none(new_step.get("detected_at")),
                 )
     return persist_chain_propagate
 
@@ -217,16 +228,16 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
     """Hydrate active chains for one (symbol, ladder) on restart, so chain state
     survives a restart.
  
-    THE DISCRIMINATOR IS THE LADDER NAME (migration 019). It used to be the
+    THE DISCRIMINATOR IS THE LADDER NAME (migration 026). It used to be the
     chain's baseline timeframe (history[0].timeframe == ladder[0]), which is not
     unique across ladders: FC and PF both baseline at 1m and both run on
     crypto_symbols(), so each machine adopted the other's chains on restart and
     advanced them under its own level numbering — 1h is level 5 in FC and level 6
     in PF. Ownership is now explicit and filtered in SQL.
  
-    No legacy branch: migration 019 retired every chain that predates the
-    `ladder` column, and ck_chains_ladder_required makes the column mandatory on
-    anything live, so a NULL ladder cannot reach this query.
+    No legacy branch: ck_chains_ladder_required (migration 026) makes the
+    column mandatory on anything live, so a NULL ladder cannot reach this
+    query.
  
     Per migration 008 the per-step history is reconstructed from chain_steps
     (authoritative, append-only) rather than the chains.history column. One
@@ -253,7 +264,7 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
             step_rows = await conn.fetch(
                 """
                 SELECT cs.chain_id, cs.step_index, cs.level, cs.timeframe,
-                       cs.step_time, cs.price
+                       cs.step_time, cs.price, cs.bar_close, cs.detected_at
                 FROM chain_steps cs
                 JOIN chains c ON c.chain_id = cs.chain_id
                 WHERE c.active = true AND c.symbol = $1 AND c.asset_class = $2
@@ -271,6 +282,10 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
                 # step_time is timestamptz; the machine compares/parses ISO
                 # strings, so emit isoformat exactly as the live path stored it.
                 "timestamp": s["step_time"].isoformat(),
+                # NULL on steps written before migration 027; the machine then
+                # derives the close from the label (open + one timeframe).
+                "bar_close": s["bar_close"].isoformat() if s["bar_close"] else None,
+                "detected_at": s["detected_at"].isoformat() if s["detected_at"] else None,
                 "price": s["price"],
             })
         out = []
@@ -295,6 +310,7 @@ def make_load_active_chains(pool, symbol: str, asset_class: str,
                 "next_expected_level": len(history),
                 "active_timeframes": list(r["active_timeframes"]),
                 "history": history, "last_timestamp": last["timestamp"],
+                "last_bar_close": last["bar_close"],
             })
         return out
     return load_active_chains
@@ -396,8 +412,8 @@ def make_insert_signal(pool):
                     INSERT INTO trade_signals
                         (signal_id, position_key, chain_id, direction, action,
                          symbol, asset_class, strategy, trigger_level, decision_price,
-                         exit_reason, fraction, decided_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                         exit_reason, fraction, decided_at, decided_bar_close)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                     ON CONFLICT (signal_id) DO NOTHING
                     """,
                     row["signal_id"], row["position_key"], row["chain_id"],
@@ -414,6 +430,7 @@ def make_insert_signal(pool):
                     # cumulative-fraction arithmetic relies on exactness.
                     Decimal(str(row.get("fraction", 1.0))),
                     decided_at,
+                    _as_timestamptz_or_none(row.get("decided_bar_close")),
                 )
         except Exception:
             # An exception here is exactly the failure mode that once killed the
@@ -477,16 +494,37 @@ def make_load_strategy_open_entries(pool, strategy: str):
 
 def make_load_opposing_chain_since(pool):
     """Restart reconcile for the chain rules: did a chain in `direction` on
-    `symbol` (any ladder — an opposing P1 is an opposing P1) initiate after
-    `since`? The package's load_open_trades asks the same of `chains`."""
-    async def load(symbol: str, direction: int, since) -> bool:
+    `symbol` initiate on the rule's own `ladder` after `since`? The live rule
+    exits only on an opposing initiation on its ladder, and its clock is when
+    an event REACHED the process — so this compares the initiation step's
+    recorded_at (wall time), not the chain's market-time origin."""
+    async def load(symbol: str, direction: int, since, ladder: str) -> bool:
         async with pool.acquire() as conn:
             return bool(await conn.fetchval(
                 """
-                SELECT 1 FROM chains
-                WHERE symbol = $1 AND direction = $2 AND origin_time > $3
+                SELECT 1 FROM chains c
+                JOIN chain_steps s ON s.chain_id = c.chain_id AND s.step_index = 0
+                WHERE c.symbol = $1 AND c.direction = $2 AND c.ladder = $4
+                  AND s.recorded_at > $3
                 LIMIT 1
-                """, symbol, int(direction), since))
+                """, symbol, int(direction), since, ladder))
+    return load
+
+
+def make_load_chain_confirmed(pool):
+    """Restart reconcile for the chain rules: did `chain_id` reach `level`
+    by wall time `by` (entry + stall window)? A trade restored from
+    trade_signals has lost its in-memory `confirmed` flag; without this, a
+    trade that confirmed before a restart inside its stall window was
+    stalled out."""
+    async def load(chain_id: str, level: int, by) -> bool:
+        async with pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """
+                SELECT 1 FROM chain_steps
+                WHERE chain_id = $1 AND level >= $2 AND recorded_at <= $3
+                LIMIT 1
+                """, chain_id, int(level), by))
     return load
 
 
@@ -597,6 +635,47 @@ def make_persist_warmup_bars(pool):
                 rows,
             )
     return persist_warmup_bars
+
+
+def make_persist_live_bar(pool):
+    """BAR STORE write for one live bar the signal process appended: the same
+    warmup_bars table warmup seeds, so make_load_buffers hydrates a restarted
+    machine up to where the last run got. Without it, buffers came back as
+    warmup left them while Kafka resumed after the last committed offset, and
+    every bar in between vanished — spliced out of the series Sumtyme reads
+    as consecutive steps.
+
+    DO NOTHING on conflict, unlike warmup's upsert: the buffer keeps the FIRST
+    version of a bar (a replay with revised values is dropped as a duplicate),
+    so the store must too."""
+    async def persist_live_bar(bar) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO warmup_bars
+                    (symbol, timeframe, timestamp_ms, open, high, low, close,
+                     asset_class, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                ON CONFLICT (symbol, timeframe, timestamp_ms) DO NOTHING
+                """,
+                bar.symbol, bar.timeframe, bar.timestamp, bar.open, bar.high,
+                bar.low, bar.close, bar.asset_class,
+            )
+    return persist_live_bar
+
+
+async def read_bar_store_cursors(pool) -> dict:
+    """The newest stored bar per (symbol, timeframe), as
+    cursors[symbol][timeframe] = epoch ms — the feed's resume point: everything
+    at or before it is already in the signal process's buffers."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT symbol, timeframe, max(timestamp_ms) AS ts FROM warmup_bars "
+            "GROUP BY symbol, timeframe")
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r["symbol"], {})[r["timeframe"]] = r["ts"]
+    return out
 
 
 def make_load_buffers(pool, symbol: str, timeframes: list):

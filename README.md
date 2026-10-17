@@ -77,7 +77,7 @@ fees — the only short-side data available.
 | Producer | bars | tagged chain events | `service2_machine.py`, `fanout_router_multi.py`, `ladder_registry.py` |
 | Strategy | chain events | `trade_signals` rows | `multi_runtime.py`, `confirmed_15m_*.py`, `signal_writer.py` |
 | Execution | trade signals | venue orders | `signal_listener.py`, `signal_executor.py`, `sizing.py`, `shadow_book.py`, `gated_adapter.py`, `coinbase_adapter.py`, `paper_adapter.py` |
-| Schema | — | the trading DB | `migrations/001…024` |
+| Schema | — | the trading DB | `migrations/001…027` |
 
 Dependencies point downward only. The executor never imports the strategy; both
 sides share only the DB contract and the event shape.
@@ -149,7 +149,8 @@ consumer.
 | `direction`, `symbol`, `asset_class` | symbol is the Coinbase product id (`BTC-USD`) |
 | `trigger_level`, `decision_price` | the level and price the strategy saw |
 | `exit_reason` | `STOP` \| `TARGET` (\| `SCALE` \| `TERMINAL`) on EXIT, NULL on ENTER |
-| `decided_at` | the deciding bar's timestamp (market time, window start) |
+| `decided_at` | the deciding bar's label: its OPEN time (market time); for a clock-driven exit, the wall clock |
+| `decided_bar_close` | the deciding bar's CLOSE, when its information existed (migration 027); NULL for clock-driven signals |
 | `created_at` | when the row was written (wall time) |
 
 **Idempotency.** `signal_id` hashes `(strategy, position_key, action, discriminator)`,
@@ -267,7 +268,6 @@ Two probes drive synthetic chain events through the **real** gates, writer,
 insert, NOTIFY and listener — nothing is hand-inserted:
 
 ```bash
-python write_path_probe.py    --i-understand-live-listeners   # two_ladder
 python write_path_probe_fc.py --i-understand-live-listeners   # confirmed_15m
 ```
 
@@ -289,8 +289,9 @@ unroutable by design.
   in arrival order (`producer/symbol_workers.py`).
 - **Crypto seconds rungs.** The CN ladder's 30s/45s bars are built from
   Coinbase Exchange trades for `subminute_symbols` only (BTC-USD): a
-  backward trade walk at warmup, a 15 s forward poll live, one source for
-  both. ~5,570 extra forecasts/symbol/day; one symbol fits the measured
+  backward trade walk at warmup, a forward poll at each window close live,
+  one source for both. Live, they wait for the 1m candles' settle (see Bar
+  ordering). ~5,570 extra forecasts/symbol/day; one symbol fits the measured
   capacity beside the ten-symbol FC ladder, a second needs the D12
   re-benchmark.
 - **Equities capacity.** The DL ladder needs ~5,700 forecasts/symbol/day over
@@ -303,11 +304,48 @@ unroutable by design.
 - **Bar latency.** Coinbase revises a closed candle for up to ~36 s, so the feed
   emits a bar 60 s after its window closes. Thin books omit no-trade minutes; the
   gaps pass through.
-- **Restart hydration.** Machines restore buffers, active chains and the last
-  baseline signal, and drop any bar not newer than their buffer (Kafka replays).
-- **State-machine sync.** The chain machine is copied from CausaView, not shared
-  as a library, and differs by two changes: the monotonic bar guard, and the
-  prepare/forecast/apply split of `on_bar` (ADR-001 debt D9). The
-  INIT/PROPAGATE/TERMINATE sweep (`_run_state_machine`) is verbatim; apply
-  changes to it in both places.
-  in both places.
+- **Bar ordering.** The Coinbase feed publishes each symbol's bars in
+  CLOSE-TIME order across all its rungs, the shorter rung first on a tie
+  (`CloseOrderMerge` in `feeds/coinbase_spot.py`): a bar waits until every rung
+  of its symbol has been read past its close. The chain machines apply bars in
+  arrival order, so without this the poll timing decided whether a chain
+  propagated or terminated.
+- **Bar times.** Bars are labelled by their OPEN time, and that label is what
+  `chain_steps.step_time`, `chains.origin_time` and `trade_signals.decided_at`
+  record. A signal's information exists at its bar's CLOSE (= label + one
+  timeframe = `signals.timestamp`, Sumtyme's placeholder), and that is what the
+  chain sweep compares across rungs: a higher rung extends a chain only with
+  information at least as new as the chain's last step. So the 1h bar
+  11:00–12:00 extends a chain whose top rung is the 30m bar 11:30–12:00 (both
+  close at 12:00). Each chain step also stores `bar_close` and `detected_at`
+  (when the machine made the step; wall clock), and `trade_signals` stores
+  `decided_bar_close` (migration 027), so nothing has to be inferred. For the
+  5m bar labelled 12:05: label 12:05, close 12:10, detected ~12:11.
+- **Restart hydration.** Every bar a machine appends is written to
+  `warmup_bars` (the bar store) once applied, so a restarted signal process
+  hydrates its buffers to where the last run got; Kafka replays the rest and
+  machines drop any bar not newer than their buffer. A new consumer group reads
+  the topic from the earliest offset. The feed resumes from the newest stored
+  bar (or warmup's cursor, if newer). The store grows by every live bar
+  (~15k rows/day for the crypto universe).
+- **State-machine sync.** The chain machine is copied from CausaView's
+  `service_2_sumtyme_bridge.process_forecast`, not shared as a library (ADR-001
+  debt D9). The INIT condition, the one-rung-at-a-time PROPAGATE loop and both
+  TERMINATE paths are the same logic. It deliberately differs in:
+  - **ordering**: the prepare/forecast/apply split applies each symbol's
+    results strictly in arrival order, cache write and sweep both under the
+    symbol lock (CausaView writes the cache, outside the lock, in forecast
+    completion order);
+  - **the sweep's comparison**: bar CLOSE, not the bar's open label (see Bar
+    times);
+  - **identity**: deterministic `chain_id` per (symbol, ladder, direction,
+    origin), and a replayed initiation is skipped (CausaView: `uuid4`);
+  - **input**: the monotonic bar guard, no synthetic gap-fill bars, and an
+    OHLC-only Sumtyme payload;
+  - **scope and storage**: one machine per (symbol, ladder); `chain_steps`
+    rows carrying `bar_close` / `detected_at`; persistence failures are
+    logged and the sweep continues; the INIT guard is restored from the
+    newest of `signals` and the active chains.
+
+  A change to the shared logic must be made in both places; a change to one of
+  the differences above must be checked against why it differs.

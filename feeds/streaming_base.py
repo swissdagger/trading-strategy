@@ -1,10 +1,8 @@
 """
 feeds/streaming_base.py — the resilient websocket supervisor.
 
-This is the shared machinery a websocket feed sits on. No feed uses it since
-ADR-001 (the Polygon and Binance ws feeds are deleted); it is kept, with its
-tests, for a future Coinbase websocket feed. All the resilience lives here,
-once.
+This is the shared machinery a websocket feed sits on (today feeds/polygon_ws,
+the equity stream). All the resilience lives here, once.
 
 ## What "resilient" means concretely
 

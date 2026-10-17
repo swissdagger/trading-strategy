@@ -3,8 +3,11 @@ producer/service2_machine.py — service_2's chain state machine, extracted behi
 the ChainMachine seam, instantiated once per (symbol, set).
 
 This is the EXTRACTION of CausaView's service_2_sumtyme_bridge.process_forecast.
-The INIT -> PROPAGATE -> TERMINATE logic is preserved verbatim in behavior; what
-changes is structural, and exactly two things change in a way that MATTERS:
+The INIT -> PROPAGATE -> TERMINATE logic (the start condition, the one-rung
+propagation loop, both termination paths) is the same as the original; the
+deliberate differences are listed in README "State-machine sync" (ordering,
+comparing on bar close, deterministic ids, input guard, storage). Structurally,
+two things change in a way that MATTERS:
 
   1. ONE INSTANCE PER (symbol, set), not per asset class. Each instance owns its
      own signal cache, last-base-signal, active_chains, per-timeframe buffers, and
@@ -29,7 +32,8 @@ against service_2):
   * the asyncio.to_thread Sumtyme call (never block the loop),
   * the INIT condition (baseline signal changed direction),
   * the PROPAGATE/TERMINATE sweep, including the "next-expected level opposes" AND
-    "current level flips" termination paths,
+    "current level flips" termination paths (its comparison is on bar close —
+    see README "State-machine sync"),
   * persisting signals + chains to the DB (research/audit tables want them),
   * hydrate-on-restart from the chains table.
 
@@ -46,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,6 +99,38 @@ def _tf_seconds(timeframe: str) -> Optional[int]:
         return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     except (ValueError, KeyError, IndexError):
         return None
+
+
+def _bar_close_ms(bar: OHLCPoint) -> int:
+    """Epoch ms at which `bar` CLOSED: bar.timestamp (its open — bars are
+    labelled by open time) + one timeframe. The moment the information in a
+    signal computed from this bar first existed; the same instant
+    service2_utils computes as placeholder_dt."""
+    secs = _tf_seconds(bar.timeframe)
+    if secs is None:
+        raise ValueError(f"cannot parse timeframe {bar.timeframe!r}")
+    return bar.timestamp + secs * 1000
+
+
+def _now_iso() -> str:
+    """Wall clock, ISO UTC: a chain step's detected_at."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _last_bar_close(chain: dict) -> str:
+    """The bar close of the chain's newest step. Live chains carry it; a
+    chain hydrated from rows written before chain_steps.bar_close existed has
+    only the step's open label, from which the close follows (open + one
+    timeframe)."""
+    close = chain.get("last_bar_close")
+    if close:
+        return close
+    last = chain["history"][-1]
+    if last.get("bar_close"):
+        return last["bar_close"]
+    secs = _tf_seconds(last["timeframe"])
+    opened = datetime.fromisoformat(last["timestamp"])
+    return _epoch_ms_to_iso(int(opened.timestamp() * 1000) + (secs or 0) * 1000)
 
 
 def _epoch_ms_to_iso(ms: int) -> str:
@@ -275,6 +312,11 @@ class ServiceTwoChainMachine(ChainMachine):
         # timeframe -> rolling buffer of tick dicts
         self._buffers: Dict[str, deque] = {}
         self._hydrated = False
+        # Did the last prepare() append its bar? Read by the router to decide
+        # whether the bar goes to the bar store.
+        self.last_prepare_appended = False
+        self._older_drops = 0
+        self._older_drop_logged = -1e9
 
     # ---------------------------------------------------------------
     def _level_index(self, timeframe: str) -> Optional[int]:
@@ -448,6 +490,7 @@ class ServiceTwoChainMachine(ChainMachine):
         Returns None when there is nothing to forecast: timeframe not in this
         ladder, duplicate/out-of-order bar (dropped), or buffer not yet full.
         """
+        self.last_prepare_appended = False
         idx = self._level_index(bar.timeframe)
         if idx is None:
             return None   # not in this ladder (router shouldn't send it, but guard)
@@ -471,10 +514,10 @@ class ServiceTwoChainMachine(ChainMachine):
                 log.debug("drop duplicate bar %s/%s ts=%s",
                           self.symbol, bar.timeframe, bar.timestamp)
             else:
-                log.warning("drop out-of-order bar %s/%s ts=%s (newest buffered %s)",
-                            self.symbol, bar.timeframe, bar.timestamp, newest)
+                self._note_older_drop(bar, newest)
             return None
         buf.append(self._tick_dict(bar))
+        self.last_prepare_appended = True
 
         # >= not == : an over-filled buffer from a race-y warmup must still
         # forecast (service_2's explicit inline note).
@@ -501,6 +544,22 @@ class ServiceTwoChainMachine(ChainMachine):
         # is acquired, so a bar queued for a permit holds 5000 references, not
         # a 5001-row frame (this is what bounds peak memory under backlog).
         return PendingForecast(idx=idx, bar=bar, snapshot=tuple(buf), memo_key=memo_key)
+
+    def _note_older_drop(self, bar: OHLCPoint, newest: int) -> None:
+        """An OLDER bar is expected in bulk after a restart (the consumer and
+        the feed replay from before the hydrated buffer's newest bar), and
+        otherwise means an upstream ordering bug. Counted, and logged at most
+        once a minute per machine so a replay cannot flood the log."""
+        self._older_drops += 1
+        now = time.monotonic()
+        if now - self._older_drop_logged >= 60.0:
+            log.warning("dropped %d bar(s) not newer than the buffer for %s/%s "
+                        "(latest: %s ts=%s, newest buffered %s) — replay after a "
+                        "restart, or an upstream ordering bug",
+                        self._older_drops, self.symbol, self.ladder_name,
+                        bar.timeframe, bar.timestamp, newest)
+            self._older_drops = 0
+            self._older_drop_logged = now
 
     # ---------------------------------------------------------------
     # STAGE 2 — forecast: the slow part. NO lock held. Touches no machine state.
@@ -688,7 +747,16 @@ class ServiceTwoChainMachine(ChainMachine):
         idx = pending.idx
         signal_value = list(pending.forecast.values())[0]
         current_price = bar.close
+        # Two times per signal. `timestamp` is the bar's LABEL (its open, as
+        # every vendor and the rest of this repo label bars) and is what chain
+        # steps, origin_time and decided_at record. `bar_close` is when the
+        # information existed, and is what the sweep COMPARES across rungs: a
+        # higher rung may extend a chain only with information at least as new
+        # as the chain's last step. Comparing opens would order a 1h bar
+        # (11:00-12:00) an hour before a 30m bar (11:30-12:00) that closed at
+        # the same moment, and refuse the extension.
         bar_iso = _epoch_ms_to_iso(bar.timestamp)
+        close_iso = _epoch_ms_to_iso(_bar_close_ms(bar))
 
         # Success path is observable at DEBUG: a healthy pipeline emits a steady
         # stream of these; sudden silence (with bars still arriving) localises a
@@ -712,6 +780,7 @@ class ServiceTwoChainMachine(ChainMachine):
             "signal": signal_value,
             "timeframe": bar.timeframe,
             "timestamp": bar_iso,
+            "bar_close": close_iso,
             "price": current_price,
         }
 
@@ -772,7 +841,10 @@ class ServiceTwoChainMachine(ChainMachine):
                 else:
                     first_step = {
                         "level": 1, "timeframe": base_sig["timeframe"],
-                        "timestamp": base_sig["timestamp"], "price": base_sig["price"],
+                        "timestamp": base_sig["timestamp"],
+                        "bar_close": base_sig["bar_close"],
+                        "detected_at": _now_iso(),
+                        "price": base_sig["price"],
                     }
                     self._last_base_signal = base_sig["signal"]
                     chain = {
@@ -782,6 +854,7 @@ class ServiceTwoChainMachine(ChainMachine):
                         "current_level": 0, "next_expected_level": 1,
                         "active_timeframes": [base_sig["timeframe"]],
                         "history": [first_step], "last_timestamp": base_sig["timestamp"],
+                        "last_bar_close": base_sig["bar_close"],
                     }
                     self._active_chains[chain_id] = chain
                     try:
@@ -793,6 +866,7 @@ class ServiceTwoChainMachine(ChainMachine):
                         symbol=self.symbol, asset_class=self.asset_class,
                         direction=base_sig["signal"], propagation_level=1,
                         timeframe=base_sig["timeframe"], timestamp=base_sig["timestamp"],
+                        bar_close=base_sig["bar_close"],
                         price=base_sig["price"],
                     ))
 
@@ -806,17 +880,22 @@ class ServiceTwoChainMachine(ChainMachine):
                 curr_idx = chain["current_level"]
 
                 next_sig = self._latest_signals.get(expected_idx)
-                if next_sig and next_sig["timestamp"] >= chain["last_timestamp"]:
+                last_close = _last_bar_close(chain)
+                if next_sig and next_sig["bar_close"] >= last_close:
                     if next_sig["signal"] == chain["direction"]:
                         # PROPAGATE
                         chain["current_level"] = expected_idx
                         chain["next_expected_level"] = expected_idx + 1
                         chain["last_timestamp"] = next_sig["timestamp"]
+                        chain["last_bar_close"] = next_sig["bar_close"]
                         if next_sig["timeframe"] not in chain["active_timeframes"]:
                             chain["active_timeframes"].append(next_sig["timeframe"])
                         new_step = {
                             "level": expected_idx + 1, "timeframe": next_sig["timeframe"],
-                            "timestamp": next_sig["timestamp"], "price": next_sig["price"],
+                            "timestamp": next_sig["timestamp"],
+                            "bar_close": next_sig["bar_close"],
+                            "detected_at": _now_iso(),
+                            "price": next_sig["price"],
                         }
                         chain["history"].append(new_step)
                         try:
@@ -831,6 +910,7 @@ class ServiceTwoChainMachine(ChainMachine):
                             symbol=self.symbol, asset_class=self.asset_class,
                             direction=chain["direction"], propagation_level=expected_idx + 1,
                             timeframe=next_sig["timeframe"], timestamp=next_sig["timestamp"],
+                            bar_close=next_sig["bar_close"],
                             price=next_sig["price"],
                         ))
                         progress_made = True
@@ -848,13 +928,14 @@ class ServiceTwoChainMachine(ChainMachine):
                             symbol=self.symbol, asset_class=self.asset_class,
                             direction=chain["direction"], propagation_level=expected_idx + 1,
                             timeframe=next_sig["timeframe"], timestamp=next_sig["timestamp"],
+                            bar_close=next_sig["bar_close"],
                             price=next_sig["price"],
                         ))
                         break
 
                 if not progress_made:
                     curr_sig = self._latest_signals.get(curr_idx)
-                    if (curr_sig and curr_sig["timestamp"] >= chain["last_timestamp"]
+                    if (curr_sig and curr_sig["bar_close"] >= last_close
                             and curr_sig["signal"] == -chain["direction"]):
                         # TERMINATE — current level flipped against the chain
                         del self._active_chains[cid]
@@ -868,6 +949,7 @@ class ServiceTwoChainMachine(ChainMachine):
                             symbol=self.symbol, asset_class=self.asset_class,
                             direction=chain["direction"], propagation_level=curr_idx + 1,
                             timeframe=curr_sig["timeframe"], timestamp=curr_sig["timestamp"],
+                            bar_close=curr_sig["bar_close"],
                             price=curr_sig["price"],
                         ))
                         break

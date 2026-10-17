@@ -82,16 +82,23 @@ def make_persist_trade(pool: asyncpg.Pool):
     unique constraint: a replay re-writing the same trade updates in place rather
     than opening a second position (the DB backstop the schema was built for).
 
+    Only the SAME trade (same trade_id) is updated. A different trade on an
+    occupied (chain_id, side) — a re-processed ENTER whose trade already closed
+    or was rejected, or a second strategy on the same chain — writes nothing and
+    returns False, so the executor refuses the entry. (It used to overwrite the
+    existing row back to PENDING under the old trade_id, after which the new
+    trade's order failed the trade_id FK.) Returns True when written.
+
     NOTE OpenTrade does not carry chain_id directly; position_key encodes it
     ("{chain_id}:{L|S}"). We split it back out to satisfy the NOT NULL chain_id
     column and the (chain_id, side) key. entry_client_order_id, entry_target_qty,
     and state are the other NOT NULLs OpenTrade can supply."""
-    async def persist_trade(t: OpenTrade) -> None:
+    async def persist_trade(t: OpenTrade) -> bool:
         # position_key is "{chain_id}:{L|S}" — chain_id may itself contain no
         # ':' (it's a uuid string), so rsplit once is safe.
         chain_id = t.position_key.rsplit(":", 1)[0]
         async with pool.acquire() as conn:
-            await conn.execute(
+            written = await conn.fetchval(
                 """
                 INSERT INTO trades
                     (trade_id, chain_id, symbol, asset_class, side, state,
@@ -107,6 +114,8 @@ def make_persist_trade(pool: asyncpg.Pool):
                     scale_banked      = EXCLUDED.scale_banked,
                     exit_reason       = EXCLUDED.exit_reason,
                     last_updated      = now()
+                WHERE trades.trade_id = EXCLUDED.trade_id
+                RETURNING trade_id
                 """,
                 t.trade_id, chain_id, t.symbol, t.asset_class, t.side.value,
                 t.state, t.entry_client_order_id, t.target_qty, t.filled_qty,
@@ -120,6 +129,11 @@ def make_persist_trade(pool: asyncpg.Pool):
                 json.dumps({str(k): str(v) for k, v in t.scale_banked.items()}),
                 t.exit_reason,
             )
+        if written is None:
+            log.error("persist_trade: (chain_id=%s, side=%s) is held by another trade; "
+                      "trade %s not written", chain_id, t.side.value, t.trade_id)
+            return False
+        return True
     return persist_trade
 
 

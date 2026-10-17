@@ -30,9 +30,11 @@ re-enabling PF needs no feed change.
 
 ## Live path
 
-One REST poll loop per timeframe at ~tf/2 (8s floor, 600s ceiling), closed
-windows only, per-(symbol, tf) high-water cursor seeded from warmup's
-feed_cursors — the same shape as the Binance feed it replaces. Each poll reads
+One REST poll loop per timeframe, each woken when its next window can be
+complete (window end + settle), closed windows only, per-(symbol, tf)
+high-water cursor seeded from warmup's feed_cursors. The rungs' bars are
+merged per symbol into CLOSE-TIME order (shorter rung first on a tie) before
+they are published — see start_live and CloseOrderMerge. Each poll reads
 from the cursor forward, so a restart or slow start catches up instead of
 skipping the windows in between. A window is emitted only once it is provably
 complete:
@@ -127,6 +129,67 @@ _LIVE_LOOKBACK_WINDOWS = 6
 # How far a live poll will catch up from a stale cursor before clamping:
 # 20 pages x 300 base candles = 100 hours of 1m. Longer gaps need a re-warmup.
 MAX_CATCHUP_PAGES = 20
+
+
+# Live poll retry after a failed read; floor between polls of one rung.
+_RETRY_S = 5.0
+_MIN_POLL_GAP_S = 1.0
+# A symbol whose bars have waited longer than this for a lagging rung is
+# logged (once per minute) naming the rung.
+_HOLD_WARN_MS = 5 * 60_000
+
+
+class CloseOrderMerge:
+    """Per-symbol merge of every rung's bars into close-time order.
+
+    Each (symbol, rung) has a THROUGH time: every bar of that rung closing at
+    or before it has been offered. A symbol's bars are released once their
+    close is at or before the smallest THROUGH across the symbol's rungs —
+    no rung can still produce an earlier-closing bar — sorted by (close,
+    timeframe length), so on a tie the shorter rung goes first."""
+
+    def __init__(self, streams: Dict[str, List[str]], through: Dict[tuple, int]):
+        self._streams = streams
+        self._through = dict(through)
+        self._pending: Dict[str, List[OHLCPoint]] = {s: [] for s in streams}
+        self._warned_at: Dict[str, int] = {}
+
+    def offer(self, symbol: str, tf: str, points: List[OHLCPoint],
+              through_ms: Optional[int]) -> None:
+        """Hand in a rung's new bars and, if the read was complete, how far
+        it has now been read (None = not caught up; THROUGH stays put)."""
+        self._pending[symbol].extend(points)
+        if through_ms is not None:
+            key = (symbol, tf)
+            self._through[key] = max(self._through.get(key, through_ms), through_ms)
+
+    def release(self, now_ms: Optional[int] = None) -> List[OHLCPoint]:
+        out: List[OHLCPoint] = []
+        for sym, tfs in self._streams.items():
+            pending = self._pending[sym]
+            if not pending:
+                continue
+            cutoff = min(self._through[(sym, tf)] for tf in tfs)
+            ready, held = [], []
+            for p in pending:
+                (ready if _close_ms(p) <= cutoff else held).append(p)
+            ready.sort(key=lambda p: (_close_ms(p), timeframe_to_ms(p.timeframe)))
+            out.extend(ready)
+            self._pending[sym] = held
+            if held and now_ms is not None:
+                oldest = min(_close_ms(p) for p in held)
+                if now_ms - oldest > _HOLD_WARN_MS and \
+                        now_ms - self._warned_at.get(sym, 0) > 60_000:
+                    self._warned_at[sym] = now_ms
+                    lagging = [tf for tf in tfs if self._through[(sym, tf)] < oldest]
+                    logger.warning(
+                        "%s: %d bar(s) held %.0fs for rung(s) %s not yet read past "
+                        "their close", sym, len(held), (now_ms - oldest) / 1000, lagging)
+        return out
+
+
+def _close_ms(p: OHLCPoint) -> int:
+    return p.timestamp + timeframe_to_ms(p.timeframe)
 
 
 def base_timeframe(tf: str) -> str:
@@ -329,17 +392,36 @@ class CoinbaseSpotFeed(AssetFeed):
         to `tf`; emits windows closed at least TRADE_SETTLE_MS ago; the cursor
         advances to the start of the first unclosed window (re-read next poll
         so late prints land in the right bar)."""
+        points, new_cursor, _ok = await self._poll_trades(symbol, tf, cursor_ms, now_ms)
+        return points, new_cursor
+
+    async def _poll_trades(self, symbol: str, tf: str, cursor_ms: int,
+                           now_ms: int) -> "tuple[List[OHLCPoint], int, bool]":
+        """_poll_trades_once plus whether the read was COMPLETE. A failed page
+        means the trades back to the cursor were not all seen, so nothing is
+        emitted (a window missing its earlier trades would be a wrong bar that
+        the cursor then moves past) and the caller must not treat the rung as
+        caught up."""
         tf_ms = timeframe_to_ms(tf)
         trades: List[dict] = []
         after: Optional[int] = None
+        covered = False
         for _ in range(20):                               # 20k trades per poll, plenty
             page = await self._fetch_trades_page(symbol, after)
+            if page is None:
+                return [], cursor_ms, False
             if not page:
+                covered = True                            # nothing older exists
                 break
             trades.extend(page)
             after = page[-1]["trade_id"]
             if page[-1]["t"] < cursor_ms:
+                covered = True
                 break
+        if not covered:
+            logger.warning("coinbase trades %s %s: 20 pages did not reach the cursor; "
+                           "holding this rung", symbol, tf)
+            return [], cursor_ms, False
         points: List[OHLCPoint] = []
         new_cursor = cursor_ms
         for w in self._trades_to_windows(trades, tf):
@@ -349,7 +431,7 @@ class CoinbaseSpotFeed(AssetFeed):
                 break
             points.append(self._point(symbol, tf, w))
             new_cursor = max(new_cursor, w["t"] + tf_ms)
-        return points, new_cursor
+        return points, new_cursor, True
 
     # ------------------------------------------------------------------
     # HISTORY (warmup)
@@ -436,10 +518,17 @@ class CoinbaseSpotFeed(AssetFeed):
         (<= _PAGE_CANDLES base candles per request); a normal poll is one
         request. A cursor more than MAX_CATCHUP_PAGES pages behind is clamped
         to that much history (logged) — far longer gaps are a re-warmup."""
+        points, _ok = await self._closed_since(symbol, timeframe, since_ms, self._now_ms())
+        return points
+
+    async def _closed_since(self, symbol: str, timeframe: str, since_ms: int,
+                            now: int) -> "tuple[List[OHLCPoint], bool]":
+        """closed_since at a given `now`, plus whether every page was read.
+        On a failed page the windows completed by the pages before it are
+        still returned (they are whole), but the rung is not caught up."""
         base_tf = base_timeframe(timeframe)
         base_ms = timeframe_to_ms(base_tf)
         tf_ms = timeframe_to_ms(timeframe)
-        now = self._now_ms()
         page_ms = _PAGE_CANDLES * base_ms
         # Read at least the last few windows, so the derived-window rule has
         # the base candles it needs even when the cursor is current.
@@ -454,18 +543,24 @@ class CoinbaseSpotFeed(AssetFeed):
         start_ms = start_ms // tf_ms * tf_ms
         by_t: Dict[int, dict] = {}
         page_start = start_ms
+        ok = True
         while page_start < now:
             page_end = min(page_start + page_ms, now)
             page = await self._fetch_page(symbol, base_tf, page_start // 1000,
                                           page_end // 1000)
             if page is None:
-                break   # error already logged; emit what is complete so far
+                ok = False   # error already logged; emit what is complete so far
+                break
             for r in page:
                 by_t[r["t"]] = r
             page_start = page_end
+        # A failed page leaves the windows after it unread: judge completeness
+        # only up to where the read got, or a window whose base candles were on
+        # the failed page would be emitted short (and never corrected).
+        judged_at = now if ok else min(now, page_start)
         return [self._point(symbol, timeframe, b)
-                for b in self._closed_target_bars(by_t, timeframe, now, final=False)
-                if b["t"] >= since_ms]
+                for b in self._closed_target_bars(by_t, timeframe, judged_at, final=False)
+                if b["t"] >= since_ms], ok
 
     # ------------------------------------------------------------------
     # LIVE (REST polling)
@@ -474,40 +569,70 @@ class CoinbaseSpotFeed(AssetFeed):
         self, symbols: List[str], timeframes: List[str],
         initial_cursors: Dict[str, Dict[str, int]], callback: LiveDataCallback,
     ) -> None:
-        self._running = True
+        """Poll every rung and emit each symbol's bars in CLOSE-TIME order.
 
-        async def poll_one_tf(tf: str) -> None:
-            tf_ms = timeframe_to_ms(tf)
-            interval = min(max(tf_ms // 2000, 8), 600)
+        Each rung has its own poller, scheduled for the moment its next
+        window can be complete (window end + settle), so a 1h bar is read a
+        minute after the hour, not up to ten minutes later. Their bars do not
+        go to the callback directly: a CloseOrderMerge holds them until every
+        rung of that symbol has been read past their close, then releases
+        them sorted by (close time, timeframe) — shorter first on a tie.
+        Without it, the order the chain machine applied rungs in was the
+        order the pollers happened to fire in, and the same bars could
+        propagate a chain or terminate it depending on poll phase.
+
+        The cost is latency: a bar waits for the slowest rung that could
+        still produce an earlier-closing bar (the 1m candles' 60 s settle
+        holds the 30s/45s rungs; a rung whose read keeps failing holds its
+        symbol, logged).
+        """
+        self._running = True
+        streams: Dict[str, List[str]] = {sym: [] for sym in symbols}
+        cursors: Dict[str, Dict[str, int]] = {}
+        for tf in timeframes:
             tf_symbols = [s for s in symbols if s in self.subminute_symbols] \
                 if tf in _SECONDS else list(symbols)
+            cursors[tf] = {sym: self.initial_cursor(initial_cursors, sym, tf)
+                           for sym in tf_symbols}
+            for sym in tf_symbols:
+                streams[sym].append(tf)
             if not tf_symbols:
                 logger.info("[%s:%s] no symbols serve this rung; poller idle", self.name, tf)
+        merge = CloseOrderMerge(
+            {sym: tfs for sym, tfs in streams.items() if tfs},
+            {(sym, tf): c for tf, by_sym in cursors.items() for sym, c in by_sym.items()})
+        emit_lock = asyncio.Lock()
+
+        async def poll_one_tf(tf: str) -> None:
+            tf_symbols = list(cursors[tf])
+            if not tf_symbols:
                 return
-            cursors = {sym: self.initial_cursor(initial_cursors, sym, tf)
-                       for sym in tf_symbols}
-            logger.info("[%s:%s] REST polling every %ss (%s)", self.name, tf, interval,
+            logger.info("[%s:%s] REST polling at window close (%s)", self.name, tf,
                         "trades" if tf in _SECONDS else "candles")
             while self._running:
+                all_ok = False
                 try:
-                    now = datetime.now(timezone.utc)
+                    now_ms = self._now_ms()
+                    now = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
                     if is_market_open(self.asset_class, now):   # crypto: always
-                        if tf in _SECONDS:
-                            batch = []
-                            now_ms = self._now_ms()
-                            for sym in tf_symbols:
-                                pts, cursors[sym] = await self._poll_trades_once(
-                                    sym, tf, cursors[sym], now_ms)
-                                batch.extend(pts)
-                        else:
-                            batch = await self.poll_once(tf_symbols, tf, cursors)
-                        if batch:
-                            await callback(batch)
+                        results = await self._poll_rung(tf_symbols, tf, cursors[tf], now_ms)
+                        all_ok = all(ok for _, _, ok in results)
+                        # One emitter at a time: release + publish is atomic,
+                        # or two rungs' releases could interleave on the wire.
+                        async with emit_lock:
+                            for sym, pts, ok in results:
+                                through = self._through(tf, now_ms, cursors[tf][sym]) if ok else None
+                                merge.offer(sym, tf, pts, through)
+                            batch = merge.release(now_ms)
+                            if batch:
+                                await callback(batch)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("[%s:%s] poll error", self.name, tf)
-                await asyncio.sleep(interval)
+                delay = (self._next_poll_ms(tf, self._now_ms()) - self._now_ms()) / 1000 \
+                    if all_ok else _RETRY_S
+                await asyncio.sleep(max(delay, _MIN_POLL_GAP_S))
 
         tasks = [asyncio.create_task(poll_one_tf(tf)) for tf in timeframes]
         try:
@@ -516,6 +641,56 @@ class CoinbaseSpotFeed(AssetFeed):
             for t in tasks:
                 if not t.done():
                     t.cancel()
+
+    async def _poll_rung(self, symbols: List[str], tf: str, cursors: Dict[str, int],
+                         now_ms: int) -> "List[tuple[str, List[OHLCPoint], bool]]":
+        """One read of one rung for each symbol: (symbol, new points, read
+        complete?). Advances `cursors` past what it returns."""
+        tf_ms = timeframe_to_ms(tf)
+        out = []
+        for sym in symbols:
+            if tf in _SECONDS:
+                pts, cursors[sym], ok = await self._poll_trades(sym, tf, cursors[sym], now_ms)
+            else:
+                got, ok = await self._closed_since(sym, tf, cursors[sym], now_ms)
+                pts = []
+                for p in got:
+                    if p.timestamp >= cursors[sym]:
+                        pts.append(p)
+                        cursors[sym] = p.timestamp + tf_ms
+            out.append((sym, pts, ok))
+        return out
+
+    @staticmethod
+    def _decided_lag_ms(tf: str) -> int:
+        """How long after a window's end it is certainly decided (emitted, or
+        known to have no bar) by the live completeness rules."""
+        if tf in _SECONDS:
+            return TRADE_SETTLE_MS
+        if tf in _DERIVED:
+            return SETTLE_MS + timeframe_to_ms(base_timeframe(tf))
+        return SETTLE_MS
+
+    def _through(self, tf: str, now_ms: int, cursor_ms: int) -> int:
+        """After a COMPLETE read at now_ms: every bar of this rung that closes
+        at or before the returned time has been read. Windows are epoch
+        aligned, so it is the last window end that is decided — or the close
+        of the newest bar emitted (`cursor_ms`), if later (a derived window
+        whose last base candle came early)."""
+        tf_ms = timeframe_to_ms(tf)
+        decided = (now_ms - self._decided_lag_ms(tf)) // tf_ms * tf_ms
+        return max(decided, cursor_ms)
+
+    def _next_poll_ms(self, tf: str, now_ms: int) -> int:
+        """When the next window of this rung can first be complete: its end
+        plus the settle delay (and, for a derived rung, again after the grace
+        for a missing last base candle). Plus a second of slack."""
+        tf_ms = timeframe_to_ms(tf)
+        lags = [TRADE_SETTLE_MS] if tf in _SECONDS else [SETTLE_MS]
+        if tf in _DERIVED:
+            lags.append(SETTLE_MS + timeframe_to_ms(base_timeframe(tf)))
+        due = min(((now_ms - lag) // tf_ms + 1) * tf_ms + lag for lag in lags)
+        return due + 1_000
 
     def initial_cursor(self, initial_cursors: Dict[str, Dict[str, int]],
                        symbol: str, tf: str) -> int:
