@@ -221,45 +221,6 @@ class ChainHistoryView:
                 out.append(r)
         return out
 
-    def opposing_failures_in_window(
-        self, symbol: str, direction: int,
-        after: datetime, before: datetime, *, exact_depth: int = 1,
-    ) -> List[ChainLifecycle]:
-        """Opposing chains (direction = -`direction`) that FAILED at EXACTLY
-        `exact_depth` — terminated with peak_level == exact_depth — whose START
-        (first_seen) falls within [after, before], bounds INCLUSIVE.
-
-        The prior_failure gate's predicate (spec §2.2), generalized from
-        failed_between in two deliberate ways:
-
-          * DEPTH IS EXACT, not "below some timeframe". A chain that reached
-            L3 and then terminated is NOT a failure for this gate — the signal
-            is a chain that initiated and died without propagating. And it is
-            expressed as a LEVEL, not a hardcoded timeframe name, so the same
-            predicate is correct on any ladder (failed_between's "before 3m"
-            hardcodes the FC shape).
-          * TERMINATED IS REQUIRED, same as failed_between, and it matters
-            here: an opposing chain currently ALIVE at L1 has not failed —
-            it may be about to run. Only a completed L1-only life is the
-            rejection signal the research keyed on.
-
-        The window is on chain START (the research predicate keys on p.start,
-        not p.terminated_at), which on any ladder equals the baseline-initiate
-        time (chains always start at the baseline; propagation never skips).
-        """
-        opposing = -direction
-        out = []
-        for r in self.chains(symbol):
-            if r.direction != opposing:
-                continue
-            if not r.terminated:
-                continue
-            if r.peak_level != exact_depth:
-                continue
-            if after <= r.first_seen <= before:
-                out.append(r)
-        return out
-
     def initiators_by_start(
         self, symbol: str, direction: int, exclude_chain_id: str,
         before_start: datetime,

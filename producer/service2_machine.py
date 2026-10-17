@@ -52,15 +52,18 @@ import hashlib
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 from producer.bar import OHLCPoint
 from producer.chain_machine import ChainEvent, ChainMachine
 
 from producer.forecast_gate import ForecastGate, ForecastMemo
 from ops.alerts import alert
+
+if TYPE_CHECKING:
+    from producer.audit import WatermarkRegistry
 
 log = logging.getLogger("producer.service2_machine")
 
@@ -279,10 +282,10 @@ class ServiceTwoChainMachine(ChainMachine):
         self.symbol = symbol
         self.asset_class = asset_class
         self.ladder = ladder
-        # The ladder's REGISTERED NAME ("A"/"B"/"FC"/"PF"), not derivable from
-        # the timeframe list: FC and PF share the 1m baseline, so the baseline
-        # timeframe does not identify a ladder. Part of the chain's identity —
-        # see chain_id_for.
+        # The ladder's REGISTERED NAME (e.g. "FC", "ED"), not derivable from
+        # the timeframe list: two ladders may share a baseline timeframe, so
+        # the baseline does not identify a ladder. Part of the chain's
+        # identity — see chain_id_for.
         self.ladder_name = ladder_name
         self.baseline_timeframe = ladder[0]
 

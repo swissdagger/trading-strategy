@@ -126,9 +126,9 @@ executor routes any signal for an asset class its venue does not trade to the
 shadow book, so an equity strategy on DL gets virtual round trips at
 `decision_price` without a venue.
 
-**Disabled, kept in the tree** (ADR-001 debt D1/D2): `two_ladder` (sub-minute
-A/B ladders; no crypto source) and `prior_failure_scaleout` (scale-out exits;
-expected to be replaced).
+The former `two_ladder` and `prior_failure_scaleout` strategies are deleted
+(ADR-001 debts D1/D2 closed), with the built-in A/B ladders and the executor's
+scale-out (partial exit) support; every exit closes the whole position.
 
 Positions are keyed `position_key = (chain_id, side)` and scoped by strategy, so
 two strategies can hold independent positions on the same chain.

@@ -307,7 +307,7 @@ class SignalListener:
             """
             SELECT signal_id, position_key, chain_id, direction, action,
                    symbol, asset_class, strategy, trigger_level, decision_price,
-                   exit_reason, fraction, decided_at, created_at
+                   exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE created_at >= $1
             ORDER BY created_at ASC, signal_id ASC
@@ -330,7 +330,7 @@ class SignalListener:
             """
             SELECT signal_id, position_key, chain_id, direction, action,
                    symbol, asset_class, strategy, trigger_level, decision_price,
-                   exit_reason, fraction, decided_at, created_at
+                   exit_reason, decided_at, created_at
             FROM trade_signals
             WHERE signal_id = $1
             """,

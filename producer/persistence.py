@@ -490,8 +490,8 @@ def make_load_open_positions(pool):
             the sum is exact, and per-tranche signal_ids mean no row is ever
             double-counted).
 
-    For whole-exit strategies (two_ladder, confirmed_15m) every exit is
-    non-SCALE, so this is behaviourally identical to the old rule. Re-entry
+    SCALE rows are historical (the removed prior_failure_scaleout); every
+    live strategy exits the whole position, never with SCALE. Re-entry
     on a (strategy, position_key) cannot occur — the deterministic ENTER
     signal_id admits one ENTER per key, ever — so the old latest-row ordering
     dance is unnecessary.

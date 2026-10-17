@@ -10,8 +10,8 @@ data we will get, so instead of dropping them the executor routes them here:
   * EXIT fills at the touch on the opposite side — a short closes by BUYING at
     the ASK.
   * The taker fee is charged on both legs; pnl_bps is net of it.
-  * Whole positions only: SCALE tranches are ignored and the position closes on
-    the final EXIT.
+  * Whole positions only: an EXIT closes the position. A historical SCALE
+    (partial-exit) row is ignored.
   * Shadow-only strategies (the chain rules) fill both legs at the signal's
     decision_price instead, per their spec; the touch only if it is missing.
 
@@ -161,7 +161,7 @@ class ShadowBook:
         return None, "none"
 
     async def on_enter(self, row: dict, at_decision_price: bool = False) -> None:
-        strategy = row.get("strategy", "two_ladder")
+        strategy = row["strategy"]
         position_key = row["position_key"]
         if self.holds(strategy, position_key):
             return   # replayed ENTER
@@ -208,16 +208,15 @@ class ShadowBook:
                      pos.symbol, px, source)
 
     async def on_exit(self, row: dict, at_decision_price: bool = False) -> None:
-        strategy = row.get("strategy", "two_ladder")
+        strategy = row["strategy"]
         position_key = row["position_key"]
         pos = self._open.get((strategy, position_key))
         if pos is None:
             log.debug("shadow EXIT %s/%s: no open virtual position", strategy, position_key)
             return
         if row.get("exit_reason") == "SCALE":
-            # Partial tranches are not modelled: the virtual position closes in
-            # full on the final (non-SCALE) EXIT. Only prior_failure_scaleout
-            # emits SCALE, and it is disabled.
+            # A partial-exit tranche from the removed prior_failure_scaleout
+            # strategy (only a historical row can carry it): never a close.
             log.debug("shadow EXIT %s/%s: SCALE tranche ignored", strategy, position_key)
             return
         px, source = await self._price(row, pos.side, OrderIntent.EXIT, at_decision_price)

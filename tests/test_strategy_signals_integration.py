@@ -81,16 +81,3 @@ async def test_same_strategy_replay_still_dedupes(pool):
 
     rows = await pool.fetch("SELECT signal_id FROM trade_signals WHERE chain_id = $1", chain_id)
     assert len(rows) == 1   # deduped — one row despite two emits
-
-
-@pytest.mark.asyncio
-async def test_default_strategy_backfill_value(pool):
-    # A writer with no explicit strategy uses 'two_ladder' (the migration
-    # default), so single-strategy and legacy behaviour is unchanged.
-    insert = make_insert_signal(pool)
-    chain_id = f"chain-{uuid.uuid4().hex[:8]}"
-    w = SignalWriter(SignalWriterHooks(insert_signal=insert))  # no strategy arg
-    await w.emit_entry(chain_id=chain_id, side=TradeSide.SHORT, symbol="MSFT",
-                       asset_class="equity", decided_at=datetime(2026,1,1,tzinfo=timezone.utc))
-    row = await pool.fetchrow("SELECT strategy FROM trade_signals WHERE chain_id = $1", chain_id)
-    assert row["strategy"] == "two_ladder"

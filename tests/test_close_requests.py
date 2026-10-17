@@ -386,18 +386,57 @@ async def test_releasing_flatten_keeps_a_signal_requested_close():
 
 
 @pytest.mark.asyncio
-async def test_final_exit_supersedes_a_working_scale_tranche():
+async def test_historical_scale_exit_row_is_ignored_never_a_close():
+    # Partial exits were removed; a replayed SCALE row must not flatten.
     ex, adapter, _, _ = await _executor()
     await ex.handle_signal(enter_row())
-    adapter.set_next_result(_result(OrderStatus.WORKING))
     scale = {**exit_row(reason="SCALE"), "signal_id": "sig-scale", "trigger_level": 6,
              "fraction": "0.25"}
     await ex.handle_signal(scale)
-    trade = _trade(ex)
-    assert trade.state == "CLOSING" and not trade.closing_final
-    (tranche,) = _exits(adapter)
-    assert tranche.qty == Decimal("2.5")
-    await ex.handle_signal(exit_row(reason="STOP"))
-    assert len(adapter.cancels) == 1              # the tranche, not the entry
-    final = _exits(adapter)[-1]
+    assert _trade(ex).state == "OPEN"
+    assert _exits(adapter) == [] and adapter.cancels == [] and ex._close_requests == {}
+    await ex.handle_signal(exit_row(reason="STOP"))       # a real close still works
+    (final,) = _exits(adapter)
     assert final.qty == Decimal("10") and ex._open == {}
+
+
+def _scaled_trade(state, exit_rung=0):
+    # A trade whose last exit lifecycle was a (now removed) SCALE tranche.
+    return OpenTrade(trade_id="0c8f2a6e-1d3b-4f5a-9e7c-2b4d6f8a0c1e", strategy="s",
+                     position_key="c1:L", symbol="AAPL", asset_class="equity",
+                     side=TradeSide.LONG, target_qty=Decimal("10"),
+                     filled_qty=Decimal("10"), exit_filled_qty=Decimal("2.5"),
+                     state=state, entry_client_order_id="e-t1",
+                     exit_reason="SCALE", exit_rung=exit_rung)
+
+
+@pytest.mark.asyncio
+async def test_open_trade_with_historical_scale_reason_is_not_closed_at_boot():
+    t = _scaled_trade("OPEN", exit_rung=300)
+    hooks, state = make_hooks(open_trades=[t])
+    adapter = CancelAdapter()
+    adapter.reconcile_result = positions(AAPL="7.5")
+    ex, adapter, _, _ = await _executor(adapter=adapter, hooks=hooks, state=state)
+    assert ex._close_requests == {} and t.exit_reason is None
+    await ex.run_close_requests_once()
+    assert t.state == "OPEN" and _exits(adapter) == [] and adapter.cancels == []
+    # A later final close sells the remainder at rung 0 (not the strided rung).
+    await ex.handle_signal(exit_row(strategy="s", chain="c1", reason="STOP"))
+    (final,) = _exits(adapter)
+    assert final.qty == Decimal("7.5") and final.escalation_rung == 0
+    assert ex._open == {}
+
+
+@pytest.mark.asyncio
+async def test_closing_scale_tranche_at_boot_is_cancelled_and_halted():
+    t = _scaled_trade("CLOSING", exit_rung=600)
+    hooks, state = make_hooks(open_trades=[t])
+    adapter = CancelAdapter()
+    adapter.reconcile_result = positions(AAPL="7.5")
+    ex, adapter, _, _ = await _executor(adapter=adapter, hooks=hooks, state=state)
+    assert adapter.cancels == [f"cv1.{t.trade_id.replace('-', '')}.X.600"]
+    assert t.state == "HALTED" and state["states"][t.trade_id][0] == "HALTED"
+    assert "SCALE" in state["states"][t.trade_id][1]
+    assert ex._close_requests == {} and _exits(adapter) == []
+    await ex.run_escalation_once()                        # never re-issued as a close
+    assert _exits(adapter) == []
